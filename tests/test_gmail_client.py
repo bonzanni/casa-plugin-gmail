@@ -258,3 +258,95 @@ def test_reply_sets_to_header_from_sender():
     missing = (4 - len(raw) % 4) % 4
     decoded = base64.urlsafe_b64decode(raw + "=" * missing).decode("utf-8", errors="replace")
     assert "To: alice@example.com" in decoded
+
+
+# --- list_send_as ---
+
+def test_list_send_as_returns_aliases():
+    client = make_client()
+    client._service.users.return_value.settings.return_value.sendAs.return_value.list.return_value.execute.return_value = {
+        "sendAs": [
+            {
+                "sendAsEmail": "user@workspace.example.com",
+                "displayName": "the user",
+                "isDefault": True,
+                "isPrimary": True,
+                "replyToAddress": "",
+                "verificationStatus": "accepted",
+            },
+            {
+                "sendAsEmail": "user+alias@workspace.example.com",
+                "displayName": "the user Alias",
+                "isDefault": False,
+                "isPrimary": False,
+                "replyToAddress": "user@workspace.example.com",
+                "verificationStatus": "pending",
+            },
+        ]
+    }
+    result = client.list_send_as()
+    assert len(result) == 2
+    assert result[0]["send_as_email"] == "user@workspace.example.com"
+    assert result[0]["is_primary"] is True
+    assert result[0]["verification_status"] == "accepted"
+    assert result[1]["send_as_email"] == "user+alias@workspace.example.com"
+    assert result[1]["reply_to_address"] == "user@workspace.example.com"
+    assert result[1]["verification_status"] == "pending"
+
+
+def test_list_send_as_empty():
+    client = make_client()
+    client._service.users.return_value.settings.return_value.sendAs.return_value.list.return_value.execute.return_value = {}
+    result = client.list_send_as()
+    assert result == []
+
+
+def test_list_send_as_http_error_raises():
+    from googleapiclient.errors import HttpError
+    client = make_client()
+    resp = MagicMock(status=403)
+    client._service.users.return_value.settings.return_value.sendAs.return_value.list.return_value.execute.side_effect = HttpError(resp, b"Forbidden")
+    with pytest.raises(ValueError):
+        client.list_send_as()
+
+
+# --- send_email with from_address ---
+
+def test_send_email_sets_from_header_no_attachments():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "sent2"}
+    client.send_email("to@b.com", "Hello", "Body", from_address="alias@workspace.example.com")
+    send_call = client._service.users.return_value.messages.return_value.send.call_args
+    raw = send_call.kwargs["body"]["raw"]
+    import base64
+    decoded = base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)).decode("utf-8", errors="replace")
+    assert "From: alias@workspace.example.com" in decoded
+
+
+def test_send_email_sets_from_header_with_attachments(tmp_path):
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "sent3"}
+    attachment = tmp_path / "file.txt"
+    attachment.write_text("content")
+    client.send_email("to@b.com", "Hello", "Body", attachment_paths=[str(attachment)], from_address="alias@workspace.example.com")
+    send_call = client._service.users.return_value.messages.return_value.send.call_args
+    raw = send_call.kwargs["body"]["raw"]
+    import base64
+    decoded = base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)).decode("utf-8", errors="replace")
+    assert "From: alias@workspace.example.com" in decoded
+
+
+# --- reply_to_thread with from_address ---
+
+def test_reply_to_thread_sets_from_header():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response()
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r3"}
+    client.reply_to_thread("thr1", "body", from_address="alias@workspace.example.com")
+    send_call = client._service.users.return_value.messages.return_value.send.call_args
+    raw = send_call.kwargs["body"]["raw"]
+    import base64
+    decoded = base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)).decode("utf-8", errors="replace")
+    assert "From: alias@workspace.example.com" in decoded

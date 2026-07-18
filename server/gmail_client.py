@@ -215,10 +215,42 @@ class GmailClient:
             raise _translate_error(exc)
         return {"success": True}
 
+    # ── SendAs ─────────────────────────────────────────────────────────────
+
+    def list_send_as(self) -> list[dict]:
+        try:
+            resp = self._service.users().settings().sendAs().list(userId="me").execute()
+        except HttpError as exc:
+            raise _translate_error(exc)
+        return [
+            {
+                "send_as_email": alias.get("sendAsEmail", ""),
+                "display_name": alias.get("displayName", ""),
+                "is_default": alias.get("isDefault", False),
+                "is_primary": alias.get("isPrimary", False),
+                "reply_to_address": alias.get("replyToAddress", ""),
+                "verification_status": alias.get("verificationStatus", ""),
+            }
+            for alias in resp.get("sendAs", [])
+        ]
+
     # ── Send / Reply ────────────────────────────────────────────────────────
 
-    def send_email(self, to: str, subject: str, body: str, attachment_paths: list[str] | None = None) -> str:
-        msg = self._build_message(to=to, subject=subject, body=body, attachment_paths=attachment_paths or [])
+    def send_email(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        attachment_paths: list[str] | None = None,
+        from_address: str = "",
+    ) -> str:
+        msg = self._build_message(
+            to=to,
+            subject=subject,
+            body=body,
+            attachment_paths=attachment_paths or [],
+            from_address=from_address,
+        )
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         try:
             resp = self._service.users().messages().send(userId="me", body={"raw": raw}).execute()
@@ -226,7 +258,13 @@ class GmailClient:
             raise _translate_error(exc)
         return resp["id"]
 
-    def reply_to_thread(self, thread_id: str, body: str, attachment_paths: list[str] | None = None) -> str:
+    def reply_to_thread(
+        self,
+        thread_id: str,
+        body: str,
+        attachment_paths: list[str] | None = None,
+        from_address: str = "",
+    ) -> str:
         try:
             thread = self._service.users().threads().get(
                 userId="me", id=thread_id, format="metadata",
@@ -245,7 +283,13 @@ class GmailClient:
         reply_to = _get_header(h, "From")
         msg_id_header = _get_header(h, "Message-ID")
         refs = _get_header(h, "References")
-        msg = self._build_message(to=reply_to, subject=subject, body=body, attachment_paths=attachment_paths or [])
+        msg = self._build_message(
+            to=reply_to,
+            subject=subject,
+            body=body,
+            attachment_paths=attachment_paths or [],
+            from_address=from_address,
+        )
         msg["In-Reply-To"] = msg_id_header
         msg["References"] = f"{refs} {msg_id_header}".strip() if refs else msg_id_header
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -257,7 +301,14 @@ class GmailClient:
             raise _translate_error(exc)
         return resp["id"]
 
-    def _build_message(self, body: str, attachment_paths: list[str], to: str = "", subject: str = ""):
+    def _build_message(
+        self,
+        body: str,
+        attachment_paths: list[str],
+        to: str = "",
+        subject: str = "",
+        from_address: str = "",
+    ):
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
         from email.mime.base import MIMEBase
@@ -268,6 +319,8 @@ class GmailClient:
             if to:
                 msg["To"] = to
             msg["Subject"] = subject
+            if from_address:
+                msg["From"] = from_address
             msg.attach(MIMEText(body, "plain"))
             for path in attachment_paths:
                 mime_type, _ = mimetypes.guess_type(path)
@@ -283,4 +336,6 @@ class GmailClient:
             if to:
                 msg["To"] = to
             msg["Subject"] = subject
+            if from_address:
+                msg["From"] = from_address
         return msg
