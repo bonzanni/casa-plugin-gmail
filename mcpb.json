@@ -1,0 +1,6 @@
+{
+  "entry": "server/server.py",
+  "python": "3.11",
+  "requirements": "server/requirements.txt",
+  "venv": "server/.venv"
+}
