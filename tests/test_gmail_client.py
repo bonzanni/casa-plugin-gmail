@@ -144,3 +144,99 @@ def test_get_thread_marks_trashed():
     client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {"messages": [msg]}
     result = client.get_thread("thr1")
     assert result["messages"][0]["trashed"] is True
+
+
+# --- manage_email ---
+
+def test_manage_archive_calls_modify():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.modify.return_value.execute.return_value = {}
+    client.manage_email("msg1", "archive")
+    call_args = client._service.users.return_value.messages.return_value.modify.call_args
+    assert "INBOX" in call_args.kwargs["body"]["removeLabelIds"]
+
+def test_manage_mark_read():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.modify.return_value.execute.return_value = {}
+    client.manage_email("msg1", "mark_read")
+    call_args = client._service.users.return_value.messages.return_value.modify.call_args
+    assert "UNREAD" in call_args.kwargs["body"]["removeLabelIds"]
+
+def test_manage_rejects_system_label_inbox():
+    client = make_client()
+    with pytest.raises(ValueError, match="action='archive'"):
+        client.manage_email("msg1", "add_label", label="INBOX")
+
+def test_manage_rejects_system_label_starred():
+    client = make_client()
+    with pytest.raises(ValueError, match="system label"):
+        client.manage_email("msg1", "add_label", label="STARRED")
+
+def test_manage_unknown_action_raises():
+    client = make_client()
+    with pytest.raises(ValueError, match="Unknown action"):
+        client.manage_email("msg1", "delete_forever")
+
+def test_manage_add_label_requires_non_empty_label():
+    client = make_client()
+    with pytest.raises(ValueError, match="label is required"):
+        client.manage_email("msg1", "add_label", label="")
+
+def test_manage_idempotent_archive_does_not_raise():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.modify.return_value.execute.return_value = {}
+    # Calling archive twice should not raise
+    client.manage_email("msg1", "archive")
+    client.manage_email("msg1", "archive")
+
+
+# --- send_email ---
+
+def test_send_email_calls_send_api():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "sent1"}
+    msg_id = client.send_email("to@b.com", "Hello", "Body text")
+    assert msg_id == "sent1"
+
+def test_send_email_rate_limit_raises():
+    from googleapiclient.errors import HttpError
+    client = make_client()
+    resp = MagicMock(status=429)
+    client._service.users.return_value.messages.return_value.send.return_value.execute.side_effect = HttpError(resp, b"rate limit")
+    with pytest.raises(ValueError, match="rate limit"):
+        client.send_email("to@b.com", "Hello", "Body")
+
+
+# --- reply_to_thread ---
+
+def test_reply_to_thread_returns_message_id():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+        "messages": [{
+            "id": "msg1", "threadId": "thr1",
+            "payload": {"headers": [
+                {"name": "Subject", "value": "Original"},
+                {"name": "Message-ID", "value": "<orig@mail>"},
+            ]}
+        }]
+    }
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "reply1"}
+    msg_id = client.reply_to_thread("thr1", "My reply")
+    assert msg_id == "reply1"
+
+def test_reply_prepends_re_to_subject():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+        "messages": [{
+            "id": "msg1", "threadId": "thr1",
+            "payload": {"headers": [{"name": "Subject", "value": "Invoice"}, {"name": "Message-ID", "value": "<m@x>"}]}
+        }]
+    }
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r1"}
+    client.reply_to_thread("thr1", "body")
+    send_call = client._service.users.return_value.messages.return_value.send.call_args
+    raw = send_call.kwargs["body"]["raw"]
+    import base64
+    missing = (4 - len(raw) % 4) % 4
+    decoded = base64.urlsafe_b64decode(raw + "=" * missing).decode("utf-8", errors="replace")
+    assert "Re: Invoice" in decoded
