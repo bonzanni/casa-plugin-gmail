@@ -40,10 +40,6 @@ def _ok(data) -> str:
     return json.dumps(data)
 
 
-def _err(msg: str) -> str:
-    raise ValueError(msg)
-
-
 # ── Search / Read ──────────────────────────────────────────────────────────
 
 @mcp.tool()

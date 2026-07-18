@@ -209,29 +209,33 @@ def test_send_email_rate_limit_raises():
 
 # --- reply_to_thread ---
 
-def test_reply_to_thread_returns_message_id():
-    client = make_client()
-    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+def _make_thread_response(subject="Original", from_addr="sender@example.com", msg_id="<orig@mail>"):
+    return {
         "messages": [{
             "id": "msg1", "threadId": "thr1",
             "payload": {"headers": [
-                {"name": "Subject", "value": "Original"},
-                {"name": "Message-ID", "value": "<orig@mail>"},
+                {"name": "Subject", "value": subject},
+                {"name": "From", "value": from_addr},
+                {"name": "Message-ID", "value": msg_id},
             ]}
         }]
     }
+
+
+def test_reply_to_thread_returns_message_id():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response()
+    )
     client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "reply1"}
     msg_id = client.reply_to_thread("thr1", "My reply")
     assert msg_id == "reply1"
 
 def test_reply_prepends_re_to_subject():
     client = make_client()
-    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
-        "messages": [{
-            "id": "msg1", "threadId": "thr1",
-            "payload": {"headers": [{"name": "Subject", "value": "Invoice"}, {"name": "Message-ID", "value": "<m@x>"}]}
-        }]
-    }
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(subject="Invoice")
+    )
     client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r1"}
     client.reply_to_thread("thr1", "body")
     send_call = client._service.users.return_value.messages.return_value.send.call_args
@@ -240,3 +244,17 @@ def test_reply_prepends_re_to_subject():
     missing = (4 - len(raw) % 4) % 4
     decoded = base64.urlsafe_b64decode(raw + "=" * missing).decode("utf-8", errors="replace")
     assert "Re: Invoice" in decoded
+
+def test_reply_sets_to_header_from_sender():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="alice@example.com")
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r2"}
+    client.reply_to_thread("thr1", "body")
+    send_call = client._service.users.return_value.messages.return_value.send.call_args
+    raw = send_call.kwargs["body"]["raw"]
+    import base64
+    missing = (4 - len(raw) % 4) % 4
+    decoded = base64.urlsafe_b64decode(raw + "=" * missing).decode("utf-8", errors="replace")
+    assert "To: alice@example.com" in decoded

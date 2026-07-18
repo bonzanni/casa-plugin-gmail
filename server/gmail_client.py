@@ -230,7 +230,7 @@ class GmailClient:
         try:
             thread = self._service.users().threads().get(
                 userId="me", id=thread_id, format="metadata",
-                metadataHeaders=["Subject", "Message-ID", "References"]
+                metadataHeaders=["Subject", "From", "To", "Message-ID", "References"]
             ).execute()
         except HttpError as exc:
             raise _translate_error(exc)
@@ -242,9 +242,10 @@ class GmailClient:
         subject = _get_header(h, "Subject") or ""
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
+        reply_to = _get_header(h, "From")
         msg_id_header = _get_header(h, "Message-ID")
         refs = _get_header(h, "References")
-        msg = self._build_message(subject=subject, body=body, attachment_paths=attachment_paths or [])
+        msg = self._build_message(to=reply_to, subject=subject, body=body, attachment_paths=attachment_paths or [])
         msg["In-Reply-To"] = msg_id_header
         msg["References"] = f"{refs} {msg_id_header}".strip() if refs else msg_id_header
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()

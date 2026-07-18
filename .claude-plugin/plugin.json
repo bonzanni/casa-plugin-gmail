@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via Google Workspace service account.",
   "author": {"name": "Casa Plugin Developer"},
   "casa": {
