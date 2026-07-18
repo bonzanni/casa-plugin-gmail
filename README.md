@@ -27,8 +27,8 @@ Gives the agent (Casa resident assistant) full Gmail access on the user's behalf
 
 ### 3. Enable Domain-Wide Delegation
 
-1. On the service account page, click **Edit** (pencil icon)
-2. Expand **Advanced Settings** → check **Enable Google Workspace Domain-wide Delegation**
+1. On the service account page, scroll to the **Domain-wide delegation** section
+2. Click **Edit** and check **Enable Google Workspace Domain-wide Delegation**
 3. Save
 4. Note the **Client ID** shown on the service account list
 
@@ -46,8 +46,8 @@ Gives the agent (Casa resident assistant) full Gmail access on the user's behalf
 
 ### 5. Store in 1Password
 
-1. Create a new **Document** item in 1Password
-2. Paste the entire service account JSON file content as the document body
+1. Create a new **Secure Note** item in 1Password
+2. Paste the entire service account JSON file content into the notes field
 3. Note the 1Password reference path (e.g. `op://Personal/Gmail Service Account/notesPlain`)
 
 ### 6. Configure Plugin via Casa
@@ -62,9 +62,8 @@ When the Casa configurator installs this plugin, it will prompt for:
 Rotate the service account key **quarterly**:
 
 1. In GCP → Service Accounts → Keys → **Add Key** (create new JSON)
-2. Store new key in 1Password
-3. Update the 1Password reference in Casa plugin config
-4. Delete the old key from GCP
+2. Update the content of the existing 1Password Secure Note item with the new JSON (the reference path stays the same — no Casa reconfiguration needed)
+3. Delete the old key from GCP
 
 If a key is compromised: revoke it immediately in GCP Console, create a new key, and update Casa config.
 
