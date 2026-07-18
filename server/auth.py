@@ -52,7 +52,8 @@ class GmailAuth:
             sys.exit(1)
 
         _validate_email_format("GMAIL_IMPERSONATION_SA", impersonation_sa)
-        if not impersonation_sa.endswith(_SA_SUFFIX):
+        _, _sa_addr = email.utils.parseaddr(impersonation_sa)
+        if not _sa_addr.lower().endswith(_SA_SUFFIX):
             print(
                 f"Gmail plugin misconfigured: GMAIL_IMPERSONATION_SA '{impersonation_sa}' "
                 f"must be a service account email ending in {_SA_SUFFIX}.",
@@ -61,14 +62,15 @@ class GmailAuth:
             sys.exit(1)
 
         _validate_email_format("GMAIL_SUBJECT_EMAIL", subject_email)
-        if subject_email.endswith(_SA_SUFFIX):
+        _, _subj_addr = email.utils.parseaddr(subject_email)
+        if _subj_addr.lower().endswith(_SA_SUFFIX):
             print(
                 f"Gmail plugin misconfigured: GMAIL_SUBJECT_EMAIL '{subject_email}' "
                 f"looks like a service account — it must be a Workspace user email.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        if subject_email.lower().endswith("@gmail.com"):
+        if _subj_addr.lower().endswith("@gmail.com"):
             print(
                 f"Gmail plugin misconfigured: GMAIL_SUBJECT_EMAIL '{subject_email}' "
                 f"is a personal Gmail address. Domain-wide delegation requires a Google Workspace account.",
