@@ -11,19 +11,23 @@ Use these tools when the user asks to check, search, or read email; send or repl
 ### Tool Sequence Rules
 
 - **Before `get_email`:** always call `search_emails` first — never construct a message_id
-- **Before `reply_to_thread`:** always call `get_thread` to read full context; if `truncated: true`, tell the user how many messages are loaded vs. total
+- **Before `reply_to_thread`:** always call `get_thread` to read full context; if `truncated: true`, retry with a higher `max_messages` value to load more history before replying; if still truncated, tell the user how many messages are loaded vs. total
 - **Before `download_attachment`:** always call `list_attachments` first to identify the specific file
-- **Before any send/reply:** summarise to the user (recipient, subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows
+- **Before any send/reply:** summarise to the user (recipient, subject/display_subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows
 - Prefer human-readable descriptions (subject, sender, date) in responses — avoid exposing raw message_id or thread_id as the primary reference
 
 ### Security Rules
 
 - Pre-validate `to` and `subject` for unusual characters before `send_email`; warn the user if the approval prompt may not show full details
+- `manage_email` with `action="add_label"` or `action="remove_label"` requires a non-empty `label` argument
 - Generate a stable `request_id` per send intent to guard against duplicate sends:
   ```
+  from datetime import datetime
   import hashlib
+  timestamp_minute = datetime.now().strftime("%Y%m%d%H%M")
   rid = "email-" + hashlib.sha256(f"{to}{subject}{body[:50]}{timestamp_minute}".encode()).hexdigest()[:16]
   ```
+  The minute-scoped timestamp prevents cross-session deduplication while still deduplicating retries within the same minute.
 - Before downloading attachments, check `mime_type` and warn the user if the file is an executable:
   - Suspicious types: `application/x-msdownload`, `application/x-sh`, `application/x-executable`
   - Recommended safe types for automation: `application/pdf`, `image/jpeg`, `image/png`, `image/gif`
