@@ -109,31 +109,52 @@ def save_attachment(cached_path: str, destination: str, overwrite: bool = False)
     return _ok({"path": path})
 
 
+# ── SendAs ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_send_as() -> str:
+    """List available SendAs aliases for the configured Gmail account, including verification status."""
+    return _ok(_client.list_send_as())
+
 # ── Compose / Send (protected) ─────────────────────────────────────────────
 
 @mcp.tool()
-def send_email(to: str, subject: str, body: str, request_id: str = "", attachment_paths: list[str] | None = None) -> str:
-    """Send a plain-text email. Protected: requires the user tap-approval."""
+def send_email(
+    to: str,
+    subject: str,
+    body: str,
+    request_id: str = "",
+    attachment_paths: list[str] | None = None,
+    from_address: str = "",
+) -> str:
+    """Send a plain-text email. from_address: optional SendAs alias (defaults to subject's primary address). Protected: requires the user tap-approval."""
     _validate_paths(attachment_paths or [])
     if request_id:
         existing = _log.check(request_id, to, subject)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
-    msg_id = _client.send_email(to, subject, body, attachment_paths or [])
+    msg_id = _client.send_email(to, subject, body, attachment_paths or [], from_address=from_address)
     if request_id:
         _log.record(request_id, msg_id, to, subject)
     return _ok({"message_id": msg_id, "already_sent": False})
 
 
 @mcp.tool()
-def reply_to_thread(thread_id: str, display_subject: str, body: str, request_id: str = "", attachment_paths: list[str] | None = None) -> str:
-    """Reply to an email thread. display_subject is for the approval prompt only. Protected: requires the user tap-approval."""
+def reply_to_thread(
+    thread_id: str,
+    display_subject: str,
+    body: str,
+    request_id: str = "",
+    attachment_paths: list[str] | None = None,
+    from_address: str = "",
+) -> str:
+    """Reply to an email thread. display_subject is for the approval prompt only. from_address: optional SendAs alias. Protected: requires the user tap-approval."""
     _validate_paths(attachment_paths or [])
     if request_id:
         existing = _log.check(request_id, thread_id, display_subject)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
-    msg_id = _client.reply_to_thread(thread_id, body, attachment_paths or [])
+    msg_id = _client.reply_to_thread(thread_id, body, attachment_paths or [], from_address=from_address)
     if request_id:
         _log.record(request_id, msg_id, thread_id, display_subject)
     return _ok({"message_id": msg_id, "already_sent": False})
