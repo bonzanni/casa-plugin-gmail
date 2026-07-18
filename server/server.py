@@ -113,7 +113,7 @@ def save_attachment(cached_path: str, destination: str, overwrite: bool = False)
 
 @mcp.tool()
 def list_send_as() -> str:
-    """List available SendAs aliases for the configured Gmail account, including verification status."""
+    """List available SendAs aliases for the configured Gmail account. Only aliases with verification_status='accepted' can be used as from_address."""
     return _ok(_client.list_send_as())
 
 # ── Compose / Send (protected) ─────────────────────────────────────────────

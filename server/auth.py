@@ -53,10 +53,10 @@ class GmailAuth:
 
         _validate_email_format("GMAIL_IMPERSONATION_SA", impersonation_sa)
         _, _sa_addr = email.utils.parseaddr(impersonation_sa)
-        if not _sa_addr.lower().endswith(_SA_SUFFIX):
+        if not _sa_addr.lower().endswith(".iam.gserviceaccount.com"):
             print(
                 f"Gmail plugin misconfigured: GMAIL_IMPERSONATION_SA '{impersonation_sa}' "
-                f"must be a service account email ending in {_SA_SUFFIX}.",
+                f"must be a service account email ending in .iam.gserviceaccount.com.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -90,9 +90,9 @@ class GmailAuth:
 
         credentials = impersonated_credentials.Credentials(
             source_credentials=source_credentials,
-            target_principal=impersonation_sa,
+            target_principal=_sa_addr,
             target_scopes=SCOPES,
-            subject=subject_email,
+            subject=_subj_addr,
         )
 
         try:

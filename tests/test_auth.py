@@ -31,6 +31,14 @@ def test_impersonation_sa_must_be_service_account_email(monkeypatch):
         make_auth().validate_and_init()
 
 
+def test_impersonation_sa_must_end_in_iam_suffix(monkeypatch):
+    # Rejects foo@bar.gserviceaccount.com (missing .iam.) — must be .iam.gserviceaccount.com
+    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@bar.gserviceaccount.com")
+    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
+    with pytest.raises(SystemExit):
+        make_auth().validate_and_init()
+
+
 def test_subject_email_rejects_service_account_address(monkeypatch):
     # Catches operator putting SA email in both slots
     monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
