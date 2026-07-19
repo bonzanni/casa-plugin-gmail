@@ -7,8 +7,7 @@
         "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/server/vendor",
         "GMAIL_CLIENT_ID": "${GMAIL_CLIENT_ID}",
         "GMAIL_CLIENT_SECRET": "${GMAIL_CLIENT_SECRET}",
-        "GMAIL_USER_EMAIL": "${GMAIL_USER_EMAIL}",
-        "CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"
+        "GMAIL_USER_EMAIL": "${GMAIL_USER_EMAIL}"
       }
     }
   }

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import urllib.parse
 
 from mcp.server.fastmcp import FastMCP
@@ -20,8 +21,20 @@ _log: SentLog | None = None
 _authenticated = False
 
 
+def _migrate_legacy_token() -> None:
+    # v0.4.0 self-declared CLAUDE_PLUGIN_DATA in .mcp.json, which the runtime
+    # delivered as the literal unexpanded string "${CLAUDE_PLUGIN_DATA}". If a
+    # token was persisted there, move it to the now-correct PLUGIN_DATA path.
+    old_token = os.path.join("${CLAUDE_PLUGIN_DATA}", "oauth_token.json")
+    new_token = os.path.join(PLUGIN_DATA, "oauth_token.json")
+    if os.path.exists(old_token) and not os.path.exists(new_token):
+        os.makedirs(PLUGIN_DATA, exist_ok=True)
+        shutil.move(old_token, new_token)
+
+
 def _startup():
     global _client, _att, _log, _authenticated
+    _migrate_legacy_token()
     os.makedirs(PLUGIN_DATA, exist_ok=True)
     _authenticated = _auth.validate_and_init()
     if _authenticated:
