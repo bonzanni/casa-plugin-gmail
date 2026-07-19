@@ -7,147 +7,102 @@ def make_auth():
     return GmailAuth()
 
 
+_FULL_ENV = {
+    "GMAIL_CLIENT_ID": "client-id",
+    "GMAIL_CLIENT_SECRET": "client-secret",
+    "GMAIL_REFRESH_TOKEN": "refresh-token",
+    "GMAIL_USER_EMAIL": "user@workspace.example.com",
+}
+
+
+def _set_full_env(monkeypatch, **overrides):
+    env = {**_FULL_ENV, **overrides}
+    for key, val in env.items():
+        if val is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, val)
+
+
 # ── Env var validation ─────────────────────────────────────────────────────
 
-def test_missing_impersonation_sa_exits(monkeypatch):
-    monkeypatch.delenv("GMAIL_IMPERSONATION_SA", raising=False)
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
+@pytest.mark.parametrize("missing_var", [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+    "GMAIL_USER_EMAIL",
+])
+def test_missing_required_var_exits(missing_var, monkeypatch):
+    _set_full_env(monkeypatch, **{missing_var: None})
     with pytest.raises(SystemExit):
         make_auth().validate_and_init()
 
 
-def test_missing_subject_email_exits(monkeypatch):
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.delenv("GMAIL_SUBJECT_EMAIL", raising=False)
+@pytest.mark.parametrize("missing_var", [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+    "GMAIL_USER_EMAIL",
+])
+def test_missing_required_var_names_it_in_stderr(missing_var, monkeypatch, capsys):
+    _set_full_env(monkeypatch, **{missing_var: None})
     with pytest.raises(SystemExit):
         make_auth().validate_and_init()
-
-
-def test_impersonation_sa_must_be_service_account_email(monkeypatch):
-    # Catches operator pasting a regular email in GMAIL_IMPERSONATION_SA
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "notanSA@example.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-
-
-def test_impersonation_sa_must_end_in_iam_suffix(monkeypatch):
-    # Rejects foo@bar.gserviceaccount.com (missing .iam.) — must be .iam.gserviceaccount.com
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@bar.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-
-
-def test_subject_email_rejects_service_account_address(monkeypatch):
-    # Catches operator putting SA email in both slots
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "sa@project.iam.gserviceaccount.com")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-
-
-def test_subject_email_rejects_gmail_com(monkeypatch):
-    # DWD requires Workspace; personal @gmail.com is rejected
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@gmail.com")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-
-
-def test_subject_email_invalid_format_exits(monkeypatch):
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "notanemail")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
+    assert missing_var in capsys.readouterr().err
 
 
 # ── Auth error paths ────────────────────────────────────────────────────────
 
-@patch("auth.google_auth_default")
-def test_default_credentials_error_exits(mock_default, monkeypatch):
-    from google.auth.exceptions import DefaultCredentialsError
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    mock_default.side_effect = DefaultCredentialsError("no credentials")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-
-
-@patch("auth.google_auth_default")
-def test_default_credentials_error_message_mentions_gcloud_login(mock_default, monkeypatch, capsys):
-    from google.auth.exceptions import DefaultCredentialsError
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    mock_default.side_effect = DefaultCredentialsError("no credentials")
-    with pytest.raises(SystemExit):
-        make_auth().validate_and_init()
-    assert "gcloud auth application-default login" in capsys.readouterr().err
-
-
-@patch("auth.impersonated_credentials.Credentials")
-@patch("auth.google_auth_default")
-def test_refresh_error_exits(mock_default, mock_imp_creds, monkeypatch):
-    from google.auth.exceptions import RefreshError
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    mock_default.return_value = (MagicMock(), "project")
+@patch("auth.Credentials")
+def test_refresh_error_exits(mock_creds_cls, monkeypatch):
+    _set_full_env(monkeypatch)
     mock_creds = MagicMock()
-    mock_creds.refresh.side_effect = RefreshError("permission denied")
-    mock_imp_creds.return_value = mock_creds
+    mock_creds.refresh.side_effect = Exception("token expired")
+    mock_creds_cls.return_value = mock_creds
     with pytest.raises(SystemExit):
         make_auth().validate_and_init()
 
 
-@patch("auth.impersonated_credentials.Credentials")
-@patch("auth.google_auth_default")
-def test_refresh_error_message_mentions_token_creator(mock_default, mock_imp_creds, monkeypatch, capsys):
-    from google.auth.exceptions import RefreshError
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@example.com")
-    mock_default.return_value = (MagicMock(), "project")
+@patch("auth.Credentials")
+def test_refresh_error_message_mentions_env_vars(mock_creds_cls, monkeypatch, capsys):
+    _set_full_env(monkeypatch)
     mock_creds = MagicMock()
-    mock_creds.refresh.side_effect = RefreshError("permission denied")
-    mock_imp_creds.return_value = mock_creds
+    mock_creds.refresh.side_effect = Exception("token expired")
+    mock_creds_cls.return_value = mock_creds
     with pytest.raises(SystemExit):
         make_auth().validate_and_init()
     err = capsys.readouterr().err
-    assert "serviceAccountTokenCreator" in err or "add-iam-policy-binding" in err
+    assert "GMAIL_REFRESH_TOKEN" in err or "GMAIL_CLIENT_SECRET" in err
 
 
 # ── Happy path ──────────────────────────────────────────────────────────────
 
-@patch("auth.impersonated_credentials.Credentials")
-@patch("auth.google_auth_default")
-def test_valid_config_initialises(mock_default, mock_imp_creds, monkeypatch):
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@workspace.example.com")
-    mock_source = MagicMock()
-    mock_default.return_value = (mock_source, "project")
+@patch("auth.Credentials")
+def test_valid_config_initialises(mock_creds_cls, monkeypatch):
+    _set_full_env(monkeypatch)
     mock_creds = MagicMock()
-    mock_imp_creds.return_value = mock_creds
+    mock_creds_cls.return_value = mock_creds
 
     auth = make_auth()
     auth.validate_and_init()
 
-    mock_imp_creds.assert_called_once_with(
-        source_credentials=mock_source,
-        target_principal="sa@project.iam.gserviceaccount.com",
-        target_scopes=auth.SCOPES,
-        subject="user@workspace.example.com",
+    mock_creds_cls.assert_called_once_with(
+        token=None,
+        refresh_token="refresh-token",
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id="client-id",
+        client_secret="client-secret",
+        scopes=auth.SCOPES,
     )
     mock_creds.refresh.assert_called_once()
     assert auth.credentials is mock_creds
     assert auth.subject_email == "user@workspace.example.com"
 
 
-@patch("auth.impersonated_credentials.Credentials")
-@patch("auth.google_auth_default")
-def test_scopes_include_settings_basic(mock_default, mock_imp_creds, monkeypatch):
-    monkeypatch.setenv("GMAIL_IMPERSONATION_SA", "sa@project.iam.gserviceaccount.com")
-    monkeypatch.setenv("GMAIL_SUBJECT_EMAIL", "user@workspace.example.com")
-    mock_default.return_value = (MagicMock(), "project")
-    mock_imp_creds.return_value = MagicMock()
+@patch("auth.Credentials")
+def test_scopes_include_settings_basic(mock_creds_cls, monkeypatch):
+    _set_full_env(monkeypatch)
+    mock_creds_cls.return_value = MagicMock()
     auth = make_auth()
     auth.validate_and_init()
     assert "https://www.googleapis.com/auth/gmail.settings.basic" in auth.SCOPES

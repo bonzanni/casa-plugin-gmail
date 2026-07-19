@@ -1,12 +1,12 @@
 # casa-plugin-gmail
 
-Gives the agent (Casa resident assistant) full Gmail access on the user's behalf via Google Workspace service account with domain-wide delegation, using keyless ADC → service account impersonation (no JSON key file required).
+Gives the agent (Casa resident assistant) full Gmail access on the user's behalf via per-user OAuth 2.0 with a refresh token stored as a plugin env var. No service account, no domain-wide delegation, no gcloud, no ADC.
 
 ## Prerequisites
 
-- Google Workspace account with admin access
 - Google Cloud project with Gmail API enabled
-- `gcloud` CLI installed and authenticated
+- An Internal OAuth 2.0 client (Desktop app type) created in that project
+- Python 3 on your workstation (for the one-time bootstrap step)
 
 ## Setup
 
@@ -16,71 +16,69 @@ Gives the agent (Casa resident assistant) full Gmail access on the user's behalf
 2. Navigate to **APIs & Services → Library**
 3. Search for "Gmail API" and click **Enable**
 
-### 2. Enable IAM Credentials API
+### 2. Create an Internal OAuth 2.0 Client
 
-```bash
-gcloud services enable iamcredentials.googleapis.com
+1. Navigate to **APIs & Services → Credentials**
+2. Click **Create Credentials → OAuth client ID**
+3. Application type: **Desktop app** — name it e.g. `casa-gmail`
+4. Click **Create**
+5. Note the **Client ID** and **Client Secret** shown in the dialog
+
+> If prompted to configure an OAuth consent screen first, set the User Type to **Internal** (Google Workspace only), fill in the app name, and add the three Gmail scopes listed below. Internal apps do not require Google verification.
+
+**Scopes needed** (add these on the consent screen):
+```
+https://www.googleapis.com/auth/gmail.modify
+https://www.googleapis.com/auth/gmail.send
+https://www.googleapis.com/auth/gmail.settings.basic
 ```
 
-### 3. Create a Service Account (if not already exists)
+### 3. Run the Bootstrap Script (once, on your workstation)
 
-1. Navigate to **IAM & Admin → Service Accounts**
-2. Click **Create Service Account** — name it e.g. `casa-gmail-agent`
-3. Skip optional role grants — click **Done**
-
-### 4. Enable Domain-Wide Delegation on the Service Account
-
-1. Click on the service account → **Edit**
-2. Check **Enable Google Workspace Domain-wide Delegation** → Save
-3. Note the **Client ID** shown on the service account list
-
-### 5. Authorise Scopes in Google Workspace Admin
-
-1. Go to [admin.google.com](https://admin.google.com)
-2. Navigate to **Security → API Controls → Domain-wide delegation**
-3. Click **Add new** and enter:
-   - **Client ID:** (from step 4)
-   - **OAuth scopes** (copy exactly — comma-separated, no spaces):
-     ```
-     https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/gmail.settings.basic
-     ```
-4. Click **Authorise**
-
-### 6. Grant Your Account Permission to Impersonate the Service Account
+Install the one dependency and run the script:
 
 ```bash
-gcloud iam service-accounts add-iam-policy-binding \
-  casa-gmail-agent@YOUR_PROJECT.iam.gserviceaccount.com \
-  --member="user:$(gcloud config get-value account)" \
-  --role="roles/iam.serviceAccountTokenCreator"
+pip install google-auth-oauthlib
+python bootstrap/get_credentials.py
 ```
 
-### 7. Authenticate with Application Default Credentials
+The script will prompt for your Client ID and Client Secret (or read them from `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` env vars), open a browser for the Google consent screen, and print four values when done:
 
-```bash
-gcloud auth application-default login
+```
+GMAIL_CLIENT_ID=...
+GMAIL_CLIENT_SECRET=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_USER_EMAIL=...
 ```
 
-> Note: Use the default login (which includes `cloud-platform` scope). Narrowing scopes with `--scopes` may prevent impersonation.
-
-### 8. Configure Plugin via Casa
+### 4. Configure Plugin via Casa
 
 When the Casa configurator installs this plugin, it will prompt for:
 
-- `GMAIL_IMPERSONATION_SA` — the service account email to impersonate (e.g. `casa-gmail-agent@YOUR_PROJECT.iam.gserviceaccount.com`)
-- `GMAIL_SUBJECT_EMAIL` — the user's Workspace Gmail address (e.g. `user@workspace.example.com`)
+- `GMAIL_CLIENT_ID` — the OAuth client ID from step 2
+- `GMAIL_CLIENT_SECRET` — the OAuth client secret from step 2
+- `GMAIL_REFRESH_TOKEN` — the refresh token printed by the bootstrap script
+- `GMAIL_USER_EMAIL` — the user's Gmail address (e.g. `user@workspace.example.com`)
+
+## Dismantling the old service-account / DWD setup
+
+The previous auth approach (v0.2.x) used ADC + a service account with domain-wide delegation. That infrastructure can now be removed:
+
+- **Service account:** delete `casa-gmail-agent` (or whichever SA was used) in GCP IAM
+- **DWD entry:** remove the entry from Workspace Admin → Security → API Controls → Domain-wide delegation
+- **IAM binding:** remove the `roles/iam.serviceAccountTokenCreator` binding that was granted to your user account
+- **gcloud ADC:** if you ran `gcloud auth application-default login` solely for this plugin, you can revoke it: `gcloud auth application-default revoke`
 
 ## Troubleshooting
 
-**`No Application Default Credentials found`**
-→ Run: `gcloud auth application-default login`
+**`missing env var(s): GMAIL_REFRESH_TOKEN`**
+→ Re-run `bootstrap/get_credentials.py` and store the printed values in Casa.
 
-**`Failed to impersonate ... RefreshError`**
+**`failed to refresh OAuth token`**
+→ The refresh token may have been revoked. Go to [myaccount.google.com/permissions](https://myaccount.google.com/permissions), revoke access for your app, then re-run the bootstrap script.
 
-1. Enable the IAM Credentials API: `gcloud services enable iamcredentials.googleapis.com`
-2. Grant token creator role: `gcloud iam service-accounts add-iam-policy-binding GMAIL_IMPERSONATION_SA --member=user:$(gcloud config get-value account) --role=roles/iam.serviceAccountTokenCreator`
-3. Ensure DWD is enabled on the service account in GCP Console
-4. Ensure all three scopes are authorised in Workspace Admin (gmail.modify, gmail.send, gmail.settings.basic)
+**`no refresh token returned` during bootstrap**
+→ A previous consent already exists. Revoke app access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions) and run the script again — it passes `prompt=consent` to force a fresh grant.
 
 ## Tools
 

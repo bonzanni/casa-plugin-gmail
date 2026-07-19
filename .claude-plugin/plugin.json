@@ -1,7 +1,7 @@
 {
   "name": "gmail",
-  "version": "0.2.1",
-  "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via Google Workspace service account.",
+  "version": "0.3.0",
+  "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0 refresh token.",
   "author": {"name": "Casa Plugin Developer"},
   "casa": {
     "protectedTools": [
