@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "gmail": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/server/.venv/bin/python",
+      "command": "python3",
       "args": ["${CLAUDE_PLUGIN_ROOT}/server/server.py"],
       "env": {
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT}/server/vendor",
         "GMAIL_IMPERSONATION_SA": "${GMAIL_IMPERSONATION_SA}",
         "GMAIL_SUBJECT_EMAIL": "${GMAIL_SUBJECT_EMAIL}",
         "CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}"
