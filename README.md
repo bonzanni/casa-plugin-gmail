@@ -1,12 +1,11 @@
 # casa-plugin-gmail
 
-Gives the agent (Casa resident assistant) full Gmail access on the user's behalf via per-user OAuth 2.0 with a refresh token stored as a plugin env var. No service account, no domain-wide delegation, no gcloud, no ADC.
+Gives the agent (Casa resident assistant) full Gmail access on the user's behalf via per-user OAuth 2.0. The consent flow is completable entirely from chat — no workstation bootstrap step required. The refresh token is persisted inside the plugin's data directory (`CLAUDE_PLUGIN_DATA`). No service account, no domain-wide delegation, no gcloud, no ADC.
 
 ## Prerequisites
 
 - Google Cloud project with Gmail API enabled
 - An Internal OAuth 2.0 client (Desktop app type) created in that project
-- Python 3 on your workstation (for the one-time bootstrap step)
 
 ## Setup
 
@@ -33,32 +32,52 @@ https://www.googleapis.com/auth/gmail.send
 https://www.googleapis.com/auth/gmail.settings.basic
 ```
 
-### 3. Run the Bootstrap Script (once, on your workstation)
-
-Install the one dependency and run the script:
-
-```bash
-pip install google-auth-oauthlib
-python bootstrap/get_credentials.py
-```
-
-The script will prompt for your Client ID and Client Secret (or read them from `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` env vars), open a browser for the Google consent screen, and print four values when done:
-
-```
-GMAIL_CLIENT_ID=...
-GMAIL_CLIENT_SECRET=...
-GMAIL_REFRESH_TOKEN=...
-GMAIL_USER_EMAIL=...
-```
-
-### 4. Configure Plugin via Casa
+### 3. Configure Plugin via Casa
 
 When the Casa configurator installs this plugin, it will prompt for:
 
 - `GMAIL_CLIENT_ID` — the OAuth client ID from step 2
 - `GMAIL_CLIENT_SECRET` — the OAuth client secret from step 2
-- `GMAIL_REFRESH_TOKEN` — the refresh token printed by the bootstrap script
 - `GMAIL_USER_EMAIL` — the user's Gmail address (e.g. `user@workspace.example.com`)
+
+### 4. Complete OAuth from Chat
+
+After the plugin is installed, run the consent flow directly in chat:
+
+1. Call `gmail_auth_start` — it returns an authorization URL
+2. Open the URL in any browser and sign in as the user
+3. After granting access, the browser redirects to `http://localhost:8080` (which won't load — that is expected)
+4. Copy the **full URL** from the browser's address bar (it contains `?code=...`)
+5. Call `gmail_auth_complete` with that URL — the plugin exchanges the code, persists the refresh token, and all Gmail tools become available
+
+The refresh token is stored at `${CLAUDE_PLUGIN_DATA}/oauth_token.json`. If the token is ever revoked, repeat step 1–5 from chat; no Casa config change is needed.
+
+## Env vars
+
+| Variable | Required | Description |
+|---|---|---|
+| `GMAIL_CLIENT_ID` | Yes | OAuth 2.0 client ID |
+| `GMAIL_CLIENT_SECRET` | Yes | OAuth 2.0 client secret |
+| `GMAIL_USER_EMAIL` | Yes | the user's Gmail address |
+| `CLAUDE_PLUGIN_DATA` | Provided by Casa | Plugin-writable data directory (token + attachments) |
+
+## Troubleshooting
+
+**`Gmail not authenticated`**
+→ Call `gmail_auth_start` and complete the consent flow from chat (steps 4.1–4.5 above).
+
+**`stored token invalid or expired — re-auth needed`**
+→ The refresh token was revoked. Repeat the chat-driven consent flow — `gmail_auth_start` and then `gmail_auth_complete`.
+
+**`No refresh_token in response` from `gmail_auth_complete`**
+→ A previous consent grant may still be active. Go to [myaccount.google.com/permissions](https://myaccount.google.com/permissions), revoke access for the app, then call `gmail_auth_start` again — the auth URL includes `prompt=consent` to force a fresh grant.
+
+**`OAuth error: access_denied`**
+→ The user declined the consent screen. Call `gmail_auth_start` to get a fresh URL and try again.
+
+## Fallback: workstation bootstrap
+
+`bootstrap/get_credentials.py` remains available as a documented fallback for cases where the chat-driven flow cannot be completed (e.g., testing in a local dev environment). It requires `pip install google-auth-oauthlib` and prints the refresh token to stdout. **Do not use this for production setup** — the chat-driven flow is the supported path and keeps the token out of env vars.
 
 ## Dismantling the old service-account / DWD setup
 
@@ -69,21 +88,12 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 - **IAM binding:** remove the `roles/iam.serviceAccountTokenCreator` binding that was granted to your user account
 - **gcloud ADC:** if you ran `gcloud auth application-default login` solely for this plugin, you can revoke it: `gcloud auth application-default revoke`
 
-## Troubleshooting
-
-**`missing env var(s): GMAIL_REFRESH_TOKEN`**
-→ Re-run `bootstrap/get_credentials.py` and store the printed values in Casa.
-
-**`failed to refresh OAuth token`**
-→ The refresh token may have been revoked. Go to [myaccount.google.com/permissions](https://myaccount.google.com/permissions), revoke access for your app, then re-run the bootstrap script.
-
-**`no refresh token returned` during bootstrap**
-→ A previous consent already exists. Revoke app access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions) and run the script again — it passes `prompt=consent` to force a fresh grant.
-
 ## Tools
 
 | Tool | Description |
 |---|---|
+| `gmail_auth_start` | Begin OAuth: returns authorization URL to open in a browser |
+| `gmail_auth_complete` ⚠️ | Complete OAuth: exchange redirect URL → persists refresh token |
 | `search_emails` | Search inbox with Gmail query syntax |
 | `get_email` | Read full email content |
 | `get_thread` | Read full email thread |

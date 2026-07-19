@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-One-time bootstrap: obtain Gmail OAuth 2.0 credentials for casa-plugin-gmail.
+DOCUMENTED FALLBACK ONLY — not required for normal setup.
 
-Run this ONCE on your own workstation (not inside Casa). It opens a browser
-for the Google consent screen and prints the four env vars to paste into
-Casa's configurator.
+As of v0.4.0, the OAuth consent flow is completable entirely from chat using
+the gmail_auth_start and gmail_auth_complete tools. Use this script only if
+the chat-driven flow is unavailable (e.g., local dev testing).
+
+Run on your workstation (not inside Casa). Opens a browser for the Google
+consent screen and prints the refresh token to stdout. The refresh token
+obtained here can be written directly to ${CLAUDE_PLUGIN_DATA}/oauth_token.json
+as {"refresh_token": "<value>"} if you need to seed a deployment manually.
 
 Requirements:
     pip install google-auth-oauthlib

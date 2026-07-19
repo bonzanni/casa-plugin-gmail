@@ -1,12 +1,13 @@
 {
   "name": "gmail",
-  "version": "0.3.0",
-  "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0 refresh token.",
+  "version": "0.4.0",
+  "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent flow is chat-driven; refresh token is persisted in plugin data.",
   "author": {"name": "Casa Plugin Developer"},
   "casa": {
     "protectedTools": [
       {"name": "send_email", "summary": "Send email to {to}: {subject}"},
-      {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"}
+      {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"},
+      {"name": "gmail_auth_complete", "summary": "Complete Gmail OAuth and store refresh token"}
     ]
   }
 }
