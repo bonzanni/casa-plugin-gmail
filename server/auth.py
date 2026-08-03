@@ -188,6 +188,18 @@ class GmailAuth:
         """Refresh, then ask Google which account this credential belongs to."""
         return self._refresh_and_profile(refresh_token)[1]
 
+    def probe_refresh(self, refresh_token: str) -> None:
+        """Liveness probe: refresh once, discard the result, keep the token.
+
+        A read-only public view of the SAME RefreshTerminal / RefreshRetryable
+        split `_refresh` already raises — no new OAuth behaviour, and no new
+        classification. It exists so a caller can ask "is this credential still
+        good?" without `load_active`'s side effects: `load_active` removes a
+        terminally dead token and activates a live one, neither of which a mere
+        health check may do. Performs no writes and touches no runtime state.
+        """
+        self._refresh(refresh_token)
+
     def build_auth_url(self, redirect_uri: str, state: str) -> str:
         """Authorization URL for casa's callback endpoint.
 

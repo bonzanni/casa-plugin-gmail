@@ -1,10 +1,11 @@
 import json
 import os
 import sys
+import time
 
 from mcp.server.fastmcp import FastMCP
 
-from auth import GmailAuth
+from auth import GmailAuth, RefreshRetryable, RefreshTerminal
 from gmail_client import GmailClient
 from attachments import AttachmentManager
 from sent_log import SentLog
@@ -108,8 +109,8 @@ def gmail_auth_start() -> str:
     return _ok(_flow_start(_auth, _cb))
 
 
-def _connected_account() -> str | None:
-    """The account of the credential actually in service, or None.
+def _connected_credential():
+    """The credential actually in service, or None.
 
     "In service" is both halves: a rebuilt runtime (`_authenticated`) AND an
     active credential on disk whose account is the configured subject. A
@@ -124,7 +125,73 @@ def _connected_account() -> str | None:
     subject = _auth.subject_email
     if not subject or active.account.lower() != subject.lower():
         return None
-    return active.account
+    return active
+
+
+def _stored_credential_failure(cred) -> tuple[str, str] | None:
+    """None when the stored credential still refreshes, else (kind, detail)
+    with kind in {"terminal", "retryable"}.
+
+    `_authenticated` is set once, at activation, and never cleared, and the
+    on-disk account keeps matching after a revocation — so without this probe
+    a credential revoked AFTER startup reports `already_connected` and mints
+    nothing, telling the operator there is nothing to do at the exact moment
+    Gmail calls are failing and they need a recovery link.
+
+    Performs NO writes and never removes the credential: reaping a dead token
+    is `load_active`'s job on its own next pass, and a transient Google 5xx
+    must never be able to destroy a working refresh token from here.
+    """
+    try:
+        _auth.probe_refresh(cred.refresh_token)
+    except RefreshTerminal as exc:
+        return "terminal", str(exc)
+    except RefreshRetryable as exc:
+        return "retryable", str(exc)
+    except Exception as exc:
+        # Unclassified ⇒ retryable, the same policy load_active applies to an
+        # ambiguous failure. Minting on "don't know" would hand the operator a
+        # re-authorization they probably do not need.
+        return "retryable", str(exc)
+    return None
+
+
+# Casa's own pending-state lifetime, read from callback_spool.py
+# (`PENDING_TTL_S = 1800`, `SKEW_S = 300`). A minted state is claimable for 30
+# minutes; past that casa's request path refuses the claim outright
+# (callback_spool.py: `if now - st.st_mtime > PENDING_TTL_S: return None`), so
+# the link is dead whatever the attempt record still says. And the record CAN
+# still say `awaiting_redirect` well past it: the sweep that retires an expired
+# pending runs on a 10-minute interval (casa_core.py, job
+# `callback_spool_sweep`), leaving a window of up to ~40 minutes after minting
+# in which a dead flow still reads open. That gap is exactly why liveness is
+# computed from the mint clock here instead of being read off `status`.
+_PENDING_TTL_S = 1800
+_SKEW_S = 300
+
+
+def _live_pending_attempt(now: float | None = None) -> dict | None:
+    """The newest still-usable `awaiting_redirect` attempt, or None.
+
+    `cb.attempts()` returns casa-validated records newest first, so the first
+    match is the newest. `minted_ts` is legitimately None on a legacy or
+    consumer-held record; liveness cannot be established for one, so it does
+    NOT count as pending — minting a link the operator can definitely use
+    beats pointing them at one that may already be dead.
+    """
+    now = time.time() if now is None else now
+    for rec in _cb.attempts():
+        if rec.get("status") != "awaiting_redirect":
+            continue
+        minted = rec.get("minted_ts")
+        if not isinstance(minted, (int, float)) or isinstance(minted, bool):
+            continue
+        age = now - minted
+        # Mirrors casa's claim gate in both directions: a beyond-skew future
+        # mint clock is refused there, and so is anything past the TTL.
+        if -_SKEW_S <= age <= _PENDING_TTL_S:
+            return rec
+    return None
 
 
 @mcp.tool()
@@ -132,27 +199,73 @@ def setup_gmail() -> str:
     """Connect Gmail: returns an authorization link to open in a browser, or reports that Gmail is already connected. Takes no arguments and is safe to run repeatedly."""
     # Casa auto-runs this once the plugin's trigger-consent episode settles with
     # an approval (plugin_store.manifest_setup_tool), dispatching it to the
-    # agent with no arguments. Two consequences shape the body:
+    # agent with no arguments. Three consequences shape the body:
     #
     #  * It must be idempotent — casa may re-dispatch, so an existing, matching
-    #    connection returns a statement of fact and mints nothing. Re-minting
-    #    would invalidate a working setup's in-flight links for no reason.
+    #    and still-LIVE connection returns a statement of fact and mints
+    #    nothing. Re-minting would invalidate a working setup's in-flight links
+    #    for no reason. Liveness is checked, not assumed: see
+    #    _stored_credential_failure.
     #  * It must not raise when the callback route is closed. Nobody asked for
     #    this call, so an exception surfaces to the operator as a bare tool
     #    error explaining nothing. gmail_auth_start deliberately still raises:
     #    it answers a direct request, where a raise is the honest answer.
-    account = _connected_account()
-    if account:
-        return _ok({
-            "status": "already_connected",
-            "account": account,
-            "instructions": (
-                f"Gmail is already connected as {account} — nothing to do. "
-                "This is not a new authorization; do not report it as one."
-            ),
-        })
+    #  * A re-dispatch must not mint a SECOND authorization. `_authenticated`
+    #    is still false while the first link is outstanding, so minting again
+    #    would produce a second independent state and a second live link —
+    #    two authorizations the operator can both complete. Casa's spool
+    #    stores only the state HASH, so the earlier `auth_url` cannot be
+    #    reconstructed (and this plugin keeps no local flow store, by design);
+    #    what it CAN do is see that an attempt is still outstanding and say so.
+    dead_credential = None
+    connected = _connected_credential()
+    if connected is not None:
+        failure = _stored_credential_failure(connected)
+        if failure is None:
+            return _ok({
+                "status": "already_connected",
+                "account": connected.account,
+                "instructions": (
+                    f"Gmail is already connected as {connected.account} — "
+                    "nothing to do. This is not a new authorization; do not "
+                    "report it as one."
+                ),
+            })
+        kind, detail = failure
+        if kind == "retryable":
+            # Transient: the credential is presumed good and is untouched.
+            # Minting here would start a re-authorization nobody needs.
+            return _ok({
+                "status": "retry_later",
+                "account": connected.account,
+                "instructions": (
+                    f"Gmail is connected as {connected.account}, but I could "
+                    f"not confirm the connection just now ({detail}). This is "
+                    "a temporary problem — nothing has changed and no new "
+                    "authorization is needed. Do not start one; run "
+                    "setup_gmail again shortly if it persists."
+                ),
+            })
+        # Terminal (revoked / invalid_grant): the connection is genuinely
+        # broken, so fall through and mint a recovery link. The credential is
+        # deliberately NOT removed here.
+        dead_credential = detail
+
     try:
-        return _ok(_flow_start(_auth, _cb))
+        pending = _live_pending_attempt()
+        if pending is not None:
+            return _ok({
+                "status": "already_pending",
+                "instructions": (
+                    "An authorization link for Gmail was already sent and is "
+                    "still valid — no new link has been created, because a "
+                    "second one would leave two live authorizations. Ask "
+                    "the user to use the link from that earlier message. If she "
+                    "no longer has it, run setup_gmail again once that link "
+                    "expires and a fresh one will be minted."
+                ),
+            })
+        result = _flow_start(_auth, _cb)
     except CallbackUnavailable as exc:
         return _ok({
             "status": "unavailable",
@@ -161,6 +274,14 @@ def setup_gmail() -> str:
                 "authorized. Once that is resolved, run setup_gmail again."
             ),
         })
+    if dead_credential is not None:
+        result["status"] = "reauthorization_needed"
+        result["instructions"] = (
+            f"The stored Gmail connection is no longer valid "
+            f"({dead_credential}), so it must be authorized again — this link "
+            f"does that. {result['instructions']}"
+        )
+    return _ok(result)
 
 
 @mcp.tool()

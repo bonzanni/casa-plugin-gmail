@@ -281,23 +281,141 @@ def test_the_setup_tool_exists_and_is_argument_free():
     assert inspect.signature(server.setup_gmail).parameters == {}
 
 
-def test_setup_gmail_mints_a_flow_when_not_connected(monkeypatch):
-    import server
-    monkeypatch.setattr(server, "_authenticated", False)
-    calls = []
+def _spool(monkeypatch, *attempts):
+    """Install a stub casa spool exposing `attempts`.
 
+    setup_gmail reads the spool before minting (it has to: casa's spool is the
+    only record of an outstanding link), so every setup_gmail test needs one —
+    the real `_cb` points at /data/callbacks and would raise CallbackUnavailable.
+    """
+    import server
+    cb = MagicMock()
+    cb.attempts.return_value = list(attempts)
+    monkeypatch.setattr(server, "_cb", cb)
+    return cb
+
+
+def _awaiting(minted_ts, state_hash="b" * 64):
+    """An `awaiting_redirect` attempt record, shaped as casa's
+    callback_attempts.new_attempt builds one."""
+    return {"v": 1, "state_hash": state_hash, "minted_ts": minted_ts,
+            "status": "awaiting_redirect", "outcome": None, "claimed": False,
+            "meta": {"kind": "gmail-oauth", "v": 1}}
+
+
+def _minting_start(calls):
     def fake_start(auth, cb):
         calls.append((auth, cb))
         return {"auth_url": "https://accounts.google.com/o?state=s",
                 "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
                 "instructions": "open it"}
-    monkeypatch.setattr(server, "_flow_start", fake_start)
+    return fake_start
+
+
+def test_setup_gmail_mints_a_flow_when_not_connected(monkeypatch):
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
 
     result = json.loads(server.setup_gmail())
 
     assert len(calls) == 1                      # the flow really was minted
     assert result["auth_url"].startswith("https://accounts.google.com/")
     assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
+
+
+# ── Fix 2: a re-dispatch must not mint a second concurrent authorization ───
+
+def test_setup_gmail_does_not_mint_twice_while_disconnected(monkeypatch):
+    """Casa's dispatch is at-least-once. The already-connected branch does not
+    cover this: while the FIRST link is outstanding `_authenticated` is still
+    false, so the old code minted a second independent state and a second live
+    link — both usable, and both completable by the operator."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    cb = _spool(monkeypatch)
+    calls = []
+    started = _minting_start(calls)
+
+    def start_and_publish(auth, cb_arg):
+        # Minting really does publish an awaiting_redirect attempt into the
+        # spool, so the stub must too or the second call sees a clean slate.
+        out = started(auth, cb_arg)
+        cb.attempts.return_value = [_awaiting(time.time())]
+        return out
+    monkeypatch.setattr(server, "_flow_start", start_and_publish)
+
+    first = json.loads(server.setup_gmail())
+    second = json.loads(server.setup_gmail())          # casa re-dispatches
+
+    assert len(calls) == 1, "a re-dispatch minted a second authorization"
+    assert first["auth_url"].startswith("https://accounts.google.com/")
+    assert second["status"] == "already_pending"
+    assert "auth_url" not in second, "a second link was handed out"
+
+
+def test_setup_gmail_reports_an_outstanding_attempt_instead_of_minting(monkeypatch):
+    """The plugin cannot reconstruct the earlier auth_url — casa's spool stores
+    only the state hash — so the honest answer is that one is already out."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, _awaiting(time.time() - 60))
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("minted a second flow while one was outstanding")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "already_pending"
+    assert "already sent" in result["instructions"]
+
+
+def test_setup_gmail_mints_when_the_outstanding_attempt_is_past_casas_ttl(monkeypatch):
+    """casa's PENDING_TTL_S is 1800s and its claim gate refuses an older state
+    outright, but the sweep that retires it runs only every 10 minutes — so a
+    DEAD flow still reads `awaiting_redirect` for up to ~40 minutes. Trusting
+    the status alone would send the operator to a link that cannot work."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, _awaiting(time.time() - 1801))
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert len(calls) == 1, "deferred to an attempt casa would refuse to claim"
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+
+
+def test_setup_gmail_mints_when_the_outstanding_attempt_has_no_mint_clock(monkeypatch):
+    """`minted_ts` is legitimately None on a legacy or consumer-held record.
+    Liveness cannot be established, so it must not read as pending."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, _awaiting(None))
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    json.loads(server.setup_gmail())
+    assert len(calls) == 1
+
+
+def test_setup_gmail_mints_when_the_only_attempt_already_has_its_result(monkeypatch):
+    """`result_ready` is waiting on gmail_auth_collect, not on the browser —
+    it is not an outstanding link, so it must not suppress a mint."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    ready = _awaiting(time.time() - 60)
+    ready["status"] = "result_ready"
+    _spool(monkeypatch, ready)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    json.loads(server.setup_gmail())
+    assert len(calls) == 1
 
 
 def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
@@ -313,6 +431,7 @@ def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
         account="user@example.com")
     monkeypatch.setattr(server, "_auth", mock_auth)
     monkeypatch.setattr(server, "_authenticated", True)
+    _spool(monkeypatch)
 
     def must_not_mint(auth, cb):
         raise AssertionError("setup_gmail minted a flow while already connected")
@@ -322,6 +441,90 @@ def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
 
     assert result["status"] == "already_connected"
     assert result["account"] == "user@example.com"
+    # The claim is checked, not assumed: a live connection is one that refreshes.
+    mock_auth.probe_refresh.assert_called_once_with("rt")
+
+
+# ── Fix 3: "already connected" must mean the credential still works ────────
+
+def _connected_auth(monkeypatch, probe_error=None):
+    import server
+    from token_store import Credential
+    mock_auth = MagicMock()
+    mock_auth.subject_email = "user@example.com"
+    mock_auth.store.load_active.return_value = Credential(
+        refresh_token="rt", flow="a" * 64, generation=1.0,
+        account="user@example.com")
+    if probe_error is not None:
+        mock_auth.probe_refresh.side_effect = probe_error
+    monkeypatch.setattr(server, "_auth", mock_auth)
+    monkeypatch.setattr(server, "_authenticated", True)
+    return mock_auth
+
+
+def test_setup_gmail_mints_a_recovery_link_when_the_stored_token_is_revoked(monkeypatch):
+    """`_authenticated` is set once at activation and never cleared, and the
+    on-disk account still matches after a revocation — so the old code reported
+    `already_connected` and minted nothing at the exact moment Gmail was
+    failing and the operator (who did not ask for this call) needed a link."""
+    import server
+    from auth import RefreshTerminal
+
+    mock_auth = _connected_auth(
+        monkeypatch, RefreshTerminal("invalid_grant: Token has been expired or revoked."))
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result.get("status") != "already_connected"
+    assert len(calls) == 1, "a revoked credential produced no recovery link"
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert result["status"] == "reauthorization_needed"
+    assert "invalid_grant" in result["instructions"]
+    # Never destroy a credential here — reaping is load_active's job.
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_does_not_mint_on_a_transient_refresh_failure(monkeypatch):
+    """The RefreshTerminal/RefreshRetryable split is exactly this distinction: a
+    Google 5xx or a network blip must not trigger a re-authorization."""
+    import server
+    from auth import RefreshRetryable
+
+    mock_auth = _connected_auth(
+        monkeypatch, RefreshRetryable("temporarily_unavailable"))
+    _spool(monkeypatch)
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("a transient refresh failure minted a new flow")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "retry_later"
+    assert result["account"] == "user@example.com"
+    assert "temporarily_unavailable" in result["instructions"]
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_treats_an_unclassified_probe_failure_as_transient(monkeypatch):
+    """Ambiguity must never mint or destroy — the same policy load_active
+    applies to an error it cannot classify."""
+    import server
+
+    mock_auth = _connected_auth(monkeypatch, ValueError("something odd"))
+    _spool(monkeypatch)
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("an unclassified failure minted a new flow")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "retry_later"
+    mock_auth.store.remove_active.assert_not_called()
 
 
 def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeypatch):
@@ -337,6 +540,7 @@ def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeyp
         account="someone.else@example.com")
     monkeypatch.setattr(server, "_auth", mock_auth)
     monkeypatch.setattr(server, "_authenticated", True)
+    _spool(monkeypatch)
     monkeypatch.setattr(server, "_flow_start", lambda auth, cb: {
         "auth_url": "https://accounts.google.com/o?state=s",
         "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
@@ -355,6 +559,7 @@ def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatc
     from casa_callback import CallbackUnavailable
 
     monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch)          # route open enough to read: the mint is what fails
 
     def boom(auth, cb):
         raise CallbackUnavailable("route not open: callback_no_target ...")
