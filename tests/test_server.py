@@ -257,10 +257,12 @@ def test_manifest_declares_the_setup_tool_casa_auto_runs():
     to hand back") and the operator had to ask for authorization by hand."""
     manifest = _manifest()
     name = manifest["casa"]["setupTool"]
-    assert name == "setup_gmail"
+    # Grammar FIRST: a name that fails it is a hard StoreError blocking
+    # install/update, which is worse than merely naming the wrong tool.
     assert _CASA_SETUP_TOOL_RE.fullmatch(name), (
         f"{name!r} fails casa's ^setup_[a-z0-9_]{{1,64}}$ — install would be "
         "rejected with setup_tool_invalid")
+    assert name == "setup_gmail"
 
 
 def test_the_setup_tool_is_not_protected():
