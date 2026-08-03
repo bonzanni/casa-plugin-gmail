@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import secrets
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -80,3 +81,27 @@ def parse_callback_query(pairs) -> tuple[str | None, str | None]:
     if not errors[0]:
         raise MalformedCallback("callback query carries an empty error")
     return None, errors[0]
+
+
+MINT_META = {"kind": "gmail-oauth", "v": 1}
+
+
+def start(auth, cb) -> dict:
+    """Mint a state into the spool and build the Google authorization URL.
+
+    No local flow store: only a state we minted can produce a result, and the
+    result's filename IS that state's hash, so CSRF protection is structural.
+    """
+    route = cb.resolve()
+    state = secrets.token_urlsafe(32)
+    cb.mint(state, dict(MINT_META))
+    return {
+        "auth_url": auth.build_auth_url(route.redirect_uri, state),
+        "redirect_uri": route.redirect_uri,
+        "instructions": (
+            "Open auth_url and grant access. When the browser shows "
+            "'Response received', you're done — I'll be notified automatically "
+            "and will finish the setup. If Google reports redirect_uri_mismatch, "
+            "register the redirect_uri above with the OAuth client."
+        ),
+    }
