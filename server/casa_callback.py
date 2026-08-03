@@ -98,11 +98,6 @@ class CasaCallback:
         import callback_spool
         return callback_spool, callback_attempts
 
-    @staticmethod
-    def state_hash(state: str) -> str:
-        import callback_spool
-        return callback_spool.state_hash(state)
-
     def mint(self, state: str, meta: dict) -> None:
         spool, _ = self._protocol()
         spool.mint(self.resolve().spool_dir, state, meta)
