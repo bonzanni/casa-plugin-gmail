@@ -13,6 +13,9 @@ import secrets
 from contextlib import contextmanager
 from pathlib import Path
 
+from auth import RefreshRetryable, RefreshTerminal
+from token_store import StagedFlowMismatch
+
 LOCK_NAME = "collect.lock"
 
 
@@ -105,3 +108,80 @@ def start(auth, cb) -> dict:
             "register the redirect_uri above with the OAuth client."
         ),
     }
+
+
+def reconcile_stage(auth, cb) -> tuple[str, str]:
+    """Step 0. Resolve the single staged slot before any attempt is considered.
+
+    A stage does not only appear after a crash — a getProfile timeout leaves one
+    behind in a perfectly healthy process. Since no flow may be exchanged while
+    a stage exists, every stage must reach a decision here.
+
+    Returns (outcome, message) with outcome in {none, promoted, settled, retain}.
+    """
+    staged = auth.store.load_staged()
+    if staged is None or not staged.flow:
+        return "none", ""
+
+    active = auth.store.load_active()
+    if active is not None and active.flow == staged.flow:
+        # Post-promote residue: the flow already committed.
+        auth.store.discard_staged()
+        return "none", ""
+
+    try:
+        account = auth.refresh_and_verify(staged.refresh_token)
+    except RefreshRetryable as exc:
+        # Keep the stage AND the active credential; the nudge will re-fire.
+        return "retain", f"Could not verify the pending authorization yet ({exc})."
+    except RefreshTerminal as exc:
+        # Settle it, or it wedges the slot forever. Ack BEFORE unlink so a
+        # successor never finds a journal with no disposition.
+        cb.ack(staged.flow)
+        auth.store.discard_staged()
+        return "settled", (
+            f"The pending Gmail authorization is no longer valid ({exc}). "
+            "Please start authorization again."
+        )
+
+    if account.lower() != auth.subject_email.lower():
+        cb.ack(staged.flow)
+        auth.store.discard_staged()
+        return "settled", (
+            f"That authorization was granted by {account}, but this plugin is "
+            f"configured for {auth.subject_email}. Nothing was changed — the "
+            "existing connection is untouched. Please retry with the right account."
+        )
+
+    try:
+        committed = auth.store.promote(staged.flow, account)
+    except StagedFlowMismatch as exc:
+        return "retain", f"Pending authorization changed under us ({exc})."
+
+    auth.activate(committed)
+    cb.ack(staged.flow)
+    return "promoted", f"Gmail connected as {account}."
+
+
+def startup_recover(auth, cb) -> str:
+    """Read env, load the active credential, then reconcile any stage — all
+    under the lock, as ONE unit.
+
+    Active FIRST: a transient failure verifying a stage must never leave the
+    process unauthenticated when a good active credential is on disk.
+
+    `validate_and_init` can itself mutate the store (it removes a terminally
+    dead active token), so it must be inside the lock, not before it. This is
+    the whole of the plugin's startup credential work — `server._startup` must
+    not call `validate_and_init` separately. A missing env var still exits the
+    process: SystemExit is a BaseException and is not caught by the caller.
+    """
+    with collect_lock(auth.store.dir) as acquired:
+        if not acquired:
+            return "busy"
+        auth.validate_and_init()
+        try:
+            outcome, _message = reconcile_stage(auth, cb)
+        except Exception:
+            return "error"
+        return outcome
