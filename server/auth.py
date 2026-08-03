@@ -5,8 +5,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as AuthRequest
 from google.oauth2.credentials import Credentials
+
+from token_store import Credential, TokenStore
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -29,6 +32,18 @@ class ExchangeRetryable(RuntimeError):
     """Transport failure, 5xx or 429. The flow may still succeed: do NOT ack."""
 
 
+class AccountMismatch(RuntimeError):
+    """The credential authorizes an inbox other than GMAIL_USER_EMAIL."""
+
+
+class RefreshTerminal(RuntimeError):
+    """The refresh token is dead (revoked / invalid_grant)."""
+
+
+class RefreshRetryable(RuntimeError):
+    """Transport failure refreshing. The token is still good — retain it."""
+
+
 class GmailAuth:
     SCOPES = SCOPES
 
@@ -37,10 +52,9 @@ class GmailAuth:
         self._user_email = None
         self._client_id = None
         self._client_secret = None
-        self._token_file = os.path.join(plugin_data_dir, "oauth_token.json")
+        self.store = TokenStore(plugin_data_dir)
 
-    def validate_and_init(self) -> bool:
-        """Read env vars and try to load persisted token. Returns True if authenticated."""
+    def _read_env(self) -> None:
         values = {name: os.environ.get(name, "") for name in _REQUIRED_ENV_VARS}
         missing = [name for name, val in values.items() if not val]
         if missing:
@@ -49,35 +63,69 @@ class GmailAuth:
                 file=sys.stderr,
             )
             sys.exit(1)
-
         self._client_id = values["GMAIL_CLIENT_ID"]
         self._client_secret = values["GMAIL_CLIENT_SECRET"]
         self._user_email = values["GMAIL_USER_EMAIL"]
 
-        if not os.path.exists(self._token_file):
-            return False
+    def validate_and_init(self) -> bool:
+        """Read env vars and load the ACTIVE credential. Staged recovery is the
+        caller's job (auth_flow.startup_recover), which holds the collect lock."""
+        self._read_env()
+        return self.load_active()
 
-        try:
-            with open(self._token_file) as f:
-                data = json.load(f)
-            credentials = Credentials(
-                token=None,
-                refresh_token=data["refresh_token"],
-                token_uri=_TOKEN_URI,
-                client_id=self._client_id,
-                client_secret=self._client_secret,
-                scopes=SCOPES,
-            )
-            credentials.refresh(AuthRequest())
-            self._credentials = credentials
-            return True
-        except Exception as exc:
+    def load_active(self) -> bool:
+        cred = self.store.load_active()
+        if cred is None:
+            return False
+        if cred.account and cred.account.lower() != self._user_email.lower():
             print(
-                f"Gmail plugin: stored token invalid or expired — re-auth needed. Error: {exc}",
+                "Gmail plugin: the stored credential authorizes "
+                f"{cred.account!r} but GMAIL_USER_EMAIL is {self._user_email!r}. "
+                "Re-authorization is needed.",
                 file=sys.stderr,
             )
-            os.remove(self._token_file)
             return False
+        try:
+            refreshed = self._refresh(cred.refresh_token)
+        except RefreshTerminal as exc:
+            print(f"Gmail plugin: stored token is dead — re-auth needed ({exc}).",
+                  file=sys.stderr)
+            self.store.remove_active()
+            return False
+        except RefreshRetryable as exc:
+            # RETAIN the token: a network blip is not a revocation.
+            print(f"Gmail plugin: could not refresh right now ({exc}); token kept.",
+                  file=sys.stderr)
+            return False
+        # Pass the already-refreshed object through: rebuilding from the
+        # refresh token alone would throw away the access token we just fetched.
+        self.activate(cred, credentials=refreshed)
+        return True
+
+    def _refresh(self, refresh_token: str) -> Credentials:
+        credentials = self.credentials_for(refresh_token)
+        try:
+            credentials.refresh(AuthRequest())
+        except RefreshError as exc:
+            raise RefreshTerminal(str(exc)) from exc
+        except Exception as exc:
+            raise RefreshRetryable(str(exc)) from exc
+        return credentials
+
+    def activate(self, cred: Credential, credentials=None) -> None:
+        """Idempotent: make `cred` the live credential.
+
+        `credentials` lets a caller that has just refreshed hand the live object
+        through instead of discarding its access token. Callers that hold only a
+        stored Credential omit it; google-auth then refreshes on first use.
+        """
+        self._credentials = credentials or self.credentials_for(cred.refresh_token)
+
+    def refresh_and_verify(self, refresh_token: str) -> str:
+        """Refresh, then ask Google which account this credential belongs to."""
+        credentials = self._refresh(refresh_token)
+        from gmail_client import GmailClient
+        return GmailClient(credentials).get_profile_email()
 
     def build_auth_url(self, redirect_uri: str, state: str) -> str:
         """Authorization URL for casa's callback endpoint.

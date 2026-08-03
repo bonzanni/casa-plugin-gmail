@@ -84,6 +84,14 @@ class GmailClient:
     def __init__(self, credentials):
         self._service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
+    def get_profile_email(self) -> str:
+        """The address this credential actually authorizes."""
+        try:
+            resp = self._service.users().getProfile(userId="me").execute()
+        except HttpError as exc:
+            raise _translate_error(exc)
+        return resp.get("emailAddress", "")
+
     # ── Search / Read ──────────────────────────────────────────────────────
 
     def search_emails(self, query: str, max_results: int = 20) -> list[dict]:

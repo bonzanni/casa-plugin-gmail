@@ -66,48 +66,34 @@ def test_no_token_file_credentials_is_none(monkeypatch, tmp_path):
     assert auth.credentials is None
 
 
-# ── Token file present ──────────────────────────────────────────────────────
+# ── Active credential loading ───────────────────────────────────────────────
 
-@patch("auth.Credentials")
-def test_valid_token_file_returns_true(mock_creds_cls, monkeypatch, tmp_path):
-    _set_full_env(monkeypatch)
-    (tmp_path / "oauth_token.json").write_text(json.dumps({"refresh_token": "rt-abc"}))
-    mock_creds = MagicMock()
-    mock_creds_cls.return_value = mock_creds
-
-    assert make_auth(tmp_path).validate_and_init() is True
+def _write_v2(tmp_path, **over):
+    payload = {"v": 2, "refresh_token": "rt-abc", "flow": "a" * 64,
+               "generation": 5.0, "account": "user@workspace.example.com",
+               "committed_ts": 1.0}
+    payload.update(over)
+    (tmp_path / "oauth_token.json").write_text(json.dumps(payload))
 
 
 @patch("auth.Credentials")
-def test_valid_token_file_sets_authenticated(mock_creds_cls, monkeypatch, tmp_path):
+def test_valid_v2_token_authenticates(mock_creds_cls, monkeypatch, tmp_path):
     _set_full_env(monkeypatch)
-    (tmp_path / "oauth_token.json").write_text(json.dumps({"refresh_token": "rt-abc"}))
+    _write_v2(tmp_path)
     mock_creds_cls.return_value = MagicMock()
 
     auth = make_auth(tmp_path)
-    auth.validate_and_init()
+    assert auth.validate_and_init() is True
     assert auth.is_authenticated
     assert auth.subject_email == "user@workspace.example.com"
 
 
 @patch("auth.Credentials")
-def test_valid_token_calls_refresh(mock_creds_cls, monkeypatch, tmp_path):
+def test_v2_account_mismatch_refuses_to_authenticate(mock_creds_cls, monkeypatch, tmp_path):
+    """Changing GMAIL_USER_EMAIL must not silently keep serving the old inbox."""
     _set_full_env(monkeypatch)
-    (tmp_path / "oauth_token.json").write_text(json.dumps({"refresh_token": "rt-abc"}))
-    mock_creds = MagicMock()
-    mock_creds_cls.return_value = mock_creds
-
-    make_auth(tmp_path).validate_and_init()
-    mock_creds.refresh.assert_called_once()
-
-
-@patch("auth.Credentials")
-def test_invalid_token_returns_false(mock_creds_cls, monkeypatch, tmp_path):
-    _set_full_env(monkeypatch)
-    (tmp_path / "oauth_token.json").write_text(json.dumps({"refresh_token": "bad-token"}))
-    mock_creds = MagicMock()
-    mock_creds.refresh.side_effect = Exception("token expired")
-    mock_creds_cls.return_value = mock_creds
+    _write_v2(tmp_path, account="someone-else@example.com")
+    mock_creds_cls.return_value = MagicMock()
 
     auth = make_auth(tmp_path)
     assert auth.validate_and_init() is False
@@ -115,16 +101,50 @@ def test_invalid_token_returns_false(mock_creds_cls, monkeypatch, tmp_path):
 
 
 @patch("auth.Credentials")
-def test_invalid_token_removes_file(mock_creds_cls, monkeypatch, tmp_path):
+def test_v2_account_mismatch_keeps_the_token_file(mock_creds_cls, monkeypatch, tmp_path):
     _set_full_env(monkeypatch)
-    token_file = tmp_path / "oauth_token.json"
-    token_file.write_text(json.dumps({"refresh_token": "bad-token"}))
-    mock_creds = MagicMock()
-    mock_creds.refresh.side_effect = Exception("token expired")
-    mock_creds_cls.return_value = mock_creds
+    _write_v2(tmp_path, account="someone-else@example.com")
+    mock_creds_cls.return_value = MagicMock()
 
     make_auth(tmp_path).validate_and_init()
-    assert not token_file.exists()
+    assert (tmp_path / "oauth_token.json").exists()
+
+
+@patch("auth.Credentials")
+def test_account_comparison_is_case_insensitive(mock_creds_cls, monkeypatch, tmp_path):
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path, account="User@Workspace.Example.COM")
+    mock_creds_cls.return_value = MagicMock()
+
+    assert make_auth(tmp_path).validate_and_init() is True
+
+
+@patch("auth.Credentials")
+def test_terminal_refresh_failure_removes_the_token(mock_creds_cls, monkeypatch, tmp_path):
+    from google.auth.exceptions import RefreshError
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = RefreshError("invalid_grant")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not (tmp_path / "oauth_token.json").exists()
+
+
+@patch("auth.Credentials")
+def test_transient_refresh_failure_RETAINS_the_token(mock_creds_cls, monkeypatch, tmp_path):
+    """A network blip must never destroy a valid refresh token."""
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = OSError("connection reset")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert (tmp_path / "oauth_token.json").exists()
 
 
 # ── build_auth_url ──────────────────────────────────────────────────────────
