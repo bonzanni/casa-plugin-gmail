@@ -232,6 +232,62 @@ def test_reconcile_does_not_ack_when_activation_fails(tmp_path):
     assert store.load_active().refresh_token == "rt-new"    # promoted on disk
 
 
+def _auth_with_real_refresh(tmp_path, monkeypatch, refresh_side_effect):
+    """A real GmailAuth over a real TokenStore, with only the google-auth
+    Credentials object faked. The RefreshError → Refresh{Retryable,Terminal}
+    classification therefore runs for real, which is the point: a MagicMock
+    auth would let reconcile_stage's catch-all decide instead."""
+    from unittest.mock import patch
+    from auth import GmailAuth
+    for key, val in {"GMAIL_CLIENT_ID": "client-id",
+                     "GMAIL_CLIENT_SECRET": "client-secret",
+                     "GMAIL_USER_EMAIL": "user@example.com"}.items():
+        monkeypatch.setenv(key, val)
+    auth = GmailAuth(str(tmp_path))
+    auth.read_env()
+    creds = MagicMock()
+    creds.refresh.side_effect = refresh_side_effect
+    return auth, patch("auth.Credentials", return_value=creds)
+
+
+def test_reconcile_retains_a_stage_when_google_is_transiently_down(tmp_path, monkeypatch):
+    """BLOCKER regression. google-auth raises RefreshError(retryable=True) for a
+    transient Google 5xx, after its own retries are spent. Settling that would
+    ack and unlink a perfectly valid freshly-granted credential."""
+    from google.auth.exceptions import RefreshError
+    from auth_flow import reconcile_stage
+    auth, patched = _auth_with_real_refresh(
+        tmp_path, monkeypatch,
+        RefreshError("server_error: backend error", retryable=True))
+    cb = MagicMock()
+    auth.store.stage("rt-new", FLOW, 9.0)
+
+    with patched:
+        outcome, _message = reconcile_stage(auth, cb)
+
+    assert outcome == "retain"
+    assert auth.store.load_staged() is not None
+    cb.ack.assert_not_called()
+
+
+def test_reconcile_still_settles_a_genuinely_revoked_stage(tmp_path, monkeypatch):
+    """The other half: a non-retryable RefreshError must still settle, or a dead
+    stage wedges the slot forever."""
+    from google.auth.exceptions import RefreshError
+    from auth_flow import reconcile_stage
+    auth, patched = _auth_with_real_refresh(
+        tmp_path, monkeypatch, RefreshError("invalid_grant", retryable=False))
+    cb = MagicMock()
+    auth.store.stage("rt-dead", FLOW, 9.0)
+
+    with patched:
+        outcome, _message = reconcile_stage(auth, cb)
+
+    assert outcome == "settled"
+    assert auth.store.load_staged() is None
+    cb.ack.assert_called_once_with(FLOW)
+
+
 def test_reconcile_settles_a_terminally_dead_stage(tmp_path):
     """A revoked stage must not wedge the slot forever."""
     from auth import RefreshTerminal
@@ -404,6 +460,84 @@ def test_startup_recover_does_not_catch_system_exit(tmp_path):
 
     with pytest.raises(SystemExit):
         startup_recover(auth, cb)
+
+
+# ── Startup-recovery outcomes must reach the user ──────────────────────────
+# Casa's browser page is identical for success, denial and a replayed link, so
+# chat is the only place the real outcome is ever learned. A stage resolved by
+# startup_recover is ACKED, and the ack tears the attempt down — so without a
+# durable notice the next collect finds nothing and says nothing.
+
+def _next_collect(auth):
+    """A fresh collect_pass with no attempts waiting: only a drained notice can
+    put anything in `messages`."""
+    from auth_flow import collect_pass
+    cb = MagicMock()
+    cb.attempts.return_value = []
+    return collect_pass(auth, cb)
+
+
+def test_startup_promotion_is_reported_by_the_next_collect(tmp_path):
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "user@example.com"
+
+    assert startup_recover(auth, cb) == "promoted"
+
+    out = _next_collect(auth)
+    assert any("Gmail connected as user@example.com" in m for m in out["messages"])
+
+
+def test_startup_wrong_account_rejection_is_reported_by_the_next_collect(tmp_path):
+    """The case that matters most: the user granted from the wrong inbox and
+    would otherwise get a neutral browser page and total silence in chat."""
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+
+    assert startup_recover(auth, cb) == "settled"
+
+    out = _next_collect(auth)
+    assert any("someone-else@example.com" in m for m in out["messages"])
+
+
+def test_startup_terminal_settlement_is_reported_by_the_next_collect(tmp_path):
+    from auth import RefreshTerminal
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
+
+    assert startup_recover(auth, cb) == "settled"
+
+    out = _next_collect(auth)
+    assert any("no longer valid" in m for m in out["messages"])
+
+
+def test_the_notice_is_written_before_the_ack(tmp_path):
+    """Ordering pin. Casa's ack is a settlement receipt that tears the flow
+    down; a notice written after it is lost by a crash in between — which is
+    the exact scenario the notice exists for."""
+    from auth import RefreshTerminal
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
+    seen = {}
+    cb.ack.side_effect = lambda h: seen.update(notices=store.load_notices())
+
+    startup_recover(auth, cb)
+
+    assert seen["notices"], "the notice must already be on disk when ack runs"
+    assert "no longer valid" in seen["notices"][0]
+
+
+def test_a_notice_is_drained_only_once(tmp_path):
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "user@example.com"
+    startup_recover(auth, cb)
+
+    assert any("Gmail connected as" in m for m in _next_collect(auth)["messages"])
+    assert not any("Gmail connected as" in m for m in _next_collect(auth)["messages"])
 
 
 def attempt(h, minted_ts=100.0, status="result_ready", outcome=None, claimed=False):
@@ -593,6 +727,37 @@ def test_a_settled_dead_stage_lets_a_later_flow_succeed(tmp_path):
 
     collect_pass(auth, cb)
     assert store.load_active().refresh_token == "rt-new"
+
+
+def test_a_live_collect_message_is_never_also_queued_as_a_notice(tmp_path):
+    """No-duplicate pin. collect_pass relays reconcile_stage's message itself,
+    so reconcile_stage must queue nothing on its behalf — otherwise the very
+    next pass would repeat 'Gmail connected as …' out of nowhere."""
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+
+    out = collect_pass(auth, cb)
+
+    assert [m for m in out["messages"] if "Gmail connected as" in m] == \
+        ["Gmail connected as user@example.com."]
+    assert store.load_notices() == []
+    assert not any("Gmail connected as" in m
+                   for m in _next_collect(auth)["messages"])
+
+
+def test_an_empty_pass_says_plainly_that_nothing_was_waiting(tmp_path):
+    """`status: ok` with no messages reads as confirmation of success. It
+    confirms nothing — a stale or replayed link produces exactly this."""
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [])
+
+    out = collect_pass(auth, cb)
+
+    assert out["status"] == "ok"          # nothing failed
+    assert out["promoted"] is False
+    assert out["messages"], "an empty pass must not be silent"
+    assert any("does NOT confirm" in m for m in out["messages"])
 
 
 def test_contended_lock_is_a_noop(tmp_path):

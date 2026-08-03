@@ -147,6 +147,61 @@ def test_transient_refresh_failure_RETAINS_the_token(mock_creds_cls, monkeypatch
     assert (tmp_path / "oauth_token.json").exists()
 
 
+@patch("auth.Credentials")
+def test_retryable_RefreshError_RETAINS_the_token(mock_creds_cls, monkeypatch, tmp_path):
+    """A transient Google 5xx surfaces as RefreshError(retryable=True) after
+    google-auth exhausts its own retries. Treating that as terminal would
+    destroy a working refresh token over an outage."""
+    from google.auth.exceptions import RefreshError
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = RefreshError(
+        "server_error: backend error", retryable=True)
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert (tmp_path / "oauth_token.json").exists()
+
+
+@patch("auth.Credentials")
+def test_non_retryable_RefreshError_still_removes_the_token(
+        mock_creds_cls, monkeypatch, tmp_path):
+    """The other half: an actual revocation must still be terminal."""
+    from google.auth.exceptions import RefreshError
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = RefreshError("invalid_grant", retryable=False)
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not (tmp_path / "oauth_token.json").exists()
+
+
+@patch("auth.Credentials")
+def test_RefreshError_without_a_retryable_attribute_is_terminal(
+        mock_creds_cls, monkeypatch, tmp_path):
+    """Defensive read: a google-auth that drops `.retryable` must degrade to
+    today's behaviour rather than raising AttributeError."""
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+
+    class BareRefreshError(Exception):
+        pass
+
+    creds = MagicMock()
+    creds.refresh.side_effect = BareRefreshError("invalid_grant")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    with patch("auth.RefreshError", BareRefreshError):
+        assert auth.validate_and_init() is False
+    assert not (tmp_path / "oauth_token.json").exists()
+
+
 # ── Legacy v1 migration ─────────────────────────────────────────────────────
 
 def _write_v1(tmp_path, refresh_token="rt-legacy"):

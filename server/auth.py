@@ -147,6 +147,17 @@ class GmailAuth:
         try:
             credentials.refresh(AuthRequest())
         except RefreshError as exc:
+            # NOT every RefreshError is a revocation. google-auth marks the
+            # exception retryable when the token endpoint answered with a
+            # retryable status, or with `internal_failure` / `server_error` /
+            # `temporarily_unavailable` (oauth2/_client.py `_can_retry`), and
+            # raises it only after exhausting its own internal retries. Calling
+            # that terminal would delete a working refresh token — and discard a
+            # freshly-staged, perfectly valid credential — because Google had a
+            # transient outage. getattr, not `.retryable`: a future google-auth
+            # that drops the attribute must degrade to "terminal", not crash.
+            if getattr(exc, "retryable", False):
+                raise RefreshRetryable(str(exc)) from exc
             raise RefreshTerminal(str(exc)) from exc
         except Exception as exc:
             raise RefreshRetryable(str(exc)) from exc

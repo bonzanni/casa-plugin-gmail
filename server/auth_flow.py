@@ -113,7 +113,7 @@ def start(auth, cb) -> dict:
     }
 
 
-def reconcile_stage(auth, cb) -> tuple[str, str]:
+def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
     """Step 0. Resolve the single staged slot before any attempt is considered.
 
     A stage does not only appear after a crash — a getProfile timeout leaves one
@@ -121,7 +121,20 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
     a stage exists, every stage must reach a decision here.
 
     Returns (outcome, message) with outcome in {none, promoted, settled, retain}.
+
+    `notify` is the ROUTING decision for the message, and belongs here because
+    ordering does: when the caller has no live channel to the user (startup
+    recovery), every message that accompanies an ack is persisted BEFORE that
+    ack, so a later collect can still say what happened. `collect_pass` relays
+    its own return value, so it leaves notify False — that, and not any
+    after-the-fact string comparison, is what makes a duplicate impossible.
     """
+    def settle(message: str) -> str:
+        """Persist the notice (if nobody is listening), THEN let the caller ack."""
+        if notify:
+            auth.store.queue_notice(message)
+        return message
+
     staged = auth.store.load_staged()
     if staged is None or not staged.flow:
         return "none", ""
@@ -139,13 +152,15 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
         return "retain", f"Could not verify the pending authorization yet ({exc})."
     except RefreshTerminal as exc:
         # Settle it, or it wedges the slot forever. Ack BEFORE unlink so a
-        # successor never finds a journal with no disposition.
-        cb.ack(staged.flow)
-        auth.store.discard_staged()
-        return "settled", (
+        # successor never finds a journal with no disposition — and settle()
+        # BEFORE the ack, so the sentence outlives the teardown.
+        message = settle(
             f"The pending Gmail authorization is no longer valid ({exc}). "
             "Please start authorization again."
         )
+        cb.ack(staged.flow)
+        auth.store.discard_staged()
+        return "settled", message
     except Exception as exc:
         # refresh_and_verify is a refresh AND a getProfile; the second half
         # raises neither typed error (a plain ValueError for any HttpError, and
@@ -163,13 +178,14 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
         )
 
     if account.lower() != auth.subject_email.lower():
-        cb.ack(staged.flow)
-        auth.store.discard_staged()
-        return "settled", (
+        message = settle(
             f"That authorization was granted by {account}, but this plugin is "
             f"configured for {auth.subject_email}. Nothing was changed — the "
             "existing connection is untouched. Please retry with the right account."
         )
+        cb.ack(staged.flow)
+        auth.store.discard_staged()
+        return "settled", message
 
     try:
         committed = auth.store.promote(staged.flow, account)
@@ -186,8 +202,9 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
             f"Gmail is authorized but I could not finish setting up ({exc}); "
             "I'll retry."
         )
+    message = settle(f"Gmail connected as {account}.")
     cb.ack(staged.flow)
-    return "promoted", f"Gmail connected as {account}."
+    return "promoted", message
 
 
 def startup_recover(auth, cb) -> str:
@@ -215,7 +232,12 @@ def startup_recover(auth, cb) -> str:
             return "busy"
         auth.validate_and_init()
         try:
-            outcome, _message = reconcile_stage(auth, cb)
+            # notify=True: there is no live channel here. Whatever this
+            # resolves — a promote, a wrong-account rejection, a terminal
+            # settle — is acked, and casa's ack tears the attempt down, so the
+            # next collect_pass would find nothing left to report. The notice
+            # is what carries the outcome into that call.
+            outcome, _message = reconcile_stage(auth, cb, notify=True)
         except Exception as exc:
             print(
                 f"Gmail plugin: credential startup recovery failed ({exc}).",
@@ -280,6 +302,13 @@ def collect_pass(auth, cb) -> dict:
     with collect_lock(auth.store.dir) as acquired:
         if not acquired:
             return {"status": "busy", "messages": [], "promoted": False}
+
+        # Anything a previous startup recovery resolved with nobody listening.
+        # Drained FIRST so it reads in the order it happened, and drained here
+        # rather than at the end because every early return below must still
+        # carry it. reconcile_stage runs with notify False from this point on,
+        # so nothing this pass produces can also land in the notice file.
+        out["messages"].extend(auth.store.drain_notices())
 
         outcome, message = reconcile_stage(auth, cb)
         if message:
@@ -376,4 +405,16 @@ def collect_pass(auth, cb) -> dict:
                 return out
             # "settled" — dead or wrong-account; try the next attempt.
 
+    if out["status"] == "ok" and not out["messages"] and not out["promoted"]:
+        # A pass that did nothing must not read as a success. This tool is
+        # documented as safe to call repeatedly, so an empty pass is normal —
+        # a stale or replayed link produces one — and `status: "ok"` with no
+        # messages leaves the agent with nothing to relay but a green light it
+        # has no basis for. Say plainly that nothing was found. Not an error:
+        # nothing failed.
+        out["messages"].append(
+            "No authorization result was waiting — nothing was collected. This "
+            "does NOT confirm that Gmail authorization succeeded. If you were "
+            "expecting a result, run gmail_auth_start and follow the link again."
+        )
     return out

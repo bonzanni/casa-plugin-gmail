@@ -20,6 +20,7 @@ from pathlib import Path
 
 ACTIVE_NAME = "oauth_token.json"
 STAGED_NAME = "oauth_token.staged.json"
+NOTICE_NAME = "pending_notices.json"
 SCHEMA_VERSION = 2
 
 
@@ -80,6 +81,7 @@ class TokenStore:
         self._dir = Path(data_dir)
         self._active = self._dir / ACTIVE_NAME
         self._staged = self._dir / STAGED_NAME
+        self._notices = self._dir / NOTICE_NAME
 
     @property
     def dir(self) -> Path:
@@ -150,3 +152,49 @@ class TokenStore:
         except FileNotFoundError:
             return
         _fsync_dir(self._dir)
+
+    # ── Pending user-facing notices ────────────────────────────────────────
+    # A flow can be resolved with nobody listening — startup recovery settles
+    # and ACKS a stage, and casa's ack tears the attempt down, so the next
+    # collect finds nothing left to report. The outcome would be lost exactly
+    # in the cases the user most needs told (wrong account, dead flow). These
+    # two calls give the resolver somewhere durable to leave the sentence.
+    # Deliberately dumb: a list of strings, written with the same durable
+    # write as a credential, drained and removed in one go. No schema
+    # evolution, no retention policy — an unread notice is a bug, not a state.
+
+    def queue_notice(self, message: str) -> None:
+        """Durably record a user-facing outcome.
+
+        Callers MUST write the notice BEFORE the ack it describes: the ack is a
+        settlement receipt that tears the flow down, so a notice written after
+        it is lost by any crash in between — which is the very scenario it
+        exists for.
+        """
+        self._dir.mkdir(parents=True, exist_ok=True)
+        _durable_write(self._notices, {
+            "v": SCHEMA_VERSION,
+            "notices": self.load_notices() + [message],
+        })
+
+    def load_notices(self) -> list[str]:
+        try:
+            raw = json.loads(self._notices.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(raw, dict):
+            return []
+        items = raw.get("notices")
+        if not isinstance(items, list):
+            return []
+        return [m for m in items if isinstance(m, str) and m]
+
+    def drain_notices(self) -> list[str]:
+        """Read and remove every pending notice. Call under the collect lock."""
+        notices = self.load_notices()
+        try:
+            os.unlink(self._notices)
+        except FileNotFoundError:
+            return notices
+        _fsync_dir(self._dir)
+        return notices

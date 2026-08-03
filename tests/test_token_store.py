@@ -185,3 +185,29 @@ def test_remove_active_is_idempotent(tmp_path):
     s.write_active(_cred("rt-x", None, None, "a@b.c"))
     s.remove_active()
     assert s.load_active() is None
+
+
+# ── Pending notices ────────────────────────────────────────────────────────
+
+def test_queued_notices_survive_a_new_store_instance(tmp_path):
+    """The point of the file: the process that queued it is gone."""
+    store(tmp_path).queue_notice("first")
+    store(tmp_path).queue_notice("second")
+    assert store(tmp_path).drain_notices() == ["first", "second"]
+
+
+def test_draining_removes_the_file_so_nothing_repeats(tmp_path):
+    s = store(tmp_path)
+    s.queue_notice("only once")
+    assert s.drain_notices() == ["only once"]
+    assert s.drain_notices() == []
+    assert not (Path(tmp_path) / "pending_notices.json").exists()
+
+
+def test_draining_nothing_is_not_an_error(tmp_path):
+    assert store(tmp_path).drain_notices() == []
+
+
+def test_an_unreadable_notice_file_is_ignored_not_fatal(tmp_path):
+    (Path(tmp_path) / "pending_notices.json").write_text("{not json")
+    assert store(tmp_path).load_notices() == []

@@ -202,6 +202,17 @@ def test_startup_recover_double_activation_builds_attachment_manager_once(monkey
     assert server._authenticated is True
 
 
+def test_startup_logs_the_recovery_outcome(monkeypatch, capsys, tmp_path):
+    """Silent startup recovery is how the lost-outcome bug went unnoticed."""
+    import server
+    monkeypatch.setattr(server, "PLUGIN_DATA", str(tmp_path))
+    monkeypatch.setattr(server, "_flow_startup", lambda auth, cb: "settled")
+
+    server._startup()
+
+    assert "settled" in capsys.readouterr().err
+
+
 def test_the_runtime_rebuild_is_wired_to_activation(monkeypatch):
     """auth.py must not learn what a GmailClient is; server.py must not rebuild
     after the fact. The hook is the seam."""

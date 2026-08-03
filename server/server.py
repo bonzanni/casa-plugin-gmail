@@ -65,7 +65,13 @@ def _startup():
     # one unit. Do NOT call _auth.validate_and_init() separately here.
     # The runtime rebuild needs no call here either: activate() runs it.
     try:
-        _flow_startup(_auth, _cb)
+        # Log the outcome: silent startup recovery is how a whole class of
+        # lost-outcome bugs went unnoticed. Any user-facing detail is durably
+        # queued by startup_recover and drained by the next gmail_auth_collect;
+        # this line is the operator's copy.
+        outcome = _flow_startup(_auth, _cb)
+        print(f"Gmail plugin: credential startup recovery — {outcome}.",
+              file=sys.stderr)
     except Exception as exc:       # never let recovery break startup
         print(f"Gmail plugin: credential startup incomplete ({exc}).",
               file=sys.stderr)
