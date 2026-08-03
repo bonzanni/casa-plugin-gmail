@@ -607,6 +607,38 @@ def test_setup_gmail_reports_a_rejected_client_as_configuration_not_revocation(
     mock_auth.store.remove_active.assert_not_called()
 
 
+def test_the_configuration_error_instructions_require_a_new_session(monkeypatch):
+    """SKILL.md has the agent relay these `instructions` VERBATIM, so this
+    string is not a diagnostic — it IS what the operator hears, and it is the
+    only recovery advice she gets.
+
+    `read_env()` copied GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET into process
+    memory once at startup and nothing re-reads them, so "correct them and run
+    setup_gmail again" is an instruction to loop forever: every later probe
+    uses the cached secret. The README was corrected to say so; this string,
+    which the README's own skill mandates relaying word for word, still carried
+    the promise the README had just dropped. Pinned on the emitted payload
+    rather than the source text, because the payload is what ships."""
+    import server
+    from auth import RefreshConfigError
+
+    _connected_auth(monkeypatch, RefreshConfigError("invalid_client: Unauthorized"))
+    _spool(monkeypatch)
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("a configuration error minted an unusable flow")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    instructions = json.loads(server.setup_gmail())["instructions"]
+
+    assert "new session" in instructions, \
+        "the operator is never told what actually picks up the corrected values"
+    assert "restart" in instructions
+    # ...and it must not stop at "fix it and run me again", which is precisely
+    # the advice that cannot work.
+    assert "run setup_gmail again" not in instructions
+
+
 def test_setup_gmail_treats_an_unclassified_probe_failure_as_transient(monkeypatch):
     """Ambiguity must never mint or destroy — the same policy load_active
     applies to an error it cannot classify."""

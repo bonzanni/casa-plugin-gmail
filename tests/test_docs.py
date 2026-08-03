@@ -7,6 +7,7 @@ console option the reader cannot select, and quoting a diagnostic string the
 code no longer emits. Both shipped. These tests are drift guards, not style
 checks: the diagnostics are compared against the source that emits them.
 """
+import ast
 import re
 from pathlib import Path
 
@@ -385,14 +386,157 @@ def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():
 # MCP server is per-session, so a new session (lighter than a full restart)
 # is what actually picks up the fix.
 
+def _configuration_error_entry():
+    return _read(README).split("the OAuth client configuration was rejected")[1] \
+                        .split("\n\n**`")[0]
+
+
 def test_the_configuration_error_recovery_does_not_promise_same_session_fix():
     """The troubleshooting entry for `configuration_error` must not tell the
     reader that re-running `setup_gmail` alone recovers — that only works
-    after a new session (or a restart) re-reads the corrected env vars."""
-    text = _read(README)
-    entry = text.split("the OAuth client configuration was rejected")[1] \
-                .split("\n\n**`")[0]
+    after a new session (or a restart) re-reads the corrected env vars.
+
+    Banning the one phrase that shipped is not enough on its own: any
+    rewording of it is the same lie. `_same_session_promises` is what holds
+    that line; the literal ban below stays only as a regression pin."""
+    entry = _configuration_error_entry()
     assert "brings it straight back into service without a restart" not in entry
     assert "same" in entry and "session" in entry
     assert "new session" in entry
     assert "restart" in entry
+    assert _same_session_promises(entry) == []
+
+
+# ── The relayed payload is documentation too ──────────────────────────────
+#
+# SKILL.md tells the agent to relay a `configuration_error`'s `instructions`
+# VERBATIM ("Relay the `instructions` verbatim (they name what to check)"), so
+# that string is operator-facing prose that merely happens to live in code.
+# Every guard above reads only docs, and that is precisely how the last fix
+# went half-done: the README's same-session promise was corrected while the
+# identical promise survived in server.py — the one the operator actually
+# hears. So these two guards run over the docs AND over the strings the docs
+# mandate relaying, and they are written as conditions on a SHAPE of claim
+# rather than on any one wording, so a future string making the same promise
+# somewhere else is caught wherever it lives.
+
+_RELAYED_SOURCES = ["server/server.py", "server/auth_flow.py"]
+
+
+def _relayed_strings(rel):
+    """Every string literal `rel` can put in front of the operator.
+
+    Docstrings are excluded — they address maintainers. Adjacent literal
+    concatenation is folded by the parser into ONE node, so a multi-line
+    `instructions` value arrives whole; checking its fragments separately
+    would let a qualifier in one line excuse a promise in another. f-string
+    placeholders collapse to "…" — their values are runtime detail.
+    """
+    tree = ast.parse(_read(*rel.split("/")))
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+    found = []
+
+    class Collect(ast.NodeVisitor):
+        def visit_Constant(self, node):
+            if isinstance(node.value, str) and id(node) not in docstrings:
+                found.append(node.value)
+
+        def visit_JoinedStr(self, node):    # deliberately does not descend
+            found.append("".join(
+                part.value if isinstance(part, ast.Constant) else "…"
+                for part in node.values))
+
+    Collect().visit(tree)
+    return found
+
+
+def _troubleshooting_entries():
+    """The README's troubleshooting entries, one per symptom — checked
+    individually, since the file as a whole trivially satisfies any
+    vocabulary test."""
+    section = _read(README).split("## Troubleshooting")[1].split("\n## ")[0]
+    return [e for e in re.split(r"\n\n(?=\*\*)", section) if e.strip()]
+
+
+def _operator_texts():
+    """(where, passage) for everything an operator is told about recovery."""
+    texts = [(README, e) for e in _troubleshooting_entries()]
+    for rel in _RELAYED_SOURCES:
+        texts += [(rel, s) for s in _relayed_strings(rel)]
+    return texts
+
+
+# "re-run setup_gmail", "run setup_gmail again", "call setup_gmail" — the
+# instruction, however it is phrased. `[^.;:]` keeps a match inside one clause.
+_RERUN = re.compile(r"\b(?:re-?run|run|call)\w*\b[^.;:]{0,60}?setup_gmail"
+                    r"|setup_gmail\b[^.;:]{0,60}?\bagain", re.I)
+
+# The claim that no session change is needed — the load-bearing falsehood.
+_NO_SESSION_CHANGE = re.compile(
+    r"without (?:a |any )?(?:full |plugin )?(?:restart|restarting|new session)"
+    r"|no (?:restart|new session) (?:is )?(?:needed|required)"
+    r"|(?:in|from|within) the same session"
+    r"|\bimmediately\b|right away|straight away|\bon its own\b|\balone\b", re.I)
+
+# ...unless the sentence is DENYING it, which is what the correct prose does.
+_DENIED = re.compile(r"\bnot\b|\bnever\b|\bno matter\b|\bcannot\b|can't|won't"
+                     r"|\bkeeps? reporting\b|\bstill\b|\buntil\b", re.I)
+
+
+def _same_session_promises(text):
+    """Sentences telling the operator to re-run `setup_gmail` while asserting
+    that no new session is needed. Markdown emphasis is stripped first, so
+    `*same*` cannot hide a claim from the match."""
+    flat = re.sub(r"[`*]", "", text)
+    return [s for s in re.split(r"(?<=[.;])\s+", flat)
+            if _RERUN.search(s) and _NO_SESSION_CHANGE.search(s)
+            and not _DENIED.search(s)]
+
+
+def test_no_operator_facing_text_promises_recovery_without_a_session_change():
+    """The general form of the bug, over docs and relayed strings alike."""
+    for where, text in _operator_texts():
+        offenders = _same_session_promises(text)
+        assert offenders == [], \
+            f"{where} promises a same-session recovery: {offenders}"
+
+
+def test_advice_to_fix_a_startup_cached_env_var_names_the_session_requirement():
+    """`read_env()` copies these variables into process memory once — it is
+    reached only through `validate_and_init()`, which only `_startup()` calls —
+    and every later probe uses `self._client_secret`, the cached copy. So
+    correcting them in casa's plugin environment changes nothing for the
+    running server, and any text that tells the operator to fix one AND to
+    re-run `setup_gmail` is a dead end unless it also says a new session (or a
+    restart) has to come first.
+
+    Stated as a condition on the pair, not on a wording, so it holds for a
+    variable or a string that does not exist yet."""
+    required = re.search(r"_REQUIRED_ENV_VARS = \[(.*?)\]",
+                         _read("server", "auth.py"), re.S).group(1)
+    cached = re.findall(r'"([^"]+)"', required)
+    assert cached, "could not read the startup-cached variables from auth.py"
+    assert "self.read_env()" in _read("server", "auth.py")
+
+    checked = 0
+    for where, text in _operator_texts():
+        if not any(name in text for name in cached):
+            continue
+        if not _RERUN.search(re.sub(r"[`*]", "", text)):
+            continue
+        checked += 1
+        lowered = text.lower()
+        assert "new session" in lowered and "restart" in lowered, (
+            f"{where} tells the operator to correct a variable this process "
+            f"cached at startup and then re-run setup_gmail, without saying a "
+            f"new session is needed first: {text!r}"
+        )
+    assert checked, "the guard matched nothing — it has stopped guarding"

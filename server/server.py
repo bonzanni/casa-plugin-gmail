@@ -368,8 +368,11 @@ def setup_gmail() -> str:
                     "plugin environment still match the Google OAuth client. "
                     "No authorization link has been created — a new one could "
                     "not complete either, because it would use the same "
-                    "rejected credentials. Do not start one; run setup_gmail "
-                    "again once the configuration is fixed."
+                    "rejected credentials. Do not start one. Correcting those "
+                    "values is not enough on its own: I read them once when "
+                    "this session started, so setup_gmail will keep reporting "
+                    "this until a new session (or a plugin restart) picks up "
+                    "the corrected values."
                 ),
             })
         # Terminal (revoked / invalid_grant): the connection is genuinely
