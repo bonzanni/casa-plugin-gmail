@@ -81,6 +81,10 @@ class TokenStore:
         self._active = self._dir / ACTIVE_NAME
         self._staged = self._dir / STAGED_NAME
 
+    @property
+    def dir(self) -> Path:
+        return self._dir
+
     def load_active(self) -> Credential | None:
         return _read(self._active)
 
