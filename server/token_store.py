@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,11 @@ ACTIVE_NAME = "oauth_token.json"
 STAGED_NAME = "oauth_token.staged.json"
 NOTICE_NAME = "pending_notices.json"
 SCHEMA_VERSION = 2
+
+# Identifies THIS server process to the notice queue (see "Pending user-facing
+# notices" below). A restart must produce a different value, so it is minted
+# per process and never persisted anywhere but inside the notice file.
+INSTANCE = uuid.uuid4().hex
 
 
 class StagedFlowMismatch(RuntimeError):
@@ -158,26 +164,78 @@ class TokenStore:
     # and ACKS a stage, and casa's ack tears the attempt down, so the next
     # collect finds nothing left to report. The outcome would be lost exactly
     # in the cases the user most needs told (wrong account, dead flow). These
-    # two calls give the resolver somewhere durable to leave the sentence.
-    # Deliberately dumb: a list of strings, written with the same durable
-    # write as a credential, drained and removed in one go. No schema
-    # evolution, no retention policy — an unread notice is a bug, not a state.
+    # calls give the resolver somewhere durable to leave the sentence.
+    #
+    # Delivery is deliberately AT-LEAST-ONCE. Showing "that authorization was
+    # granted by the wrong account" twice is a nuisance; never showing it is
+    # the bug this file exists to prevent. So a notice is never removed by the
+    # act of reading it:
+    #
+    #   peek_notices()            returns the pending ones, removing nothing
+    #   mark_notices_delivered()  called ONLY after the pass returned them
+    #   the next peek             purges what THIS process already delivered
+    #
+    # "This process" is the point of `delivered_by`. A mark says the tool call
+    # returned the sentence; it does not say the response reached anyone. A
+    # later pass in the same process is evidence that it did — the process did
+    # not die between returning and writing the response. A pass in a *new*
+    # process has no such evidence, so it re-delivers once rather than purge a
+    # notice that may have died with its reader.
+    #
+    # Each notice carries a key — flow + disposition — so re-queueing the same
+    # outcome (a settlement whose ack failed, settled again next startup) is a
+    # no-op instead of a second identical sentence.
 
-    def queue_notice(self, message: str) -> None:
-        """Durably record a user-facing outcome.
+    def queue_notice(self, key: str, message: str) -> None:
+        """Durably record a user-facing outcome, at most once per `key`.
 
         Callers MUST write the notice BEFORE the ack it describes: the ack is a
         settlement receipt that tears the flow down, so a notice written after
         it is lost by any crash in between — which is the very scenario it
         exists for.
         """
+        records = self._load_records()
+        if any(r["key"] == key for r in records):
+            return
         self._dir.mkdir(parents=True, exist_ok=True)
-        _durable_write(self._notices, {
-            "v": SCHEMA_VERSION,
-            "notices": self.load_notices() + [message],
-        })
+        self._write_records(
+            records + [{"key": key, "message": message, "delivered_by": None}]
+        )
 
     def load_notices(self) -> list[str]:
+        """Every notice this process still owes the user."""
+        return [r["message"] for r in self._load_records()
+                if r["delivered_by"] != INSTANCE]
+
+    def peek_notices(self) -> list[str]:
+        """Purge what THIS process already delivered, then return the rest.
+
+        Removes nothing this process has not itself delivered — including a
+        notice another (now dead) process marked, which is re-offered. Call
+        under the collect lock.
+        """
+        records = self._load_records()
+        kept = [r for r in records if r["delivered_by"] != INSTANCE]
+        if len(kept) != len(records):
+            self._write_records(kept)
+        return [r["message"] for r in kept]
+
+    def mark_notices_delivered(self) -> None:
+        """Record that a completed pass returned every outstanding notice.
+
+        Call ONLY once the pass has returned normally with the notices in hand:
+        marking at peek time would let any later failure in that pass drop a
+        notice nobody ever saw.
+        """
+        records = self._load_records()
+        outstanding = [r for r in records if r["delivered_by"] != INSTANCE]
+        if not outstanding:
+            return
+        for record in outstanding:
+            record["delivered_by"] = INSTANCE
+        self._write_records(records)
+
+    def _load_records(self) -> list[dict]:
         try:
             raw = json.loads(self._notices.read_text())
         except (OSError, ValueError):
@@ -187,14 +245,27 @@ class TokenStore:
         items = raw.get("notices")
         if not isinstance(items, list):
             return []
-        return [m for m in items if isinstance(m, str) and m]
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key, message = item.get("key"), item.get("message")
+            if not isinstance(key, str) or not isinstance(message, str) or not message:
+                continue
+            by = item.get("delivered_by")
+            out.append({
+                "key": key,
+                "message": message,
+                "delivered_by": by if isinstance(by, str) and by else None,
+            })
+        return out
 
-    def drain_notices(self) -> list[str]:
-        """Read and remove every pending notice. Call under the collect lock."""
-        notices = self.load_notices()
-        try:
-            os.unlink(self._notices)
-        except FileNotFoundError:
-            return notices
-        _fsync_dir(self._dir)
-        return notices
+    def _write_records(self, records: list[dict]) -> None:
+        if not records:
+            try:
+                os.unlink(self._notices)
+            except FileNotFoundError:
+                return
+            _fsync_dir(self._dir)
+            return
+        _durable_write(self._notices, {"v": SCHEMA_VERSION, "notices": records})

@@ -129,10 +129,16 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
     its own return value, so it leaves notify False — that, and not any
     after-the-fact string comparison, is what makes a duplicate impossible.
     """
-    def settle(message: str) -> str:
-        """Persist the notice (if nobody is listening), THEN let the caller ack."""
+    def settle(disposition: str, message: str) -> str:
+        """Persist the notice (if nobody is listening), THEN let the caller ack.
+
+        Keyed by flow + disposition, and not by chance: an ack that fails
+        leaves the stage in place, so the next startup reaches this same
+        disposition for this same flow and would otherwise queue the identical
+        sentence a second time.
+        """
         if notify:
-            auth.store.queue_notice(message)
+            auth.store.queue_notice(f"{staged.flow}:{disposition}", message)
         return message
 
     staged = auth.store.load_staged()
@@ -155,6 +161,7 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
         # successor never finds a journal with no disposition — and settle()
         # BEFORE the ack, so the sentence outlives the teardown.
         message = settle(
+            "terminal",
             f"The pending Gmail authorization is no longer valid ({exc}). "
             "Please start authorization again."
         )
@@ -179,6 +186,7 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
 
     if account.lower() != auth.subject_email.lower():
         message = settle(
+            "wrong_account",
             f"That authorization was granted by {account}, but this plugin is "
             f"configured for {auth.subject_email}. Nothing was changed — the "
             "existing connection is untouched. Please retry with the right account."
@@ -202,7 +210,7 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
             f"Gmail is authorized but I could not finish setting up ({exc}); "
             "I'll retry."
         )
-    message = settle(f"Gmail connected as {account}.")
+    message = settle("connected", f"Gmail connected as {account}.")
     cb.ack(staged.flow)
     return "promoted", message
 
@@ -298,112 +306,15 @@ def collect_pass(auth, cb) -> dict:
 
     Idempotent by contract — casa may nudge more than once.
     """
-    out = {"status": "ok", "messages": [], "promoted": False}
     with collect_lock(auth.store.dir) as acquired:
         if not acquired:
             return {"status": "busy", "messages": [], "promoted": False}
-
-        # Anything a previous startup recovery resolved with nobody listening.
-        # Drained FIRST so it reads in the order it happened, and drained here
-        # rather than at the end because every early return below must still
-        # carry it. reconcile_stage runs with notify False from this point on,
-        # so nothing this pass produces can also land in the notice file.
-        out["messages"].extend(auth.store.drain_notices())
-
-        outcome, message = reconcile_stage(auth, cb)
-        if message:
-            out["messages"].append(message)
-        if outcome == "retain":
-            out["status"] = "retry_later"
-            return out
-        if outcome == "promoted":
-            out["promoted"] = True
-
-        committed = _committed_generation(auth.store.load_active())
-
-        for rec in cb.attempts():
-            h = rec["state_hash"]
-            if committed is not None and attempt_order(rec) < committed:
-                cb.ack(h)
-                out["messages"].append("Discarded a superseded authorization link.")
-                continue
-
-            status = rec.get("status")
-            if status == "awaiting_redirect":
-                continue
-            if status == "done":
-                reason = _DONE_TEXT.get(rec.get("outcome"), "that authorization ended")
-                out["messages"].append(f"Nothing to collect — {reason}.")
-                cb.ack(h)
-                continue
-
-            active = auth.store.load_active()
-            kind, payload = _obtain_result(cb, rec, active)
-            if kind == "retry":
-                out["status"] = "retry_later"
-                continue
-            if kind == "committed":
-                try:
-                    auth.activate(active)
-                except Exception as exc:
-                    # Ack only after activate() succeeds. A failed runtime
-                    # rebuild is process-wide, so the remaining attempts would
-                    # fail identically: end the pass, ack nothing, let the
-                    # nudge re-fire.
-                    out["status"] = "retry_later"
-                    out["messages"].append(
-                        f"Gmail is authorized but I could not finish setting up "
-                        f"({exc}); I'll retry.")
-                    return out
-                cb.ack(h)
-                out["promoted"] = True
-                out["messages"].append("Gmail is already connected.")
-                continue
-            if kind == "unrecoverable":
-                out["messages"].append(
-                    "An authorization result was lost before I could read it. "
-                    "Please start authorization again.")
-                cb.ack(h)
-                continue
-
-            try:
-                code, error = parse_callback_query(payload.get("query"))
-            except MalformedCallback as exc:
-                out["messages"].append(f"Unusable authorization response ({exc}).")
-                cb.ack(h)
-                continue
-            if error:
-                out["messages"].append(
-                    f"Authorization was not granted ({error}). Nothing has changed.")
-                cb.ack(h)
-                continue
-
-            try:
-                token = auth.exchange_code(code, cb.resolve().redirect_uri)
-            except ExchangeTerminal as exc:
-                out["messages"].append(f"That authorization could not be completed "
-                                       f"({exc}). Please start again.")
-                cb.ack(h)
-                continue                      # terminal: fall through is safe
-            except ExchangeRetryable as exc:
-                out["messages"].append(f"Temporary problem completing authorization "
-                                       f"({exc}); I'll retry.")
-                out["status"] = "retry_later"
-                return out                    # never fall through: it would
-                                              # overwrite the staged slot
-
-            auth.store.stage(token["refresh_token"], h, rec.get("minted_ts"))
-            stage_outcome, stage_message = reconcile_stage(auth, cb)
-            if stage_message:
-                out["messages"].append(stage_message)
-            if stage_outcome == "promoted":
-                out["promoted"] = True
-                committed = _committed_generation(auth.store.load_active())
-                continue
-            if stage_outcome == "retain":
-                out["status"] = "retry_later"
-                return out
-            # "settled" — dead or wrong-account; try the next attempt.
+        out = _locked_pass(auth, cb)
+        # Only here: the pass returned normally, so `out` really does carry
+        # every notice the peek handed over. Marking at the peek instead would
+        # let any failure below — a raising cb.attempts(), a crash mid-exchange
+        # — retire a sentence nobody ever read.
+        auth.store.mark_notices_delivered()
 
     if out["status"] == "ok" and not out["messages"] and not out["promoted"]:
         # A pass that did nothing must not read as a success. This tool is
@@ -417,4 +328,119 @@ def collect_pass(auth, cb) -> dict:
             "does NOT confirm that Gmail authorization succeeded. If you were "
             "expecting a result, run gmail_auth_start and follow the link again."
         )
+    return out
+
+
+def _locked_pass(auth, cb) -> dict:
+    """The pass proper, run under the collect lock.
+
+    Every `return` here is a normal return whose `messages` carry the peeked
+    notices; anything raised leaves them undelivered and therefore on disk.
+    """
+    out = {"status": "ok", "messages": [], "promoted": False}
+
+    # Anything a previous startup recovery resolved with nobody listening.
+    # Peeked FIRST so it reads in the order it happened, and peeked here rather
+    # than at the end because every early return below must still carry it.
+    # Peek, not drain: the durable copy outlives this pass and is retired by
+    # collect_pass only once the pass has returned. reconcile_stage runs with
+    # notify False from this point on, so nothing this pass produces can also
+    # land in the notice file.
+    out["messages"].extend(auth.store.peek_notices())
+
+    outcome, message = reconcile_stage(auth, cb)
+    if message:
+        out["messages"].append(message)
+    if outcome == "retain":
+        out["status"] = "retry_later"
+        return out
+    if outcome == "promoted":
+        out["promoted"] = True
+
+    committed = _committed_generation(auth.store.load_active())
+
+    for rec in cb.attempts():
+        h = rec["state_hash"]
+        if committed is not None and attempt_order(rec) < committed:
+            cb.ack(h)
+            out["messages"].append("Discarded a superseded authorization link.")
+            continue
+
+        status = rec.get("status")
+        if status == "awaiting_redirect":
+            continue
+        if status == "done":
+            reason = _DONE_TEXT.get(rec.get("outcome"), "that authorization ended")
+            out["messages"].append(f"Nothing to collect — {reason}.")
+            cb.ack(h)
+            continue
+
+        active = auth.store.load_active()
+        kind, payload = _obtain_result(cb, rec, active)
+        if kind == "retry":
+            out["status"] = "retry_later"
+            continue
+        if kind == "committed":
+            try:
+                auth.activate(active)
+            except Exception as exc:
+                # Ack only after activate() succeeds. A failed runtime
+                # rebuild is process-wide, so the remaining attempts would
+                # fail identically: end the pass, ack nothing, let the
+                # nudge re-fire.
+                out["status"] = "retry_later"
+                out["messages"].append(
+                    f"Gmail is authorized but I could not finish setting up "
+                    f"({exc}); I'll retry.")
+                return out
+            cb.ack(h)
+            out["promoted"] = True
+            out["messages"].append("Gmail is already connected.")
+            continue
+        if kind == "unrecoverable":
+            out["messages"].append(
+                "An authorization result was lost before I could read it. "
+                "Please start authorization again.")
+            cb.ack(h)
+            continue
+
+        try:
+            code, error = parse_callback_query(payload.get("query"))
+        except MalformedCallback as exc:
+            out["messages"].append(f"Unusable authorization response ({exc}).")
+            cb.ack(h)
+            continue
+        if error:
+            out["messages"].append(
+                f"Authorization was not granted ({error}). Nothing has changed.")
+            cb.ack(h)
+            continue
+
+        try:
+            token = auth.exchange_code(code, cb.resolve().redirect_uri)
+        except ExchangeTerminal as exc:
+            out["messages"].append(f"That authorization could not be completed "
+                                   f"({exc}). Please start again.")
+            cb.ack(h)
+            continue                      # terminal: fall through is safe
+        except ExchangeRetryable as exc:
+            out["messages"].append(f"Temporary problem completing authorization "
+                                   f"({exc}); I'll retry.")
+            out["status"] = "retry_later"
+            return out                    # never fall through: it would
+                                          # overwrite the staged slot
+
+        auth.store.stage(token["refresh_token"], h, rec.get("minted_ts"))
+        stage_outcome, stage_message = reconcile_stage(auth, cb)
+        if stage_message:
+            out["messages"].append(stage_message)
+        if stage_outcome == "promoted":
+            out["promoted"] = True
+            committed = _committed_generation(auth.store.load_active())
+            continue
+        if stage_outcome == "retain":
+            out["status"] = "retry_later"
+            return out
+        # "settled" — dead or wrong-account; try the next attempt.
+
     return out

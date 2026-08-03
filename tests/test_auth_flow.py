@@ -540,6 +540,82 @@ def test_a_notice_is_drained_only_once(tmp_path):
     assert not any("Gmail connected as" in m for m in _next_collect(auth)["messages"])
 
 
+# ── The drain must not lose the outcome it exists to preserve ──────────────
+# Removing the durable copy at the START of the pass throws away the only
+# record of the outcome while the pass can still fail. Delivery is
+# at-least-once by choice: a repeated "granted by the wrong account" is a
+# nuisance, a silent one is the bug.
+
+def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
+    """Sol's case: the notice is read, then cb.attempts() blows up — the tool
+    errors out and the sentence must still be waiting for the retry."""
+    from auth_flow import collect_pass, startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+    assert startup_recover(auth, cb) == "settled"
+
+    broken = MagicMock()
+    broken.attempts.side_effect = RuntimeError("callback index unreadable")
+    with pytest.raises(RuntimeError):
+        collect_pass(auth, broken)
+
+    assert any("someone-else@example.com" in m
+               for m in _next_collect(auth)["messages"])
+
+
+def test_a_notice_survives_a_process_that_dies_after_returning_it(tmp_path,
+                                                                  monkeypatch):
+    """Terra's case: the pass returns the notice and the server exits before
+    the response is delivered. A NEW process has no evidence anyone read it."""
+    import token_store
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+    startup_recover(auth, cb)
+
+    assert any("someone-else@example.com" in m
+               for m in _next_collect(auth)["messages"])
+
+    monkeypatch.setattr(token_store, "INSTANCE", "the-restarted-process")
+    assert any("someone-else@example.com" in m
+               for m in _next_collect(auth)["messages"])
+
+
+def test_a_delivered_notice_is_purged_by_the_following_pass(tmp_path):
+    """The other half: at-least-once must not become forever."""
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+    startup_recover(auth, cb)
+
+    assert any("someone-else@example.com" in m
+               for m in _next_collect(auth)["messages"])
+    assert not any("someone-else@example.com" in m
+                   for m in _next_collect(auth)["messages"])
+    assert not (tmp_path / "pending_notices.json").exists()
+    assert not any("someone-else@example.com" in m
+                   for m in _next_collect(auth)["messages"])
+
+
+def test_a_failed_ack_does_not_queue_the_notice_twice(tmp_path):
+    """The stage survives an ack that failed, so the next startup settles the
+    same flow the same way — and must not append the same sentence again."""
+    from auth import RefreshTerminal
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
+    cb.ack.side_effect = RuntimeError("casa unreachable")
+
+    assert startup_recover(auth, cb) == "error"
+    assert store.load_staged() is not None, "a failed ack must keep the stage"
+
+    cb.ack.side_effect = None
+    assert startup_recover(auth, cb) == "settled"
+
+    messages = _next_collect(auth)["messages"]
+    assert len([m for m in messages if "no longer valid" in m]) == 1
+
+
 def attempt(h, minted_ts=100.0, status="result_ready", outcome=None, claimed=False):
     return {"state_hash": h, "minted_ts": minted_ts, "status": status,
             "outcome": outcome, "claimed": claimed, "meta": None}
