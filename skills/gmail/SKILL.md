@@ -4,6 +4,30 @@ description: Use when the user asks the agent to read, search, send, reply to, o
 
 # Gmail Skill
 
+## Authorization
+
+**If a turn says an authorization result is waiting for the `gmail` plugin — call
+`gmail_auth_collect` immediately.** That message is casa delivering an OAuth redirect;
+the result expires 900 seconds after it lands. `gmail_auth_collect` takes no arguments
+and is safe to call repeatedly.
+
+To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `auth_url`
+as a tappable link. Tell her the browser will show "Response received" and that
+nothing needs copying back.
+
+Reporting rules — the browser page is deliberately identical for success, denial and a
+replayed link, so **chat is the only place the user learns the real outcome**:
+
+- `messages` from `gmail_auth_collect` are written for her. Relay them; do not
+  summarise a failure into a success.
+- Authorization denied → say so plainly. Do not imply it worked.
+- Wrong Google account → report it as a failure, and say the existing connection is
+  untouched.
+- `redirect_uri_mismatch` from Google → give her the `redirect_uri` value returned by
+  `gmail_auth_start` and say it must be registered on the OAuth client exactly.
+- `status: "retry_later"` → a transient problem; tell her you'll finish shortly and do
+  not start a second authorization.
+
 ## Interactive Use
 
 Use these tools when the user asks to check, search, or read email; send or reply to a message; manage inbox (archive, label, mark read, trash); or handle attachments.
