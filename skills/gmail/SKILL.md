@@ -20,6 +20,9 @@ replayed link, so **chat is the only place the user learns the real outcome**:
 
 - `messages` from `gmail_auth_collect` are written for her. Relay them; do not
   summarise a failure into a success.
+- Nothing waiting → `messages` says so in as many words. Relay that too, and never
+  report `status: "ok"` on its own as confirmation: a stale or already-handled link
+  produces a perfectly successful call that authorized nothing.
 - Authorization denied → say so plainly. Do not imply it worked.
 - Wrong Google account → report it as a failure, and say the existing connection is
   untouched.

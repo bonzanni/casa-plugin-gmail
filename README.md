@@ -5,7 +5,7 @@ Gives the agent (Casa resident assistant) full Gmail access on the user's behalf
 ## Prerequisites
 
 - Google Cloud project with Gmail API enabled
-- An Internal OAuth 2.0 client of type **Web application** — not Desktop app (see below)
+- An OAuth 2.0 client of type **Web application** — not Desktop app (see below). The consent screen's **user type** depends on your account, and only one of the two is ever selectable: see Step 2.
 - A casa deployment with `public_url` set to a public `https://` origin, and the plugin assigned a reachable role
 
 ### Why the OAuth client must be a Web application client
@@ -31,7 +31,7 @@ Setup spans two systems: the Google Cloud project (OAuth client) and the casa de
 5. Leave **Authorized redirect URIs** empty for now — you'll come back and fill it in during Step 3, once casa has told you the exact value to use.
 6. Click **Create**, then note the **Client ID** and **Client Secret** shown in the dialog.
 
-> If prompted to configure an OAuth consent screen first, set the User Type to **Internal** (Google Workspace only), fill in the app name, and add the three Gmail scopes listed below. Internal apps do not require Google verification.
+> If prompted to configure an OAuth consent screen first, fill in the app name and add the three Gmail scopes listed below. **User type:** **Internal** is offered *only* inside a Google Workspace organization (and needs no Google verification); a personal Gmail account cannot select it and must use **External**, which works the same here but also requires adding your own address under **Test users** while the app stays unpublished. Neither choice changes the client type — it must still be **Web application**.
 
 **Scopes needed** (add these on the consent screen):
 ```
@@ -47,7 +47,13 @@ This is where most setup failures happen — each prerequisite below fails silen
 1. **Set casa's `public_url`** to a clean `https://` origin: scheme + host only — no path, no trailing slash, no IP literal, no userinfo (e.g. `https://<your-casa-public-url>`, not `https://<your-casa-public-url>/`, not `https://1.2.3.4`, not `https://user@<your-casa-public-url>`). Casa needs this to construct a real, reachable redirect URI for the plugin.
 2. **Give the plugin a reachable assigned role** *before* installing it. Casa uses this to know where to deliver the callback result.
 3. **Install the plugin**, then **approve casa's callback-consent DM**. Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed.
-4. **Read the authoritative redirect URI** from `/data/callbacks/<plugin-name>/ready.json` and register that *exact* string in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). Never construct this value yourself from the plugin's name — a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Only the value in `ready.json` is authoritative. *Optional, rollback only:* if you are upgrading from v0.4.x, also keep (or add) `http://localhost:8080` as a second entry in **Authorized redirect URIs** — v0.4.1 used that loopback flow, so leaving it registered means a downgrade needs no Google console round-trip. It is unused by v0.5.0 and can be removed once the callback flow is confirmed working.
+4. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). Never construct this value yourself from the plugin's name: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
+   - **Preferred, always available:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use.
+   - **From the host,** without having to know the effective name:
+     ```
+     grep -o '"redirect_uri":[^,}]*' /data/callbacks/*/ready.json
+     ```
+   *Optional, rollback only:* if you are upgrading from v0.4.x, also keep (or add) `http://localhost:8080` as a second entry in **Authorized redirect URIs** — v0.4.1 used that loopback flow, so leaving it registered means a downgrade needs no Google console round-trip. It is unused by v0.5.0 and can be removed once the callback flow is confirmed working.
 5. **Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_USER_EMAIL`** in casa's plugin environment configuration for this plugin (not in a secret manager directly — casa is what passes these through to the plugin's server process). `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`).
 
 #### What breaks if a step above is skipped
@@ -86,23 +92,32 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 
 ## Troubleshooting
 
-**`Gmail not authenticated`**
-→ Ask the agent to connect Gmail, which calls `gmail_auth_start`; follow the link and confirm the outcome she reports (see Setup, Step 4).
+**`Gmail is not authenticated. Call gmail_auth_start …`** (tool error)
+→ No credential is in service. Ask the agent to connect Gmail, which calls `gmail_auth_start`; follow the link and confirm the outcome she reports (see Setup, Step 4).
 
-**`stored token invalid or expired — re-auth needed`**
-→ The refresh token was revoked or the stored credential no longer matches `GMAIL_USER_EMAIL`. Run `gmail_auth_start` again.
+**`Gmail plugin: stored token is dead — re-auth needed (…)`** (server log)
+→ The refresh token was revoked or rejected as `invalid_grant`, and the stored credential has been removed. Run `gmail_auth_start` again.
+
+**`Gmail plugin: the stored credential authorizes '…' but GMAIL_USER_EMAIL is '…'`** (server log)
+→ The stored credential is for a different inbox. The token file is kept, not deleted; either restore the old `GMAIL_USER_EMAIL` or run `gmail_auth_start` again for the new one.
+
+**`Gmail plugin: could not refresh right now (…); token kept`** (server log)
+→ A transient failure — network, or a Google 5xx / `temporarily_unavailable`. The token is deliberately **retained**; nothing needs re-authorizing. The next startup or tool call retries.
+
+**`No authorization result was waiting …`** (from `gmail_auth_collect`)
+→ The pass found nothing to collect. This is not a success: a stale or already-handled link produces it. If you were expecting a result, run `gmail_auth_start` and follow the fresh link.
 
 **An authorization result never seems to arrive**
 → Check the reason-code table above. The most common cause is `callback_no_target` (plugin has no reachable assigned role) or `callback_pending_ack` (the consent DM hasn't been approved) — both leave the flow silently stuck rather than producing a visible error.
 
 **`redirect_uri_mismatch` from Google**
-→ The URI registered on the OAuth client doesn't match casa's authoritative value. Re-read `/data/callbacks/<plugin-name>/ready.json` and register that exact string — do not derive or guess it.
+→ The URI registered on the OAuth client doesn't match casa's authoritative value. Take the `redirect_uri` that `gmail_auth_start` returns (or use the discovery command in Step 3.4) and register that exact string — do not derive or guess it.
 
-**`OAuth error: access_denied`**
-→ The user declined the consent screen. `gmail_auth_collect` reports this as a failure — ask the agent to run `gmail_auth_start` again for a fresh link.
+**`Authorization was not granted (access_denied). Nothing has changed.`** (from `gmail_auth_collect`)
+→ The consent screen was declined. Ask the agent to run `gmail_auth_start` again for a fresh link.
 
-**Wrong Google account was authorized**
-→ Reported as a failure; the existing stored connection (if any) is left untouched. Run `gmail_auth_start` again and sign in as the correct account.
+**`That authorization was granted by <address>, but this plugin is configured for <address>`** (from `gmail_auth_collect`)
+→ The wrong Google account was used. The existing stored connection (if any) is left untouched. Run `gmail_auth_start` again and sign in as the correct account.
 
 ## No workstation fallback
 
