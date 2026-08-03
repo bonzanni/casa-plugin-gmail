@@ -11,21 +11,43 @@ description: Use when the user asks the agent to read, search, send, reply to, o
 the result expires 900 seconds after it lands. `gmail_auth_collect` takes no arguments
 and is safe to call repeatedly.
 
-To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `auth_url`
-as a tappable link. Tell her the browser will show "Response received" and that
-nothing needs copying back.
+To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `auth_url`.
+Tell her the browser will show "Response received" and that nothing needs copying back.
+
+**Whenever you give the user an `auth_url`, tell her to open it in a real browser rather
+than tapping it here — Google refuses OAuth sign-in inside a chat app's built-in
+browser.** Say it every time, in one short clause ("open this in Chrome/Safari rather
+than tapping it — Google blocks sign-in inside the chat app's browser"). Without that
+line the flow fails silently on her phone: she signs in, Google shows a generic
+**"Something went wrong"** page, the consent screen never appears and nothing is ever
+redirected back, so no result arrives and there is nothing for you to collect.
+
+If she reports "Something went wrong" **after signing in**, that is the signature of
+this. The fix is to reopen the *same* link in a proper browser (long-press → *Open in
+Chrome* / *Open in Safari*, or copy the URL across) — tapping it again will fail
+identically, and a new link will not help. Do not mint a fresh authorization for this.
 
 **Unprompted setup:** casa may dispatch `setup_gmail` on its own — it does this once
 the user approves the plugin's consent DM, so the instruction arrives without her having
 asked for anything. Call it with no arguments and relay its output exactly as you would
-`gmail_auth_start`'s: an `auth_url` is a tappable link, with the same "Response
-received" wording. Two of its results are not links, and neither is a failure:
+`gmail_auth_start`'s: an `auth_url` gets the same "open it in a real browser" and
+"Response received" wording. Its other results are not links:
 
 - `status` of `already_connected` → Gmail is already connected as the named `account`
   and nothing was changed. Say that plainly, and do not offer a link — it is not a
   new connection, so **do not report it as a new authorization**.
-- `status` of `unavailable` → the callback route is not open yet (usually the consent
-  DM or the plugin's role). Relay the `instructions` verbatim; nothing was authorized.
+- `status` of `already_pending` → a valid authorization link was already sent and is
+  still good, so no second one was created. Point the user back to the earlier message
+  rather than asking for a new link; do not call the tool again to get one.
+- `status` of `reauthorization_needed` → the stored connection was found revoked. The
+  `auth_url` is a genuine link and reconnects Gmail; relay it as one.
+- `status` of `retry_later` → the connection could not be checked just now. Nothing
+  changed and nothing needs re-authorizing; say you'll confirm shortly and do **not**
+  start an authorization.
+- `status` of `unavailable` → **automatic setup did not complete** and no authorization
+  was started. This is actionable and retryable, not a dead end: relay the
+  `instructions` verbatim — they carry the reason — and say `setup_gmail` can be run
+  again once it is resolved. Do not guess at the cause or attribute one of your own.
 
 Reporting rules — the browser page is deliberately identical for success, denial and a
 replayed link, so **chat is the only place the user learns the real outcome**:

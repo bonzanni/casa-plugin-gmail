@@ -123,6 +123,60 @@ def test_the_host_side_route_is_the_one_that_needs_no_running_server():
     assert "without a running server" in step
 
 
+def test_consent_is_approved_only_after_the_environment_is_configured():
+    """Approving the consent DM is precisely what makes casa dispatch
+    `setup_gmail`, and casa dispatches it ONCE: it treats an accepted agent turn
+    as dispatched without correlating whether the tool executed, so there is no
+    retry. With the three variables still unset the server exits in
+    `read_env()`, the dispatched call fails, and the setup episode is spent —
+    the promised automatic link never arrives. This is not hypothetical: on the
+    live host the callback-consent ack is timestamped 10:53:27Z and the
+    variables were wired at 10:54:21Z."""
+    env_step = _step_number("GMAIL_CLIENT_SECRET")
+    consent_step = _step_number("callback-consent DM")
+    assert env_step < consent_step, (
+        "the README has the operator approve consent — which triggers the "
+        "one-shot setup dispatch — before configuring the environment that "
+        "dispatch depends on"
+    )
+
+
+def test_redirect_uri_registration_follows_consent_because_casa_forces_it():
+    """Consent cannot simply be moved to the very end. Casa publishes a
+    plugin's `ready.json`/`.index` only for a ROUTED callback, and an unacked
+    callback is never routed (callback_reconcile.py: an "unacked" plugin's
+    published pair is retired as an orphan) — so before consent the redirect
+    URI does not exist to be read, by either documented route. Registration
+    therefore has to come after consent, and the README must say why rather
+    than leave a reader to "fix" the order back into a dead end."""
+    consent_step = _step_number("callback-consent DM")
+    register_step = _step_number("Authorized redirect URIs")
+    assert consent_step < register_step
+    step = _casa_steps()[register_step - 1]
+    assert "only once its callback is *routed*" in step
+    assert "the value does not exist to be read" in step
+
+
+def test_the_consent_step_warns_that_approval_is_what_dispatches_setup():
+    """The reader has to know WHY the order matters, or they will reorder it."""
+    step = _casa_steps()[_step_number("callback-consent DM") - 1]
+    assert "MCP server is healthy" in step
+    assert "no automatic retry" in step
+    assert "dispatches it **once**" in step
+    # ...and that the link it produces must not be opened before 3.5.
+    assert "finish Step 3.5 before opening it" in step
+
+
+def test_the_missing_link_advice_bounds_the_wait_and_names_an_unhealthy_server():
+    """"If no link arrives" gave no wait bound — leaving the reader to guess how
+    long "automatic" takes — and omitted the very failure the old step order
+    encouraged: a server that exited at startup for want of its env vars."""
+    text = _read(README)
+    assert "within about two minutes" in text
+    assert "MCP server is not running or not healthy" in text
+    assert "Step 3.3" in text          # points at the env step by number
+
+
 def test_every_step_3_pointer_names_the_step_it_means():
     """A renumbering that leaves a stale `Step 3.N` behind is the same class of
     bug as the ordering it fixes — it sends the reader to the wrong place."""
@@ -203,6 +257,82 @@ def test_skill_tells_the_agent_already_connected_is_not_a_new_authorization():
     text = _read("skills", "gmail", "SKILL.md")
     assert "casa may dispatch `setup_gmail`" in text
     assert "do not report it as a new authorization" in text
+
+
+# ── Google refuses OAuth in an embedded (in-app) browser ──────────────────
+#
+# Confirmed by a controlled bisect on the operator's phone: same device, same
+# Google account, same URL. Tapping the link in the chat client fails with
+# Google's "Something went wrong" after sign-in; long-pressing the SAME link
+# and opening it in Chrome reaches the consent screen and completes. The only
+# variable that changed is the browser context. Casa's callback endpoint
+# received zero requests from the failing attempts, so nothing is redirected
+# back and the flow stops silently — which is why the instruction has to be in
+# the skill: it is the only thing standing between the operator and a dead end.
+
+def test_the_skill_tells_the_agent_to_send_the_operator_to_a_real_browser():
+    """The hands-free flow delivers the link on the one surface where tapping
+    it cannot work, so this is the highest-value line in the file."""
+    text = _read("skills", "gmail", "SKILL.md")
+    assert "open it in a real browser" in text
+    assert "Google refuses OAuth sign-in" in text
+
+
+def test_the_skill_names_the_signature_and_the_remedy():
+    """"Something went wrong" AFTER sign-in is the tell; retrying the tap is
+    not the remedy, and neither is a fresh link."""
+    text = _read("skills", "gmail", "SKILL.md")
+    assert "Something went wrong" in text
+    assert "after signing in" in text
+    assert "reopen the *same* link" in text
+
+
+def test_the_readme_records_the_embedded_browser_constraint_in_both_places():
+    """Once in the walkthrough (where it prevents the failure) and once in
+    troubleshooting (where it is looked up after the failure)."""
+    text = _read(README)
+    walkthrough = text.split("### 4. Run the authorization flow")[1].split("\n## ")[0]
+    troubleshooting = text.split("## Troubleshooting")[1]
+    claim = "Google refuses to run OAuth sign-in in an embedded browser"
+    assert claim in walkthrough, "the walkthrough does not warn about it"
+    assert claim in troubleshooting, "troubleshooting does not explain it"
+    assert "Something went wrong" in troubleshooting
+
+
+def test_the_embedded_browser_claim_is_not_overstated():
+    """We observed one chat client's in-app browser and never captured Google's
+    underlying error code, so the docs must name neither — and must not imply
+    the plugin can detect a browser it cannot see."""
+    for text in (_read(README), _read("skills", "gmail", "SKILL.md")):
+        assert "Telegram" not in text
+        for code in ("disallowed_useragent", "invalid_request", "403"):
+            assert code not in text, f"names a Google error code we never saw: {code}"
+    assert "cannot see which browser" in _read(README)
+    assert "cannot detect" in _read(README)
+
+
+def test_the_skill_no_longer_calls_an_unavailable_setup_a_non_failure():
+    """`unavailable` means automatic setup did NOT complete — actionable and
+    retryable. And the skill must not attribute a cause: casa dispatches only
+    after consent is approved AND a live route check, so "usually the consent
+    DM or the plugin's role" is wrong on its face. Relay the returned reason."""
+    text = _read("skills", "gmail", "SKILL.md")
+    assert "automatic setup did not complete" in text
+    assert "neither is a failure" not in text
+    assert "usually the consent" not in text
+    assert "Do not guess at the cause" in text
+
+
+def test_the_skill_covers_every_status_the_setup_tool_can_return():
+    """Drift guard: a status the server emits but the skill never mentions is a
+    result the agent has no instruction for."""
+    source = _read("server", "server.py")
+    skill = _read("skills", "gmail", "SKILL.md")
+    emitted = set(re.findall(r'"status": "(\w+)"', source))
+    emitted |= set(re.findall(r'result\["status"\] = "(\w+)"', source))
+    for status in emitted:
+        assert f"`{status}`" in skill, \
+            f"server.py returns {status!r} but SKILL.md never mentions it"
 
 
 def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():
