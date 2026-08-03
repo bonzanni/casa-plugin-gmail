@@ -1,4 +1,5 @@
 import json
+import time
 import pytest
 from unittest.mock import MagicMock
 
@@ -143,6 +144,62 @@ def test_gmail_auth_collect_reports_and_rebuilds_clients(monkeypatch):
     assert server._client is not None and server._att is not None
     assert server.GmailClient.call_count == 1        # rebuilt exactly once
     assert server.AttachmentManager.call_count == 1
+
+
+def test_startup_recover_double_activation_builds_attachment_manager_once(monkeypatch, tmp_path):
+    """One startup_recover call can activate() twice: load_active() activates
+    an on-disk active credential, then reconcile_stage()'s promote() activates
+    a pending stage in the same pass. AttachmentManager/SentLog are
+    credential-independent and must be built exactly once; GmailClient is
+    credential-derived and must be rebuilt on every activation.
+
+    Driven through a REAL double activation — a real GmailAuth, a real
+    TokenStore on disk, and the real auth_flow.startup_recover — not a mocked
+    activate() call. Only the two network-touching methods (_refresh,
+    refresh_and_verify) are stubbed, since they'd otherwise hit Google.
+    """
+    import server
+    from auth import GmailAuth
+    from auth_flow import startup_recover
+    from token_store import Credential
+
+    monkeypatch.setattr(server, "_client", None)
+    monkeypatch.setattr(server, "_att", None)
+    monkeypatch.setattr(server, "_log", None)
+    monkeypatch.setattr(server, "_authenticated", False)
+
+    mock_client_cls = MagicMock()
+    mock_att_cls = MagicMock()
+    mock_log_cls = MagicMock()
+    monkeypatch.setattr(server, "GmailClient", mock_client_cls)
+    monkeypatch.setattr(server, "AttachmentManager", mock_att_cls)
+    monkeypatch.setattr(server, "SentLog", mock_log_cls)
+
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("GMAIL_USER_EMAIL", "user@example.com")
+
+    auth = GmailAuth(str(tmp_path))
+    auth.on_activate = server._rebuild_runtime          # the real wiring
+
+    active_flow = "a" * 64
+    staged_flow = "b" * 64
+    auth.store.write_active(Credential(
+        refresh_token="rt-active", flow=active_flow, generation=1.0,
+        account="user@example.com"))
+    auth.store.stage("rt-staged", staged_flow, time.time())
+
+    monkeypatch.setattr(auth, "_refresh", lambda rt: MagicMock())
+    monkeypatch.setattr(auth, "refresh_and_verify", lambda rt: "user@example.com")
+
+    outcome = startup_recover(auth, MagicMock())
+
+    assert outcome == "promoted"                        # both activations ran
+    assert mock_client_cls.call_count == 2               # rebuilt every time
+    assert mock_att_cls.call_count == 1                  # built exactly once
+    assert mock_log_cls.call_count == 1                  # built exactly once
+    assert server._att is not None and server._log is not None
+    assert server._authenticated is True
 
 
 def test_the_runtime_rebuild_is_wired_to_activation(monkeypatch):

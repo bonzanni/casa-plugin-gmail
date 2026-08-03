@@ -41,8 +41,17 @@ def _rebuild_runtime() -> None:
     """
     global _client, _att, _log, _authenticated
     _client = GmailClient(_auth.credentials)
-    _att = AttachmentManager(PLUGIN_DATA)
-    _log = SentLog(os.path.join(PLUGIN_DATA, "sent_log.json"))
+    # _att/_log are credential-independent (no credential goes into their
+    # constructors), so a surviving instance is functionally identical to a
+    # fresh one — build each only once. This matters because a single
+    # startup_recover can activate twice in one call (an active credential
+    # AND a pending stage both on disk: load_active() activates, then
+    # reconcile_stage()'s promote() activates again). Without the guard, the
+    # second AttachmentManager() would start a second cleanup timer thread.
+    if _att is None:
+        _att = AttachmentManager(PLUGIN_DATA)
+    if _log is None:
+        _log = SentLog(os.path.join(PLUGIN_DATA, "sent_log.json"))
     _authenticated = True
 
 
