@@ -104,9 +104,9 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 **Wrong Google account was authorized**
 → Reported as a failure; the existing stored connection (if any) is left untouched. Run `gmail_auth_start` again and sign in as the correct account.
 
-## Fallback: workstation bootstrap is not usable
+## No workstation fallback
 
-Earlier versions of this plugin documented `bootstrap/get_credentials.py` as a workstation fallback for completing OAuth outside of chat. That script requests the redirect URIs `urn:ietf:wg:oauth:2.0:oob` and `http://localhost`, neither of which a **Web application** OAuth client accepts (see Prerequisites above) — so this fallback cannot succeed against the Web client this plugin now requires, and there is currently no supported alternative to the in-chat flow (Setup, Step 4). Do not rely on `bootstrap/get_credentials.py` for setup.
+Earlier versions shipped `bootstrap/get_credentials.py` for completing OAuth outside chat. It has been removed: it requested the redirect URIs `urn:ietf:wg:oauth:2.0:oob` and `http://localhost`, neither of which a **Web application** OAuth client accepts (see Prerequisites above). The in-chat flow (Setup, Step 4) is the only supported path.
 
 ## Dismantling the old service-account / DWD setup
 
