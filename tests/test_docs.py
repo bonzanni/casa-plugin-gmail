@@ -11,6 +11,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).parent.parent
 
 
@@ -486,19 +488,79 @@ _NO_SESSION_CHANGE = re.compile(
     r"|(?:in|from|within) the same session"
     r"|\bimmediately\b|right away|straight away|\bon its own\b|\balone\b", re.I)
 
-# ...unless the sentence is DENYING it, which is what the correct prose does.
+# ...unless the passage is DENYING it, which is what the correct prose does.
 _DENIED = re.compile(r"\bnot\b|\bnever\b|\bno matter\b|\bcannot\b|can't|won't"
                      r"|\bkeeps? reporting\b|\bstill\b|\buntil\b", re.I)
 
+# A denial only excuses the claim it actually denies. Exempting a whole
+# sentence because a negation appears anywhere in it is how this guard was
+# defeated: "Do not start a new authorization, but run setup_gmail again in
+# the same session and it will recover Gmail." negates *starting an
+# authorization*, not the recovery, and the promise walked straight through.
+# So the denial is looked for only over the span a negation can actually
+# reach the claim from:
+#
+#   to the left  — negation scopes rightward, so a "not" standing before the
+#                  claim reaches it only from inside the same clause ("do NOT
+#                  re-run setup_gmail in the same session"). Punctuation ends
+#                  a clause, and so do "but" and "then", which hand the
+#                  following clause back to positive polarity ("do not start
+#                  one, but run it again…", "…, then run it again"). "and" /
+#                  "or" are deliberately NOT breaks: a negation genuinely
+#                  distributes over them ("never correct the values and
+#                  re-run setup_gmail in the same session").
+#   to the right — the outcome carries the polarity and is often stated later
+#                  in the passage ("…will keep reporting this", "…does not
+#                  restart it"), so everything after the claim counts.
+#
+# Residual, accepted: a negation planted *after* the claim on an unrelated
+# verb ("run setup_gmail again immediately, and do not wait for an
+# administrator") still exempts. Telling that apart from a genuine negative
+# outcome ("…will not help") needs to know WHICH verb is negated, which no
+# regex here can do; dropping the rightward reach instead would fire on the
+# `denies-the-outcome` case below, and a guard that fires on correct prose is
+# one the next author deletes.
+_CLAUSE_BREAK = re.compile(r"[,;:(\n—–]|\bbut\b|\bthen\b", re.I)
+
+
+def _denies_the_claim(passage, claim_start):
+    """Whether `passage` denies the recovery claim starting at `claim_start`,
+    as opposed to merely containing a negation somewhere."""
+    breaks = [m.end() for m in _CLAUSE_BREAK.finditer(passage[:claim_start])]
+    return bool(_DENIED.search(passage[breaks[-1] if breaks else 0:]))
+
+
+def _promises_same_session(passage):
+    """A re-run instruction and a no-session-change claim in one passage, with
+    nothing denying the claim."""
+    rerun = _RERUN.search(passage)
+    claim = _NO_SESSION_CHANGE.search(passage)
+    if not (rerun and claim):
+        return False
+    return not _denies_the_claim(passage, min(rerun.start(), claim.start()))
+
 
 def _same_session_promises(text):
-    """Sentences telling the operator to re-run `setup_gmail` while asserting
+    """Passages telling the operator to re-run `setup_gmail` while asserting
     that no new session is needed. Markdown emphasis is stripped first, so
-    `*same*` cannot hide a claim from the match."""
+    `*same*` cannot hide a claim from the match.
+
+    Sentences are checked one at a time and then in adjacent pairs: putting
+    the instruction and the immediate-effect claim in two sentences ("…then
+    run setup_gmail again. It comes straight back into service immediately.")
+    makes exactly the same promise while neither half carries it alone. The
+    pair window stops at two because that is where the corpus stays quiet —
+    no legitimate passage in it pairs a re-run instruction with a
+    no-session-change claim — and a wider window would start joining
+    unrelated advice into a promise nobody made.
+    """
     flat = re.sub(r"[`*]", "", text)
-    return [s for s in re.split(r"(?<=[.;])\s+", flat)
-            if _RERUN.search(s) and _NO_SESSION_CHANGE.search(s)
-            and not _DENIED.search(s)]
+    sentences = re.split(r"(?<=[.;])\s+", flat)
+    offenders = [s for s in sentences if _promises_same_session(s)]
+    split_across = [f"{a} {b}" for a, b in zip(sentences, sentences[1:])
+                    if a not in offenders and b not in offenders
+                    and _promises_same_session(f"{a} {b}")]
+    return offenders + split_across
 
 
 def test_no_operator_facing_text_promises_recovery_without_a_session_change():
@@ -507,6 +569,93 @@ def test_no_operator_facing_text_promises_recovery_without_a_session_change():
         offenders = _same_session_promises(text)
         assert offenders == [], \
             f"{where} promises a same-session recovery: {offenders}"
+
+
+# ── What the detector itself is pinned against ────────────────────────────
+#
+# The corpus test above can only ever prove that TODAY's prose is clean; it
+# says nothing about whether the detector would still see the promise in
+# tomorrow's. These two tables are the detector's own tests, and they are the
+# reason it can be changed safely: every wording that has actually got past
+# it, or been proposed to, is kept here verbatim.
+
+_MUST_BE_CAUGHT = [
+    # The wording that shipped, and that the literal ban in the entry test
+    # was written for.
+    ("shipped-wording",
+     "Check `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin "
+     "environment against the Google OAuth client, then run `setup_gmail` "
+     "again — it re-checks the stored credential and, if the fix worked, "
+     "brings it straight back into service without a restart or a "
+     "re-authorization (the credential is tied to the client **ID**, so "
+     "rotating only the secret costs nothing)."),
+    # A rewording of it that the literal ban cannot see.
+    ("reworded",
+     "Just re-run `setup_gmail` in the *same* session — it re-checks the "
+     "stored credential and, if the fix worked, brings it straight back into "
+     "service without a re-authorization (the credential is tied to the "
+     "client **ID**, so rotating only the secret costs nothing)."),
+    # The same promise relocated into a different runtime string.
+    ("relocated",
+     "run setup_gmail again in the same session and it will work."),
+    # Terra: an unrelated negation ("do not WAIT") in the same sentence used
+    # to disarm a sentence-wide denial exemption.
+    ("terra-unrelated-negation",
+     "Do not wait for an administrator: correct your OAuth client settings, "
+     "then run setup_gmail again immediately."),
+    # Sol: the same trick, and the promise made twice over — "in the same
+    # session" AND "it will recover".
+    ("sol-unrelated-negation",
+     "Do not start a new authorization, but run setup_gmail again in the "
+     "same session and it will recover Gmail."),
+    # Terra: the instruction and the immediate-effect claim split across a
+    # full stop, so that neither sentence carries the promise alone.
+    ("split-across-sentences",
+     "Correct `GMAIL_CLIENT_SECRET` in casa's plugin environment, then run "
+     "`setup_gmail` again. It brings the stored credential back into service "
+     "immediately."),
+]
+
+# The other half of the trade-off. A guard that fires on correct prose gets
+# weakened or deleted by the next person to touch it, so these pin that the
+# scoping above did not simply become "any negation is ignored".
+_MUST_NOT_BE_CAUGHT = [
+    # The negation governs the re-run itself.
+    ("denies-the-rerun",
+     "Do not re-run `setup_gmail` in the *same* session."),
+    # The negation is the outcome, stated after the claim.
+    ("denies-the-outcome",
+     "Re-running `setup_gmail` in the same session, however, will not help."),
+    # The shape the corrected README uses: claim, then its refutation, in one
+    # sentence, across a colon.
+    ("refutes-in-the-same-sentence",
+     "Check `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin "
+     "environment against the Google OAuth client — but re-running "
+     "`setup_gmail` in the *same* session will keep reporting "
+     "`configuration_error` no matter how many times you call it: the "
+     "running MCP server read those variables once at startup."),
+]
+
+
+@pytest.mark.parametrize("passage", [p for _, p in _MUST_BE_CAUGHT],
+                         ids=[i for i, _ in _MUST_BE_CAUGHT])
+def test_the_detector_catches_every_wording_that_has_beaten_it(passage):
+    """Each of these promises a same-session recovery. Two of them were
+    written by reviewers specifically to slip past this detector, by putting a
+    negation that denies something else into the sentence; a third splits the
+    promise over two sentences. If one of them stops failing here, the guard
+    has a hole of exactly the kind it exists to close."""
+    assert _same_session_promises(passage) != [], \
+        f"the detector no longer sees the promise in: {passage!r}"
+
+
+@pytest.mark.parametrize("passage", [p for _, p in _MUST_NOT_BE_CAUGHT],
+                         ids=[i for i, _ in _MUST_NOT_BE_CAUGHT])
+def test_the_detector_leaves_prose_that_denies_the_promise_alone(passage):
+    """None of these promises anything — they deny it. A detector that fires
+    on them is one the next author has to disable to say something true."""
+    assert _same_session_promises(passage) == [], \
+        f"the detector fired on prose that denies the promise: {passage!r}"
 
 
 def test_advice_to_fix_a_startup_cached_env_var_names_the_session_requirement():
