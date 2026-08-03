@@ -510,6 +510,10 @@ def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
     assert result["account"] == "user@example.com"
     # The claim is checked, not assumed: a live connection is one that refreshes.
     mock_auth.probe_refresh.assert_called_once_with("rt")
+    # A runtime already in service is left alone. Re-activating would swap the
+    # live GmailClient for one that has to fetch an access token again, and
+    # would run the on_activate hook a second time, for nothing.
+    mock_auth.activate.assert_not_called()
 
 
 # ── Fix 3: "already connected" must mean the credential still works ────────
@@ -643,6 +647,171 @@ def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeyp
     result = json.loads(server.setup_gmail())
     assert result["auth_url"].startswith("https://accounts.google.com/")
     assert "status" not in result
+
+
+# ── Fix 4: decide from the DURABLE store, not from runtime activation ──────
+#
+# Every one of the three fixes above was the same defect wearing a new hat: a
+# guard that covered one path and missed its sibling, because setup_gmail
+# decided from `_authenticated` — a fact about whether THIS PROCESS's startup
+# happened to succeed — instead of from what is on disk. The classification
+# above sat behind `_connected_credential`, which returned None whenever
+# `_authenticated` was false, so on the restart path every check was skipped
+# and setup_gmail minted a link that could not complete.
+#
+# `load_active` reaches that state on purpose: a rejected client, a transient
+# refresh failure, an unconfirmable account and a failed runtime rebuild all
+# RETAIN the credential and return False (auth.py). The tests below are that
+# state — credential on disk, runtime inactive — one per probe verdict.
+
+def _restart_auth(monkeypatch, probe_error=None, activate_error=None):
+    """Sol's reproduction: a retained credential, an INACTIVE runtime.
+
+    Nothing here is exotic — it is exactly what a restart leaves behind after
+    `load_active` retains the token and returns False.
+    """
+    import server
+    from token_store import Credential
+
+    cred = Credential(refresh_token="rt", flow="a" * 64, generation=1.0,
+                      account="user@example.com")
+    mock_auth = MagicMock()
+    mock_auth.subject_email = "user@example.com"
+    mock_auth.store.load_active.return_value = cred
+    if probe_error is not None:
+        mock_auth.probe_refresh.side_effect = probe_error
+    if activate_error is not None:
+        mock_auth.activate.side_effect = activate_error
+    monkeypatch.setattr(server, "_auth", mock_auth)
+    monkeypatch.setattr(server, "_authenticated", False)   # post-restart
+    return mock_auth, cred
+
+
+def test_setup_gmail_reports_configuration_error_after_a_restart(monkeypatch):
+    """THE reproduction. A rotated `GMAIL_CLIENT_SECRET` makes `load_active`
+    raise RefreshConfigError, retain the token and return False — so on the next
+    restart `_authenticated` is false. The classification was gated on it, so
+    setup_gmail skipped the probe entirely and minted: one mint, zero probes,
+    and a link whose code exchange uses the same rejected secret."""
+    import server
+    from auth import RefreshConfigError
+
+    mock_auth, _ = _restart_auth(
+        monkeypatch, probe_error=RefreshConfigError("invalid_client: Unauthorized"))
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "configuration_error"
+    # Counts, not just the status: the bug WAS mint=1/probe=0 while the status
+    # string read plausibly ("authorization_needed" from a real mint).
+    assert len(calls) == 0, "minted a link its own client credentials would reject"
+    assert mock_auth.probe_refresh.call_count == 1, "never probed the stored token"
+    assert "invalid_client" in result["instructions"]
+    assert "GMAIL_CLIENT_SECRET" in result["instructions"]
+    assert "auth_url" not in result
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_mints_a_recovery_link_after_a_restart_when_revoked(monkeypatch):
+    """The same on-disk state with the opposite verdict: deciding from the store
+    must still mint when the grant really is dead. `load_active` removes such a
+    token, but not if the revocation happened after it ran."""
+    import server
+    from auth import RefreshTerminal
+
+    mock_auth, _ = _restart_auth(
+        monkeypatch,
+        probe_error=RefreshTerminal("invalid_grant: Token has been expired or revoked."))
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "reauthorization_needed"
+    assert len(calls) == 1, "a revoked credential produced no recovery link"
+    assert mock_auth.probe_refresh.call_count == 1
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert "invalid_grant" in result["instructions"]
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_does_not_mint_after_a_restart_on_a_transient_failure(monkeypatch):
+    """A Google 5xx during startup leaves exactly this state too. Ambiguity must
+    not mint: the credential is presumed good and is untouched."""
+    import server
+    from auth import RefreshRetryable
+
+    mock_auth, _ = _restart_auth(
+        monkeypatch, probe_error=RefreshRetryable("temporarily_unavailable"))
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "retry_later"
+    assert len(calls) == 0, "a transient failure minted a re-authorization"
+    assert mock_auth.probe_refresh.call_count == 1
+    assert result["account"] == "user@example.com"
+    assert "temporarily_unavailable" in result["instructions"]
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_puts_a_live_credential_back_into_service_after_a_restart(
+        monkeypatch):
+    """The design question, answered: REPAIR, then report.
+
+    The credential probes live and matches — the operator has fixed the
+    configuration and restarted, or the outage that blocked startup has passed.
+    Reporting "already connected" and stopping would be true of the store and
+    false of every Gmail tool, which keeps raising "Gmail is not authenticated"
+    until someone restarts the process. `activate()` is what ends that, and its
+    `on_activate` hook rebuilds the runtime; both are idempotent."""
+    import server
+
+    mock_auth, cred = _restart_auth(monkeypatch)          # probe succeeds
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "already_connected"
+    assert result["account"] == "user@example.com"
+    assert len(calls) == 0, "minted a link for a credential that still works"
+    assert mock_auth.probe_refresh.call_count == 1
+    # Repaired, not merely reported: without this the status is a claim the
+    # Gmail tools cannot honour.
+    mock_auth.activate.assert_called_once_with(cred)
+
+
+def test_setup_gmail_does_not_claim_connected_when_activation_fails(monkeypatch):
+    """`activate()` runs the runtime rebuild and is allowed to raise. Then the
+    honest answer is not "connected" — and not `retry_later` either, since
+    nothing about Google is at fault. It is the same shape as a closed callback
+    route: automatic setup did not complete, nothing was authorized, retry when
+    the local cause is fixed."""
+    import server
+
+    mock_auth, _ = _restart_auth(monkeypatch,
+                                 activate_error=OSError("no space left on device"))
+    _spool(monkeypatch)
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "unavailable"
+    assert result["status"] != "already_connected"
+    assert len(calls) == 0, "a failed runtime rebuild minted a needless link"
+    assert mock_auth.probe_refresh.call_count == 1
+    assert "no space left on device" in result["instructions"]
+    assert "auth_url" not in result
+    mock_auth.store.remove_active.assert_not_called()
 
 
 def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatch):

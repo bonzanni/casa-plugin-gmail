@@ -109,16 +109,25 @@ def gmail_auth_start() -> str:
     return _ok(_flow_start(_auth, _cb))
 
 
-def _connected_credential():
-    """The credential actually in service, or None.
+def _stored_credential():
+    """The DURABLE credential for the configured subject, or None.
 
-    "In service" is both halves: a rebuilt runtime (`_authenticated`) AND an
-    active credential on disk whose account is the configured subject. A
-    credential for a different inbox is precisely the case that needs
-    re-authorization, so it must not read as connected.
+    Deliberately does NOT consult `_authenticated`. Three review rounds found
+    the same bug in three disguises, and the common cause was that setup_gmail
+    decided from in-memory runtime state: `_authenticated` records whether
+    startup happened to succeed, which is a fact about this process, not about
+    the credential. The two diverge exactly when it matters — `load_active`
+    RETAINS the token and returns False on a rejected client, a transient
+    refresh failure, or a failed runtime rebuild (auth.py `load_active`), so a
+    perfectly good credential sits on disk with `_authenticated` false. Reading
+    the runtime there skipped every check below and minted a link that could
+    not complete. The store is the only thing that knows what is actually true.
+
+    A credential for a different inbox, or a legacy one recording no account at
+    all, returns None — neither can read as connected, and both are cases the
+    mint path already handles (an account mismatch is precisely what needs
+    re-authorizing; a v1 file is `load_active`'s to migrate).
     """
-    if not _authenticated:
-        return None
     active = _auth.store.load_active()
     if active is None or not active.account:
         return None
@@ -126,6 +135,43 @@ def _connected_credential():
     if not subject or active.account.lower() != subject.lower():
         return None
     return active
+
+
+def _bring_into_service(cred) -> str | None:
+    """Make a proven-live credential usable by the Gmail tools. None on success,
+    else the failure detail.
+
+    Reached only when the probe has just shown that `cred` refreshes and
+    authorizes the configured account. If the runtime is already up there is
+    nothing to do — re-activating would swap the live GmailClient for one whose
+    access token has to be fetched again, for no gain.
+
+    Why repair rather than merely report: on the restart path the credential is
+    good and `_authenticated` is false, so "already connected" would be true of
+    the store and false of the tools — every Gmail call still raises "Gmail is
+    not authenticated" until the process is restarted. Reporting a connection
+    the operator cannot use is the same class of lie as vouching for a revoked
+    one, which is the bug fixed the round before this. `activate()` exists for
+    exactly this, its `on_activate` hook rebuilds the runtime, and both are
+    idempotent (see `_rebuild_runtime`). It writes no credential and removes
+    none: activation is a runtime operation, and the store is untouched — which
+    is also why it needs no collect lock, since that lock exists to serialize
+    the single staged SLOT (auth_flow.collect_lock) and nothing here goes near
+    it.
+
+    Activation is allowed to fail (the hook may raise), and then the answer is
+    NOT "connected". It is not a Google problem either, so it is not
+    `retry_later`: it is the same shape as a closed callback route — automatic
+    setup did not complete, nothing was authorized, and it is worth retrying
+    once the local cause is fixed. That is `unavailable`.
+    """
+    if _authenticated:
+        return None
+    try:
+        _auth.activate(cred)
+    except Exception as exc:
+        return str(exc)
+    return None
 
 
 def _stored_credential_failure(cred) -> tuple[str, str] | None:
@@ -137,11 +183,15 @@ def _stored_credential_failure(cred) -> tuple[str, str] | None:
     answers `invalid_client`), so the refresh token is still good and a fresh
     authorization would fail at the code exchange for the same reason.
 
-    `_authenticated` is set once, at activation, and never cleared, and the
-    on-disk account keeps matching after a revocation — so without this probe
-    a credential revoked AFTER startup reports `already_connected` and mints
-    nothing, telling the operator there is nothing to do at the exact moment
-    Gmail calls are failing and they need a recovery link.
+    Nothing else can supply this verdict. The on-disk record keeps looking
+    healthy after a revocation, and `_authenticated` — set once at activation
+    and never cleared — keeps saying "yes" too, so without this probe a
+    credential revoked AFTER startup reports `already_connected` and mints
+    nothing, at the exact moment Gmail calls are failing and the operator needs
+    a recovery link. It is equally the only verdict available BEFORE any
+    activation: `load_active` retains the credential and returns False on a
+    rejected client or a transient failure, so on that path the probe is what
+    distinguishes a live credential from a dead one and a broken client.
 
     Performs NO writes and never removes the credential: reaping a dead token
     is `load_active`'s job on its own next pass, and a transient Google 5xx
@@ -228,6 +278,13 @@ def setup_gmail() -> str:
     # an approval (plugin_store.manifest_setup_tool), dispatching it to the
     # agent with no arguments. Three consequences shape the body:
     #
+    #  * Every decision is taken from the DURABLE store, never from
+    #    `_authenticated`. If a credential exists on disk it is probed and the
+    #    answer branches on the probe's verdict, whether or not startup managed
+    #    to activate it — because the cases where startup did NOT are exactly
+    #    the cases this tool is dispatched to explain, and `load_active`
+    #    deliberately retains the credential in most of them. See
+    #    _stored_credential.
     #  * It must be idempotent — casa may re-dispatch, so an existing, matching
     #    and still-LIVE connection returns a statement of fact and mints
     #    nothing. Re-minting would invalidate a working setup's in-flight links
@@ -248,15 +305,32 @@ def setup_gmail() -> str:
     #    minting publishes only the former, and the latter trails it by up to
     #    a reconciliation interval. See _outstanding_authorization.
     dead_credential = None
-    connected = _connected_credential()
-    if connected is not None:
-        failure = _stored_credential_failure(connected)
+    stored = _stored_credential()
+    if stored is not None:
+        failure = _stored_credential_failure(stored)
         if failure is None:
+            # Live and for the right inbox. If startup left it inactive, put it
+            # into service before saying so — otherwise "already connected"
+            # would be true of the store and false of every Gmail tool.
+            blocked = _bring_into_service(stored)
+            if blocked is not None:
+                return _ok({
+                    "status": "unavailable",
+                    "account": stored.account,
+                    "instructions": (
+                        f"Gmail's stored authorization for {stored.account} is "
+                        f"valid, but I could not bring it into service "
+                        f"({blocked}), so the Gmail tools will still fail. "
+                        "Nothing needs re-authorizing and no authorization "
+                        "link has been created. Run setup_gmail again, or "
+                        "restart the plugin, once that is resolved."
+                    ),
+                })
             return _ok({
                 "status": "already_connected",
-                "account": connected.account,
+                "account": stored.account,
                 "instructions": (
-                    f"Gmail is already connected as {connected.account} — "
+                    f"Gmail is already connected as {stored.account} — "
                     "nothing to do. This is not a new authorization; do not "
                     "report it as one."
                 ),
@@ -267,10 +341,11 @@ def setup_gmail() -> str:
             # Minting here would start a re-authorization nobody needs.
             return _ok({
                 "status": "retry_later",
-                "account": connected.account,
+                "account": stored.account,
                 "instructions": (
-                    f"Gmail is connected as {connected.account}, but I could "
-                    f"not confirm the connection just now ({detail}). This is "
+                    f"Gmail's stored authorization for {stored.account} is in "
+                    f"place, but I could not confirm it just now ({detail}). "
+                    "This is "
                     "a temporary problem — nothing has changed and no new "
                     "authorization is needed. Do not start one; run "
                     "setup_gmail again shortly if it persists."
@@ -283,10 +358,10 @@ def setup_gmail() -> str:
             # the same rejected client. Name the problem instead.
             return _ok({
                 "status": "configuration_error",
-                "account": connected.account,
+                "account": stored.account,
                 "instructions": (
-                    f"Gmail is still connected as {connected.account} and its "
-                    f"stored authorization is intact, but Google rejected this "
+                    f"Gmail's stored authorization for {stored.account} is "
+                    f"intact and does not need replacing, but Google rejected this "
                     f"plugin's OAuth client credentials ({detail}). This is a "
                     "configuration problem, not a revoked connection: check "
                     "that GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in casa's "
