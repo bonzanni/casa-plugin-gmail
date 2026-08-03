@@ -1,7 +1,6 @@
 import json
 import os
-import shutil
-import urllib.parse
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -9,8 +8,14 @@ from auth import GmailAuth
 from gmail_client import GmailClient
 from attachments import AttachmentManager
 from sent_log import SentLog
+from auth_flow import collect_pass as _flow_collect
+from auth_flow import start as _flow_start
+from auth_flow import startup_recover as _flow_startup
+from casa_callback import CasaCallback
 
 PLUGIN_DATA = os.environ.get("CLAUDE_PLUGIN_DATA", "/tmp/gmail-plugin-data")
+PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 mcp = FastMCP("gmail")
 
@@ -20,35 +25,37 @@ _att: AttachmentManager | None = None
 _log: SentLog | None = None
 _authenticated = False
 
+_cb = CasaCallback(PLUGIN_ROOT)
 
-def _migrate_legacy_token() -> None:
-    # v0.4.0 self-declared CLAUDE_PLUGIN_DATA in .mcp.json, which the runtime
-    # delivered as the literal unexpanded string "${CLAUDE_PLUGIN_DATA}". If a
-    # token was persisted there, move it to the now-correct PLUGIN_DATA path.
-    old_token = os.path.join("${CLAUDE_PLUGIN_DATA}", "oauth_token.json")
-    new_token = os.path.join(PLUGIN_DATA, "oauth_token.json")
-    if os.path.exists(old_token) and not os.path.exists(new_token):
-        os.makedirs(PLUGIN_DATA, exist_ok=True)
-        shutil.move(old_token, new_token)
+
+def _rebuild_runtime() -> None:
+    global _client, _att, _log, _authenticated
+    _client = GmailClient(_auth.credentials)
+    _att = AttachmentManager(PLUGIN_DATA)
+    _log = SentLog(os.path.join(PLUGIN_DATA, "sent_log.json"))
+    _authenticated = True
 
 
 def _startup():
-    global _client, _att, _log, _authenticated
-    _migrate_legacy_token()
     os.makedirs(PLUGIN_DATA, exist_ok=True)
-    _authenticated = _auth.validate_and_init()
-    if _authenticated:
-        _client = GmailClient(_auth.credentials)
-        _att = AttachmentManager(PLUGIN_DATA)
-        _log = SentLog(os.path.join(PLUGIN_DATA, "sent_log.json"))
+    # startup_recover holds collect.lock across env validation, active-token
+    # loading AND staged recovery — all three can mutate the store, so they are
+    # one unit. Do NOT call _auth.validate_and_init() separately here.
+    try:
+        _flow_startup(_auth, _cb)
+    except Exception as exc:       # never let recovery break startup
+        print(f"Gmail plugin: credential startup incomplete ({exc}).",
+              file=sys.stderr)
+    if _auth.is_authenticated:
+        _rebuild_runtime()
 
 
 def _require_auth() -> None:
     if not _authenticated:
         raise ValueError(
-            "Gmail not authenticated. Use gmail_auth_start to get the authorization URL, "
-            "visit it in a browser, then call gmail_auth_complete with the redirect URL "
-            "from your browser's address bar."
+            "Gmail is not authenticated. Call gmail_auth_start to get an "
+            "authorization link; after you grant access I'll be notified and "
+            "will finish setup with gmail_auth_collect."
         )
 
 
@@ -70,49 +77,17 @@ def _ok(data) -> str:
 
 @mcp.tool()
 def gmail_auth_start() -> str:
-    """Begin Gmail OAuth: returns an authorization URL to open in any browser. After granting access, the browser redirects to localhost (which won't load) — copy the full URL from the address bar and call gmail_auth_complete with it."""
-    url = _auth.build_auth_url()
-    return _ok({
-        "auth_url": url,
-        "instructions": (
-            "Open auth_url in any browser and sign in. After granting access, your browser "
-            "will redirect to http://localhost:8080 which won't load — that is expected. "
-            "Copy the full URL from your browser's address bar (it contains ?code=...) "
-            "and call gmail_auth_complete with that URL."
-        ),
-    })
+    """Begin Gmail OAuth: returns a link to open in a browser. After you grant access the browser shows a confirmation page and the setup completes automatically — nothing to copy back."""
+    return _ok(_flow_start(_auth, _cb))
 
 
 @mcp.tool()
-def gmail_auth_complete(redirect_url: str) -> str:
-    """Complete Gmail OAuth by exchanging the authorization code from the redirect URL. Persists the refresh token to the plugin data directory. Protected: requires operator approval."""
-    global _client, _att, _log, _authenticated
-
-    parsed = urllib.parse.urlparse(redirect_url)
-    params = urllib.parse.parse_qs(parsed.query)
-
-    if "error" in params:
-        raise ValueError(f"OAuth error: {params['error'][0]}")
-
-    codes = params.get("code")
-    if not codes:
-        raise ValueError(
-            "No authorization code found in redirect URL. "
-            "Ensure you copied the full URL from the browser address bar after the redirect."
-        )
-    code = codes[0]
-
-    _auth.exchange_code(code)
-
-    _client = GmailClient(_auth.credentials)
-    _att = AttachmentManager(PLUGIN_DATA)
-    _log = SentLog(os.path.join(PLUGIN_DATA, "sent_log.json"))
-    _authenticated = True
-
-    return _ok({
-        "status": "authenticated",
-        "message": "Gmail OAuth complete. Refresh token persisted to plugin data directory. All Gmail tools are now available.",
-    })
+def gmail_auth_collect() -> str:
+    """Collect any waiting Gmail authorization result and finish setup. Call this when casa reports an authorization result is waiting. Safe to call repeatedly."""
+    result = _flow_collect(_auth, _cb)
+    if result.get("promoted") and _auth.is_authenticated:
+        _rebuild_runtime()
+    return _ok(result)
 
 
 # ── Search / Read ──────────────────────────────────────────────────────────

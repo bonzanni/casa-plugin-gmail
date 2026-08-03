@@ -89,40 +89,51 @@ def test_unauthenticated_tools_raise(monkeypatch):
         server.search_emails("from:me")
 
 
-def test_gmail_auth_start_returns_url(monkeypatch):
+def test_gmail_auth_start_returns_url_and_redirect_uri(monkeypatch):
     import server
-    mock_auth = MagicMock()
-    mock_auth.build_auth_url.return_value = "https://accounts.google.com/o/oauth2/auth?client_id=x"
-    monkeypatch.setattr(server, "_auth", mock_auth)
-
+    monkeypatch.setattr(server, "_flow_start", lambda auth, cb: {
+        "auth_url": "https://accounts.google.com/o?state=s",
+        "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
+        "instructions": "open it",
+    })
     result = json.loads(server.gmail_auth_start())
-    assert "auth_url" in result
-    assert "instructions" in result
-    assert "accounts.google.com" in result["auth_url"]
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
 
 
-def test_gmail_auth_complete_parses_code_and_reinitialises(monkeypatch):
+def test_gmail_auth_start_surfaces_callback_unavailable(monkeypatch):
     import server
-    mock_auth = MagicMock()
-    mock_auth.credentials = MagicMock()
-    monkeypatch.setattr(server, "_auth", mock_auth)
-    monkeypatch.setattr(server, "_authenticated", False)
+    from casa_callback import CallbackUnavailable
 
-    result = json.loads(server.gmail_auth_complete("http://localhost:8080?code=abc123&scope=gmail"))
-
-    mock_auth.exchange_code.assert_called_once_with("abc123")
-    assert result["status"] == "authenticated"
+    def boom(auth, cb):
+        raise CallbackUnavailable("route not open: callback_no_target ...")
+    monkeypatch.setattr(server, "_flow_start", boom)
+    with pytest.raises(Exception, match="callback_no_target"):
+        server.gmail_auth_start()
 
 
-def test_gmail_auth_complete_rejects_error_param(monkeypatch):
+def test_gmail_auth_collect_reports_and_rebuilds_clients(monkeypatch):
     import server
+    monkeypatch.setattr(server, "_flow_collect", lambda auth, cb: {
+        "status": "ok", "promoted": True, "messages": ["Gmail connected as a@b.c."]})
+    monkeypatch.setattr(server, "_rebuild_runtime", lambda: None)
 
-    with pytest.raises(ValueError, match="OAuth error"):
-        server.gmail_auth_complete("http://localhost:8080?error=access_denied")
+    result = json.loads(server.gmail_auth_collect())
+    assert result["status"] == "ok"
+    assert result["messages"] == ["Gmail connected as a@b.c."]
 
 
-def test_gmail_auth_complete_rejects_missing_code(monkeypatch):
+def test_gmail_auth_complete_is_gone():
     import server
+    assert not hasattr(server, "gmail_auth_complete")
 
-    with pytest.raises(ValueError, match="No authorization code"):
-        server.gmail_auth_complete("http://localhost:8080?scope=gmail")
+
+def test_manifest_declares_the_callback_and_no_stale_protected_tool():
+    from pathlib import Path
+    manifest = json.loads(
+        (Path(__file__).parent.parent / ".claude-plugin" / "plugin.json").read_text())
+    assert manifest["casa"]["callbacks"] == [{"name": "oauth"}]
+    names = [t["name"] for t in manifest["casa"]["protectedTools"]]
+    assert "gmail_auth_complete" not in names
+    assert "gmail_auth_collect" not in names        # must stay unprotected
+    assert manifest["version"] == "0.5.0"
