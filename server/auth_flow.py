@@ -146,6 +146,21 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
             f"The pending Gmail authorization is no longer valid ({exc}). "
             "Please start authorization again."
         )
+    except Exception as exc:
+        # refresh_and_verify is a refresh AND a getProfile; the second half
+        # raises neither typed error (a plain ValueError for any HttpError, and
+        # transport failures raw). Unclassified ⇒ retain, the same policy the
+        # refresh itself uses: never destroy a credential on ambiguity, and
+        # never let the stage wedge every future attempt at step 0.
+        return "retain", f"Could not verify the pending authorization yet ({exc})."
+
+    if not account:
+        # getProfile answered without an emailAddress. That is a failed
+        # verification, NOT a wrong-account verdict — settling it here would ack
+        # and discard a stage that may be perfectly good.
+        return "retain", (
+            "Could not confirm which account the pending authorization belongs to."
+        )
 
     if account.lower() != auth.subject_email.lower():
         cb.ack(staged.flow)
@@ -161,7 +176,16 @@ def reconcile_stage(auth, cb) -> tuple[str, str]:
     except StagedFlowMismatch as exc:
         return "retain", f"Pending authorization changed under us ({exc})."
 
-    auth.activate(committed)
+    try:
+        auth.activate(committed)
+    except Exception as exc:
+        # Activation failure is retryable, and the ack must not happen: the
+        # credential is already durably promoted, so the next pass recovers it
+        # through the `claimed` / `active.flow == h` committed path.
+        return "retain", (
+            f"Gmail is authorized but I could not finish setting up ({exc}); "
+            "I'll retry."
+        )
     cb.ack(staged.flow)
     return "promoted", f"Gmail connected as {account}."
 
@@ -178,7 +202,14 @@ def startup_recover(auth, cb) -> str:
     the whole of the plugin's startup credential work — `server._startup` must
     not call `validate_and_init` separately. A missing env var still exits the
     process: SystemExit is a BaseException and is not caught by the caller.
+
+    The env read is hoisted OUT of the lock. It touches no store state, so the
+    "env validation, active-token loading and staged recovery are one unit"
+    rule is untouched — but a contended lock must not leave the process with no
+    client id and no subject email, which would make gmail_auth_start emit
+    `client_id=None` and gmail_auth_collect fail on the account comparison.
     """
+    auth.read_env()
     with collect_lock(auth.store.dir) as acquired:
         if not acquired:
             return "busy"
@@ -283,7 +314,18 @@ def collect_pass(auth, cb) -> dict:
                 out["status"] = "retry_later"
                 continue
             if kind == "committed":
-                auth.activate(active)
+                try:
+                    auth.activate(active)
+                except Exception as exc:
+                    # Ack only after activate() succeeds. A failed runtime
+                    # rebuild is process-wide, so the remaining attempts would
+                    # fail identically: end the pass, ack nothing, let the
+                    # nudge re-fire.
+                    out["status"] = "retry_later"
+                    out["messages"].append(
+                        f"Gmail is authorized but I could not finish setting up "
+                        f"({exc}); I'll retry.")
+                    return out
                 cb.ack(h)
                 out["promoted"] = True
                 out["messages"].append("Gmail is already connected.")

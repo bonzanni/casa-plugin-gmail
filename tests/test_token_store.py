@@ -40,6 +40,50 @@ def test_stage_writes_atomically_leaving_no_temp(tmp_path):
     assert names == ["oauth_token.staged.json"]
 
 
+def test_write_fsyncs_the_file_before_replacing_and_the_dir_after(tmp_path, monkeypatch):
+    """Casa's ack is a strict-fsync settlement receipt: it treats this store as
+    already committed. The order — fsync the data, THEN publish it by rename,
+    THEN fsync the directory entry — is the whole guarantee, and a refactor to
+    path.write_text() would silently destroy it."""
+    import token_store
+    real_fsync, real_replace = os.fsync, os.replace
+    calls = []
+
+    def spy_fsync(fd):
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        calls.append(f"fsync:{kind}")
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        calls.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(token_store.os, "fsync", spy_fsync)
+    monkeypatch.setattr(token_store.os, "replace", spy_replace)
+
+    store(tmp_path).write_active(_cred("rt-x", "a" * 64, 1.0, "a@b.c"))
+
+    assert calls == ["fsync:file", "replace", "fsync:dir"]
+
+
+def test_a_crash_between_temp_write_and_replace_leaves_the_previous_file_intact(
+        tmp_path, monkeypatch):
+    import token_store
+    s = store(tmp_path)
+    s.write_active(_cred("rt-old", "a" * 64, 1.0, "old@example.com"))
+
+    def crash(src, dst):
+        raise OSError("power cut")
+    monkeypatch.setattr(token_store.os, "replace", crash)
+
+    with pytest.raises(OSError):
+        s.write_active(_cred("rt-new", "b" * 64, 2.0, "new@example.com"))
+
+    survivor = s.load_active()
+    assert survivor.refresh_token == "rt-old"
+    assert survivor.account == "old@example.com"
+
+
 def test_promote_moves_staged_to_active_with_account(tmp_path):
     s = store(tmp_path)
     s.stage("rt-1", "a" * 64, 7.0)

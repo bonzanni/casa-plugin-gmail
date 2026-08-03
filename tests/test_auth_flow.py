@@ -182,6 +182,56 @@ def test_reconcile_retains_stage_on_retryable_failure(tmp_path):
     cb.ack.assert_not_called()
 
 
+def test_reconcile_retains_on_an_unclassified_verification_failure(tmp_path):
+    """refresh_and_verify is a refresh AND a getProfile. getProfile raises a
+    plain ValueError for every HttpError (403 with the Gmail API disabled, say).
+    Unclassified must mean RETAIN — an escaping exception would wedge the slot
+    and fail every future attempt at step 0."""
+    from auth_flow import reconcile_stage
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.side_effect = ValueError("Gmail API error 403: disabled")
+
+    outcome, message = reconcile_stage(auth, cb)
+
+    assert outcome == "retain"
+    assert "403" in message
+    assert store.load_staged() is not None
+    cb.ack.assert_not_called()
+
+
+def test_reconcile_retains_when_the_verified_account_is_blank(tmp_path):
+    """getProfile without an emailAddress is a FAILED verification, not a
+    wrong-account verdict: acking and discarding here would throw away a stage
+    that may be perfectly good."""
+    from auth_flow import reconcile_stage
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = ""
+
+    outcome, message = reconcile_stage(auth, cb)
+
+    assert outcome == "retain"
+    assert "configured for" not in message          # not the mismatch verdict
+    assert store.load_staged() is not None
+    cb.ack.assert_not_called()
+
+
+def test_reconcile_does_not_ack_when_activation_fails(tmp_path):
+    """The rebuild of everything derived from the credential happens inside
+    activate(). If it fails, the flow must stay unacked — the credential is
+    already durably promoted and the next pass recovers it."""
+    from auth_flow import reconcile_stage
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "user@example.com"
+    auth.activate.side_effect = RuntimeError("attachment cache unwritable")
+
+    outcome, _message = reconcile_stage(auth, cb)
+
+    assert outcome != "promoted"
+    assert outcome == "retain"
+    cb.ack.assert_not_called()
+    assert store.load_active().refresh_token == "rt-new"    # promoted on disk
+
+
 def test_reconcile_settles_a_terminally_dead_stage(tmp_path):
     """A revoked stage must not wedge the slot forever."""
     from auth import RefreshTerminal
@@ -246,6 +296,45 @@ def test_startup_recover_returns_busy_when_lock_contended(tmp_path):
     auth.refresh_and_verify.assert_not_called()
 
 
+def _real_auth(tmp_path, monkeypatch, **env):
+    """A real GmailAuth (not a double) so env reading can be observed."""
+    from auth import GmailAuth
+    values = {"GMAIL_CLIENT_ID": "client-id", "GMAIL_CLIENT_SECRET": "client-secret",
+              "GMAIL_USER_EMAIL": "user@example.com", **env}
+    for key, val in values.items():
+        if val is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, val)
+    return GmailAuth(str(tmp_path))
+
+
+def test_startup_recover_reads_env_even_when_the_lock_is_contended(tmp_path, monkeypatch):
+    """Two overlapping server processes are the only reason the lock exists. The
+    loser must still be configured: without the env, gmail_auth_start emits
+    client_id=None and gmail_auth_collect crashes on the account comparison."""
+    from auth_flow import collect_lock, startup_recover
+    auth = _real_auth(tmp_path, monkeypatch)
+
+    with collect_lock(tmp_path):
+        result = startup_recover(auth, MagicMock())
+
+    assert result == "busy"
+    assert auth.subject_email == "user@example.com"
+    assert "client_id=client-id" in auth.build_auth_url("https://casa/x", "s")
+
+
+def test_startup_recover_exits_on_missing_env_even_when_contended(tmp_path, monkeypatch):
+    """The hoisted env read still exits the process: SystemExit is a
+    BaseException and nothing here may catch it."""
+    from auth_flow import collect_lock, startup_recover
+    auth = _real_auth(tmp_path, monkeypatch, GMAIL_CLIENT_ID=None)
+
+    with collect_lock(tmp_path):
+        with pytest.raises(SystemExit):
+            startup_recover(auth, MagicMock())
+
+
 def test_startup_recover_loads_active_before_reconciling_stage(tmp_path):
     """Ordering pin: validate_and_init runs before stage verification."""
     from auth_flow import startup_recover
@@ -289,10 +378,16 @@ def test_startup_recover_holds_the_lock_through_reconcile_stage(tmp_path):
 
 
 def test_startup_recover_returns_error_when_reconcile_stage_raises(tmp_path, capsys):
-    """A bug or I/O error in step 0 must not propagate — and must be logged."""
+    """A bug or I/O error in step 0 must not propagate — and must be logged.
+
+    An unclassified *verification* failure is now classified as "retain" inside
+    reconcile_stage, so this net is exercised from the settlement instead: it
+    must still catch anything reconcile_stage does not."""
+    from auth import RefreshTerminal
     from auth_flow import startup_recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
-    auth.refresh_and_verify.side_effect = RuntimeError("boom")
+    auth.refresh_and_verify.side_effect = RefreshTerminal("revoked")
+    cb.ack.side_effect = RuntimeError("boom")
 
     result = startup_recover(auth, cb)
 
@@ -424,6 +519,21 @@ def test_claimed_attempt_already_committed_activates_then_acks(tmp_path):
     auth.exchange_code.assert_not_called()
     cb.ack.assert_called_with(NEW)
     assert out["promoted"] is True
+
+
+def test_committed_activation_failure_ends_the_pass_without_acking(tmp_path):
+    """Same rule on the already-committed shortcut: ack only after activate()."""
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW, claimed=True)],
+                       active=cred(rt="rt-new", flow=NEW, gen=100.0))
+    cb.collect.side_effect = FileNotFoundError()
+    auth.activate.side_effect = RuntimeError("attachment cache unwritable")
+
+    out = collect_pass(auth, cb)
+
+    assert out["status"] == "retry_later"
+    assert out["promoted"] is False
+    cb.ack.assert_not_called()
 
 
 def test_claimed_attempt_resumes_from_the_held_journal(tmp_path):

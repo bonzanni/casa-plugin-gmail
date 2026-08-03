@@ -113,14 +113,43 @@ def test_gmail_auth_start_surfaces_callback_unavailable(monkeypatch):
 
 
 def test_gmail_auth_collect_reports_and_rebuilds_clients(monkeypatch):
+    """The rebuild is wired to activate(), so it must have happened by the time
+    the tool returns — and it must be driven by the activation, not bolted on
+    afterwards (which would rebuild twice, starting a second cleanup thread)."""
     import server
-    monkeypatch.setattr(server, "_flow_collect", lambda auth, cb: {
-        "status": "ok", "promoted": True, "messages": ["Gmail connected as a@b.c."]})
-    monkeypatch.setattr(server, "_rebuild_runtime", lambda: None)
+    from token_store import Credential
+
+    monkeypatch.setattr(server, "GmailClient", MagicMock())
+    monkeypatch.setattr(server, "AttachmentManager", MagicMock())
+    monkeypatch.setattr(server, "SentLog", MagicMock())
+    monkeypatch.setattr(server, "_client", None)
+    monkeypatch.setattr(server, "_att", None)
+    monkeypatch.setattr(server, "_log", None)
+    monkeypatch.setattr(server, "_authenticated", False)
+
+    def fake_collect(auth, cb):
+        # What a real promotion does, and the only thing that does it.
+        auth.activate(Credential(refresh_token="rt", flow="a" * 64,
+                                 generation=1.0, account="a@b.c"))
+        return {"status": "ok", "promoted": True,
+                "messages": ["Gmail connected as a@b.c."]}
+    monkeypatch.setattr(server, "_flow_collect", fake_collect)
 
     result = json.loads(server.gmail_auth_collect())
+
     assert result["status"] == "ok"
     assert result["messages"] == ["Gmail connected as a@b.c."]
+    assert server._authenticated is True
+    assert server._client is not None and server._att is not None
+    assert server.GmailClient.call_count == 1        # rebuilt exactly once
+    assert server.AttachmentManager.call_count == 1
+
+
+def test_the_runtime_rebuild_is_wired_to_activation(monkeypatch):
+    """auth.py must not learn what a GmailClient is; server.py must not rebuild
+    after the fact. The hook is the seam."""
+    import server
+    assert server._auth.on_activate is server._rebuild_runtime
 
 
 def test_gmail_auth_complete_is_gone():

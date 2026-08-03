@@ -53,8 +53,13 @@ class GmailAuth:
         self._client_id = None
         self._client_secret = None
         self.store = TokenStore(plugin_data_dir)
+        # Assignable activation hook. The owner of the credential-derived
+        # runtime (server.py) assigns it, so a rebuild failure raises INSIDE
+        # activate() — i.e. before any caller acks a flow on the strength of it.
+        # auth.py deliberately knows nothing about what gets rebuilt.
+        self.on_activate = None
 
-    def _read_env(self) -> None:
+    def read_env(self) -> None:
         values = {name: os.environ.get(name, "") for name in _REQUIRED_ENV_VARS}
         missing = [name for name, val in values.items() if not val]
         if missing:
@@ -70,23 +75,44 @@ class GmailAuth:
     def validate_and_init(self) -> bool:
         """Read env vars and load the ACTIVE credential. Staged recovery is the
         caller's job (auth_flow.startup_recover), which holds the collect lock."""
-        self._read_env()
+        self.read_env()
         return self.load_active()
+
+    def _report_account_mismatch(self, account: str) -> None:
+        print(
+            "Gmail plugin: the stored credential authorizes "
+            f"{account!r} but GMAIL_USER_EMAIL is {self._user_email!r}. "
+            "Re-authorization is needed.",
+            file=sys.stderr,
+        )
 
     def load_active(self) -> bool:
         cred = self.store.load_active()
         if cred is None:
             return False
         if cred.account and cred.account.lower() != self._user_email.lower():
-            print(
-                "Gmail plugin: the stored credential authorizes "
-                f"{cred.account!r} but GMAIL_USER_EMAIL is {self._user_email!r}. "
-                "Re-authorization is needed.",
-                file=sys.stderr,
-            )
+            self._report_account_mismatch(cred.account)
             return False
         try:
-            refreshed = self._refresh(cred.refresh_token)
+            if cred.account is None:
+                # Legacy v1 file: it records no account, so the guard above
+                # could not run and nothing would ever activate it. Verify once
+                # with getProfile and migrate in place to v2, so every later
+                # startup compares against a recorded account. The migrated
+                # credential supersedes nothing: no flow, no generation.
+                refreshed, account = self._refresh_and_profile(cred.refresh_token)
+                if not account:
+                    print("Gmail plugin: could not confirm which account the "
+                          "stored token authorizes; token kept.", file=sys.stderr)
+                    return False
+                if account.lower() != self._user_email.lower():
+                    self._report_account_mismatch(account)
+                    return False
+                cred = Credential(refresh_token=cred.refresh_token, flow=None,
+                                  generation=None, account=account)
+                self.store.write_active(cred)
+            else:
+                refreshed = self._refresh(cred.refresh_token)
         except RefreshTerminal as exc:
             print(f"Gmail plugin: stored token is dead — re-auth needed ({exc}).",
                   file=sys.stderr)
@@ -97,9 +123,23 @@ class GmailAuth:
             print(f"Gmail plugin: could not refresh right now ({exc}); token kept.",
                   file=sys.stderr)
             return False
+        except Exception as exc:
+            # Unknown ⇒ retain, the same policy _refresh applies. getProfile
+            # raises a plain ValueError on any HttpError and lets transport
+            # failures through raw; neither may destroy a working credential.
+            print(f"Gmail plugin: could not verify the stored token right now "
+                  f"({exc}); token kept.", file=sys.stderr)
+            return False
         # Pass the already-refreshed object through: rebuilding from the
         # refresh token alone would throw away the access token we just fetched.
-        self.activate(cred, credentials=refreshed)
+        try:
+            self.activate(cred, credentials=refreshed)
+        except Exception as exc:
+            # The activation hook failed (see activate). The credential stays on
+            # disk; the process simply starts unauthenticated.
+            print(f"Gmail plugin: could not bring the stored credential into "
+                  f"service ({exc}); token kept.", file=sys.stderr)
+            return False
         return True
 
     def _refresh(self, refresh_token: str) -> Credentials:
@@ -113,19 +153,29 @@ class GmailAuth:
         return credentials
 
     def activate(self, cred: Credential, credentials=None) -> None:
-        """Idempotent: make `cred` the live credential.
+        """Idempotent: make `cred` the live credential, then run `on_activate`.
 
         `credentials` lets a caller that has just refreshed hand the live object
         through instead of discarding its access token. Callers that hold only a
         stored Credential omit it; google-auth then refreshes on first use.
+
+        The hook runs here, and is allowed to raise: everything derived from the
+        credential must be in service before a caller treats the activation as
+        successful and acks the flow that produced it.
         """
         self._credentials = credentials or self.credentials_for(cred.refresh_token)
+        if self.on_activate is not None:
+            self.on_activate()
+
+    def _refresh_and_profile(self, refresh_token: str):
+        """(live credentials, authorized address). One refresh, one getProfile."""
+        credentials = self._refresh(refresh_token)
+        from gmail_client import GmailClient
+        return credentials, GmailClient(credentials).get_profile_email()
 
     def refresh_and_verify(self, refresh_token: str) -> str:
         """Refresh, then ask Google which account this credential belongs to."""
-        credentials = self._refresh(refresh_token)
-        from gmail_client import GmailClient
-        return GmailClient(credentials).get_profile_email()
+        return self._refresh_and_profile(refresh_token)[1]
 
     def build_auth_url(self, redirect_uri: str, state: str) -> str:
         """Authorization URL for casa's callback endpoint.

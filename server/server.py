@@ -29,6 +29,16 @@ _cb = CasaCallback(PLUGIN_ROOT)
 
 
 def _rebuild_runtime() -> None:
+    """Rebuild everything derived from the credential.
+
+    This is _auth.on_activate (wired just below), so it runs INSIDE
+    GmailAuth.activate() and its failure modes — two makedirs, a cleanup sweep
+    and a thread in AttachmentManager, a file read in SentLog — fail the
+    activation itself rather than being discovered after the flow was acked.
+    activate() is the ONLY thing that ever sets _auth._credentials, so this is
+    also the only place the runtime needs rebuilding: no caller may call it
+    again afterwards or the thread would be started twice.
+    """
     global _client, _att, _log, _authenticated
     _client = GmailClient(_auth.credentials)
     _att = AttachmentManager(PLUGIN_DATA)
@@ -36,18 +46,20 @@ def _rebuild_runtime() -> None:
     _authenticated = True
 
 
+_auth.on_activate = _rebuild_runtime
+
+
 def _startup():
     os.makedirs(PLUGIN_DATA, exist_ok=True)
     # startup_recover holds collect.lock across env validation, active-token
     # loading AND staged recovery — all three can mutate the store, so they are
     # one unit. Do NOT call _auth.validate_and_init() separately here.
+    # The runtime rebuild needs no call here either: activate() runs it.
     try:
         _flow_startup(_auth, _cb)
     except Exception as exc:       # never let recovery break startup
         print(f"Gmail plugin: credential startup incomplete ({exc}).",
               file=sys.stderr)
-    if _auth.is_authenticated:
-        _rebuild_runtime()
 
 
 def _require_auth() -> None:
@@ -84,10 +96,9 @@ def gmail_auth_start() -> str:
 @mcp.tool()
 def gmail_auth_collect() -> str:
     """Collect any waiting Gmail authorization result and finish setup. Call this when casa reports an authorization result is waiting. Safe to call repeatedly."""
-    result = _flow_collect(_auth, _cb)
-    if result.get("promoted") and _auth.is_authenticated:
-        _rebuild_runtime()
-    return _ok(result)
+    # No rebuild here: activate() ran _rebuild_runtime before the flow was
+    # acked, and a second call would start a second cleanup thread.
+    return _ok(_flow_collect(_auth, _cb))
 
 
 # ── Search / Read ──────────────────────────────────────────────────────────

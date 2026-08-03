@@ -147,6 +147,193 @@ def test_transient_refresh_failure_RETAINS_the_token(mock_creds_cls, monkeypatch
     assert (tmp_path / "oauth_token.json").exists()
 
 
+# ── Legacy v1 migration ─────────────────────────────────────────────────────
+
+def _write_v1(tmp_path, refresh_token="rt-legacy"):
+    """A v0.4.x file: no `v`, no `flow`, no `account`."""
+    (tmp_path / "oauth_token.json").write_text(
+        json.dumps({"refresh_token": refresh_token}))
+
+
+def _raw_active(tmp_path):
+    return json.loads((tmp_path / "oauth_token.json").read_text())
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_token_is_verified_and_migrated_in_place_to_v2(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    """A v1 file records no account, so the mismatch guard cannot run on it.
+    Verify with getProfile once, then rewrite it as v2 so it can never again be
+    served unverified. The migrated credential supersedes nothing."""
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+    mock_client_cls.return_value.get_profile_email.return_value = (
+        "User@Workspace.Example.COM")
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is True
+    assert auth.is_authenticated
+
+    raw = _raw_active(tmp_path)
+    assert raw["v"] == 2
+    assert raw["refresh_token"] == "rt-legacy"
+    assert raw["account"] == "User@Workspace.Example.COM"
+    assert raw["flow"] is None
+    assert raw["generation"] is None
+    mock_client_cls.return_value.get_profile_email.assert_called_once()
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_token_for_another_account_is_refused_and_left_on_disk(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    """Changing GMAIL_USER_EMAIL must not silently keep serving the old inbox
+    just because the stored file predates the account field."""
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+    mock_client_cls.return_value.get_profile_email.return_value = "someone-else@example.com"
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not auth.is_authenticated
+    assert _raw_active(tmp_path) == {"refresh_token": "rt-legacy"}   # untouched
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_transient_verification_failure_retains_the_token(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = OSError("connection reset")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert _raw_active(tmp_path) == {"refresh_token": "rt-legacy"}
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_unclassified_getprofile_failure_retains_the_token(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    """get_profile_email raises a plain ValueError for every HttpError — a 403
+    from an unenabled Gmail API must not destroy a working credential."""
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+    mock_client_cls.return_value.get_profile_email.side_effect = ValueError(
+        "Gmail API error 403: accessNotConfigured")
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not auth.is_authenticated
+    assert _raw_active(tmp_path) == {"refresh_token": "rt-legacy"}
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_blank_verified_account_retains_the_token(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+    mock_client_cls.return_value.get_profile_email.return_value = ""
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert _raw_active(tmp_path) == {"refresh_token": "rt-legacy"}
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v1_terminal_refresh_removes_the_token(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    from google.auth.exceptions import RefreshError
+    _set_full_env(monkeypatch)
+    _write_v1(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = RefreshError("invalid_grant")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not (tmp_path / "oauth_token.json").exists()
+
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_v2_token_is_not_re_verified_over_the_network(
+        mock_creds_cls, mock_client_cls, monkeypatch, tmp_path):
+    """The extra getProfile is the price of a legacy file only — a v2 file
+    carries the account it was verified against."""
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+
+    make_auth(tmp_path).validate_and_init()
+    mock_client_cls.return_value.get_profile_email.assert_not_called()
+
+
+# ── activate / activation hook ──────────────────────────────────────────────
+
+def _credential(rt="rt-x"):
+    from token_store import Credential
+    return Credential(refresh_token=rt, flow=None, generation=None, account="a@b.c")
+
+
+def test_activate_runs_the_activation_hook_after_setting_credentials(
+        monkeypatch, tmp_path):
+    """server.py hangs the runtime rebuild here so it happens BEFORE any caller
+    acks the flow — auth.py itself stays ignorant of what gets rebuilt."""
+    _set_full_env(monkeypatch)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    seen = []
+    auth.on_activate = lambda: seen.append(auth.credentials)
+
+    auth.activate(_credential())
+
+    assert len(seen) == 1
+    assert seen[0] is auth.credentials       # credential set before the hook ran
+
+
+def test_activate_propagates_a_failing_hook(monkeypatch, tmp_path):
+    """The failure must reach the caller: an activation whose rebuild failed is
+    not a successful activation."""
+    _set_full_env(monkeypatch)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    def boom():
+        raise RuntimeError("attachment cache unwritable")
+    auth.on_activate = boom
+
+    with pytest.raises(RuntimeError, match="unwritable"):
+        auth.activate(_credential())
+
+
+@patch("auth.Credentials")
+def test_load_active_reports_a_failing_hook_and_keeps_the_token(
+        mock_creds_cls, monkeypatch, tmp_path, capsys):
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    mock_creds_cls.return_value = MagicMock()
+    auth = make_auth(tmp_path)
+
+    def boom():
+        raise RuntimeError("attachment cache unwritable")
+    auth.on_activate = boom
+
+    assert auth.validate_and_init() is False
+    assert (tmp_path / "oauth_token.json").exists()
+    assert "unwritable" in capsys.readouterr().err
+
+
 # ── refresh_and_verify ──────────────────────────────────────────────────────
 
 @patch("gmail_client.GmailClient")
