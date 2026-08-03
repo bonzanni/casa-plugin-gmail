@@ -207,42 +207,74 @@ def test_queueing_the_same_key_twice_produces_one_notice(tmp_path):
 
 def test_peeking_removes_nothing(tmp_path):
     """Read must not be destructive: the caller may still fail before it has
-    delivered what it read."""
+    delivered what it read. Peek counts nothing either — only a completed pass
+    counts, via record_notices_offered()."""
     s = store(tmp_path)
     s.queue_notice("k", "still here")
+    assert s.peek_notices() == ["still here"]
     assert s.peek_notices() == ["still here"]
     assert s.peek_notices() == ["still here"]
     assert (Path(tmp_path) / "pending_notices.json").exists()
 
 
-def test_a_delivered_notice_is_purged_by_the_next_peek(tmp_path):
+def test_a_notice_is_not_removed_by_a_later_pass(tmp_path):
+    """P1. A completed pass is NOT evidence that its response reached anyone,
+    so the pass after it must not purge what the first one merely returned.
+    Only exhausting the offer budget removes a notice."""
+    from token_store import NOTICE_OFFER_LIMIT
     s = store(tmp_path)
-    s.queue_notice("k", "only once")
-    assert s.peek_notices() == ["only once"]
-    s.mark_notices_delivered()
-    assert s.peek_notices() == []
+    s.queue_notice("k", "wrong account")
+
+    assert s.peek_notices() == ["wrong account"]
+    s.record_notices_offered()
+
+    for _ in range(NOTICE_OFFER_LIMIT - 1):
+        assert s.peek_notices() == ["wrong account"], \
+            "a later pass must not retire a notice it did not deliver"
+        s.record_notices_offered()
+
+
+def test_a_notice_is_offered_at_most_the_limit_then_never_again(tmp_path):
+    """P2. At-least-once must not become forever. The count is durable, so a
+    fresh TokenStore — which is all a restart is, now that no process identity
+    survives anywhere — resumes the budget instead of resetting it."""
+    from token_store import NOTICE_OFFER_LIMIT
+    store(tmp_path).queue_notice("k", "wrong account")
+
+    offers = 0
+    for _ in range(NOTICE_OFFER_LIMIT + 5):
+        # A new instance every round: each pass is a "restarted" process.
+        s = store(tmp_path)
+        offers += len(s.peek_notices())
+        s.record_notices_offered()
+
+    assert offers == NOTICE_OFFER_LIMIT
+    assert store(tmp_path).peek_notices() == []
     assert not (Path(tmp_path) / "pending_notices.json").exists()
 
 
-def test_a_notice_delivered_by_a_dead_process_is_offered_again(tmp_path,
-                                                               monkeypatch):
-    """The mark says the call returned the sentence, not that anyone read it.
-    Only a later pass in the SAME process is evidence of that, so a restart in
-    between must re-offer rather than purge."""
-    import token_store
+def test_requeueing_an_offered_notice_neither_duplicates_it_nor_resets_it(tmp_path):
+    """P3. A settlement whose ack failed is settled again by the next startup,
+    which re-queues the identical flow:disposition. That must stay a no-op —
+    not a second copy, and not a fresh offer budget for the first."""
+    from token_store import NOTICE_OFFER_LIMIT
     s = store(tmp_path)
-    s.queue_notice("k", "wrong account")
+    s.queue_notice("flow:wrong_account", "wrong account")
     assert s.peek_notices() == ["wrong account"]
-    s.mark_notices_delivered()
+    s.record_notices_offered()
 
-    monkeypatch.setattr(token_store, "INSTANCE", "a-different-process")
-    assert s.peek_notices() == ["wrong account"]
-    s.mark_notices_delivered()
-    assert s.peek_notices() == []
+    s.queue_notice("flow:wrong_account", "wrong account")
+    assert s.peek_notices() == ["wrong account"], "one copy, still owed"
+
+    offers = 1
+    while s.peek_notices():
+        offers += 1
+        s.record_notices_offered()
+    assert offers == NOTICE_OFFER_LIMIT, "the re-queue must not extend the budget"
 
 
-def test_marking_with_nothing_pending_is_not_an_error(tmp_path):
-    store(tmp_path).mark_notices_delivered()
+def test_recording_with_nothing_pending_is_not_an_error(tmp_path):
+    store(tmp_path).record_notices_offered()
     assert store(tmp_path).peek_notices() == []
 
 
@@ -252,4 +284,15 @@ def test_peeking_nothing_is_not_an_error(tmp_path):
 
 def test_an_unreadable_notice_file_is_ignored_not_fatal(tmp_path):
     (Path(tmp_path) / "pending_notices.json").write_text("{not json")
-    assert store(tmp_path).load_notices() == []
+    assert store(tmp_path).peek_notices() == []
+
+
+def test_a_notice_with_no_recorded_count_is_treated_as_never_offered(tmp_path):
+    """At-least-once bias: a record whose count is missing or nonsense must
+    re-offer, never silently retire."""
+    (Path(tmp_path) / "pending_notices.json").write_text(json.dumps(
+        {"v": 2, "notices": [{"key": "k", "message": "wrong account"},
+                             {"key": "j", "message": "dead flow",
+                              "offered": "lots"}]}
+    ))
+    assert store(tmp_path).peek_notices() == ["wrong account", "dead flow"]

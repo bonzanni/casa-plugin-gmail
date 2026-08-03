@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,10 +23,11 @@ STAGED_NAME = "oauth_token.staged.json"
 NOTICE_NAME = "pending_notices.json"
 SCHEMA_VERSION = 2
 
-# Identifies THIS server process to the notice queue (see "Pending user-facing
-# notices" below). A restart must produce a different value, so it is minted
-# per process and never persisted anywhere but inside the notice file.
-INSTANCE = uuid.uuid4().hex
+# How many times a pending notice may be offered before it is retired for good
+# (see "Pending user-facing notices" below). Three covers casa's nudge retrying
+# a collect within one process AND a restart or two, without letting a sentence
+# repeat forever. Not configurable: there is nothing here worth tuning.
+NOTICE_OFFER_LIMIT = 3
 
 
 class StagedFlowMismatch(RuntimeError):
@@ -168,19 +168,26 @@ class TokenStore:
     #
     # Delivery is deliberately AT-LEAST-ONCE. Showing "that authorization was
     # granted by the wrong account" twice is a nuisance; never showing it is
-    # the bug this file exists to prevent. So a notice is never removed by the
-    # act of reading it:
+    # the bug this file exists to prevent.
     #
-    #   peek_notices()            returns the pending ones, removing nothing
-    #   mark_notices_delivered()  called ONLY after the pass returned them
-    #   the next peek             purges what THIS process already delivered
+    # There is no acknowledgement on this tool surface: returning a sentence
+    # from gmail_auth_collect is not evidence that the response reached the
+    # agent, and neither is a later pass — casa's nudge carries a six-dispatch
+    # budget, so a retried collect in the SAME process is ordinary behaviour,
+    # not a signal that the previous one landed. Nothing observable here can
+    # confirm delivery, so nothing here pretends to. Instead each notice
+    # carries a durable count of how many times it has been OFFERED:
     #
-    # "This process" is the point of `delivered_by`. A mark says the tool call
-    # returned the sentence; it does not say the response reached anyone. A
-    # later pass in the same process is evidence that it did — the process did
-    # not die between returning and writing the response. A pass in a *new*
-    # process has no such evidence, so it re-delivers once rather than purge a
-    # notice that may have died with its reader.
+    #   peek_notices()           returns everything under the limit, removing
+    #                            and counting nothing
+    #   record_notices_offered() called ONLY after the pass returned them;
+    #                            counts one offer against each and drops those
+    #                            that have now reached NOTICE_OFFER_LIMIT
+    #
+    # The count is durable, so restarts neither reset it nor exempt anything:
+    # a notice is offered at most NOTICE_OFFER_LIMIT times across any sequence
+    # of passes and restarts, and then never again. Nothing else removes a
+    # notice — in particular, "a later pass ran" never does.
     #
     # Each notice carries a key — flow + disposition — so re-queueing the same
     # outcome (a settlement whose ack failed, settled again next startup) is a
@@ -199,41 +206,34 @@ class TokenStore:
             return
         self._dir.mkdir(parents=True, exist_ok=True)
         self._write_records(
-            records + [{"key": key, "message": message, "delivered_by": None}]
+            records + [{"key": key, "message": message, "offered": 0}]
         )
 
-    def load_notices(self) -> list[str]:
-        """Every notice this process still owes the user."""
-        return [r["message"] for r in self._load_records()
-                if r["delivered_by"] != INSTANCE]
-
     def peek_notices(self) -> list[str]:
-        """Purge what THIS process already delivered, then return the rest.
+        """Every notice still owed the user. Removes nothing, counts nothing.
 
-        Removes nothing this process has not itself delivered — including a
-        notice another (now dead) process marked, which is re-offered. Call
-        under the collect lock.
+        Read must not be destructive: the caller may still fail before it has
+        delivered what it read. Call under the collect lock.
         """
-        records = self._load_records()
-        kept = [r for r in records if r["delivered_by"] != INSTANCE]
-        if len(kept) != len(records):
-            self._write_records(kept)
-        return [r["message"] for r in kept]
+        return [r["message"] for r in self._load_records()
+                if r["offered"] < NOTICE_OFFER_LIMIT]
 
-    def mark_notices_delivered(self) -> None:
-        """Record that a completed pass returned every outstanding notice.
+    def record_notices_offered(self) -> None:
+        """Count one offer against every notice a completed pass returned, and
+        retire those that have now been offered NOTICE_OFFER_LIMIT times.
 
         Call ONLY once the pass has returned normally with the notices in hand:
-        marking at peek time would let any later failure in that pass drop a
-        notice nobody ever saw.
+        counting at peek time would let any later failure in that pass burn an
+        offer nobody ever read.
         """
         records = self._load_records()
-        outstanding = [r for r in records if r["delivered_by"] != INSTANCE]
-        if not outstanding:
+        if not records:
             return
-        for record in outstanding:
-            record["delivered_by"] = INSTANCE
-        self._write_records(records)
+        for record in records:
+            record["offered"] += 1
+        self._write_records(
+            [r for r in records if r["offered"] < NOTICE_OFFER_LIMIT]
+        )
 
     def _load_records(self) -> list[dict]:
         try:
@@ -252,11 +252,14 @@ class TokenStore:
             key, message = item.get("key"), item.get("message")
             if not isinstance(key, str) or not isinstance(message, str) or not message:
                 continue
-            by = item.get("delivered_by")
+            offered = item.get("offered")
             out.append({
                 "key": key,
                 "message": message,
-                "delivered_by": by if isinstance(by, str) and by else None,
+                # A missing or nonsense count reads as "never offered": the
+                # at-least-once bias says re-offer, never silently retire.
+                "offered": offered if isinstance(offered, int)
+                and not isinstance(offered, bool) and offered >= 0 else 0,
             })
         return out
 

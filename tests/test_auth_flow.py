@@ -522,7 +522,7 @@ def test_the_notice_is_written_before_the_ack(tmp_path):
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
     seen = {}
-    cb.ack.side_effect = lambda h: seen.update(notices=store.load_notices())
+    cb.ack.side_effect = lambda h: seen.update(notices=store.peek_notices())
 
     startup_recover(auth, cb)
 
@@ -530,21 +530,12 @@ def test_the_notice_is_written_before_the_ack(tmp_path):
     assert "no longer valid" in seen["notices"][0]
 
 
-def test_a_notice_is_drained_only_once(tmp_path):
-    from auth_flow import startup_recover
-    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
-    auth.refresh_and_verify.return_value = "user@example.com"
-    startup_recover(auth, cb)
-
-    assert any("Gmail connected as" in m for m in _next_collect(auth)["messages"])
-    assert not any("Gmail connected as" in m for m in _next_collect(auth)["messages"])
-
-
-# ── The drain must not lose the outcome it exists to preserve ──────────────
-# Removing the durable copy at the START of the pass throws away the only
-# record of the outcome while the pass can still fail. Delivery is
+# ── The notice must not be lost, and must not repeat forever ───────────────
+# Removing the durable copy because a pass ran throws away the only record of
+# the outcome without ever learning that anyone read it. Delivery is
 # at-least-once by choice: a repeated "granted by the wrong account" is a
-# nuisance, a silent one is the bug.
+# nuisance, a silent one is the bug. A durable per-notice offer count is what
+# keeps "at least once" from becoming "forever".
 
 def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
     """Sol's case: the notice is read, then cb.attempts() blows up — the tool
@@ -563,38 +554,67 @@ def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
                for m in _next_collect(auth)["messages"])
 
 
-def test_a_notice_survives_a_process_that_dies_after_returning_it(tmp_path,
-                                                                  monkeypatch):
-    """Terra's case: the pass returns the notice and the server exits before
-    the response is delivered. A NEW process has no evidence anyone read it."""
-    import token_store
+def test_a_notice_survives_a_retried_collect_in_the_same_process(tmp_path):
+    """P1, and Terra's MAJOR. Casa's nudge carries a six-dispatch budget, so a
+    second gmail_auth_collect in the same process is ordinary — it is NOT
+    evidence that the first response reached the agent. If the second pass
+    purges what the first returned, the user is told nothing was waiting when
+    their authorization had in fact been rejected as the wrong account."""
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+    assert startup_recover(auth, cb) == "settled"
+
+    first = _next_collect(auth)["messages"]
+    assert any("someone-else@example.com" in m for m in first)
+
+    retry = _next_collect(auth)["messages"]
+    assert any("someone-else@example.com" in m for m in retry), \
+        "the retried collect must still carry the outcome"
+    assert not any("No authorization result was waiting" in m for m in retry)
+
+
+def test_a_pass_that_raises_does_not_consume_an_offer(tmp_path):
+    """P4. The offer is counted only on a normal return, so a pass that blew up
+    after peeking leaves the whole budget intact."""
+    from token_store import NOTICE_OFFER_LIMIT
+    from auth_flow import collect_pass, startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.return_value = "someone-else@example.com"
+    assert startup_recover(auth, cb) == "settled"
+
+    broken = MagicMock()
+    broken.attempts.side_effect = RuntimeError("callback index unreadable")
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            collect_pass(auth, broken)
+
+    offers = sum(1 for _ in range(NOTICE_OFFER_LIMIT + 3)
+                 if any("someone-else@example.com" in m
+                        for m in _next_collect(auth)["messages"]))
+    assert offers == NOTICE_OFFER_LIMIT
+
+
+def test_a_notice_is_offered_a_bounded_number_of_times_then_never_again(tmp_path):
+    """P2. The other half: at-least-once must not become forever, and a restart
+    must neither reset the budget nor exempt a notice from it — the count is on
+    disk, and no process identity is involved anywhere."""
+    from token_store import NOTICE_OFFER_LIMIT, TokenStore
     from auth_flow import startup_recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
     startup_recover(auth, cb)
 
-    assert any("someone-else@example.com" in m
-               for m in _next_collect(auth)["messages"])
+    offers = 0
+    for _ in range(NOTICE_OFFER_LIMIT + 5):
+        # A fresh store every round: each pass is a restarted server.
+        auth.store = TokenStore(str(tmp_path))
+        if any("someone-else@example.com" in m
+               for m in _next_collect(auth)["messages"]):
+            offers += 1
 
-    monkeypatch.setattr(token_store, "INSTANCE", "the-restarted-process")
-    assert any("someone-else@example.com" in m
-               for m in _next_collect(auth)["messages"])
-
-
-def test_a_delivered_notice_is_purged_by_the_following_pass(tmp_path):
-    """The other half: at-least-once must not become forever."""
-    from auth_flow import startup_recover
-    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
-    auth.refresh_and_verify.return_value = "someone-else@example.com"
-    startup_recover(auth, cb)
-
-    assert any("someone-else@example.com" in m
-               for m in _next_collect(auth)["messages"])
-    assert not any("someone-else@example.com" in m
-                   for m in _next_collect(auth)["messages"])
+    assert offers == NOTICE_OFFER_LIMIT
     assert not (tmp_path / "pending_notices.json").exists()
-    assert not any("someone-else@example.com" in m
-                   for m in _next_collect(auth)["messages"])
 
 
 def test_a_failed_ack_does_not_queue_the_notice_twice(tmp_path):
@@ -817,7 +837,7 @@ def test_a_live_collect_message_is_never_also_queued_as_a_notice(tmp_path):
 
     assert [m for m in out["messages"] if "Gmail connected as" in m] == \
         ["Gmail connected as user@example.com."]
-    assert store.load_notices() == []
+    assert store.peek_notices() == []
     assert not any("Gmail connected as" in m
                    for m in _next_collect(auth)["messages"])
 

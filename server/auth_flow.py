@@ -311,10 +311,13 @@ def collect_pass(auth, cb) -> dict:
             return {"status": "busy", "messages": [], "promoted": False}
         out = _locked_pass(auth, cb)
         # Only here: the pass returned normally, so `out` really does carry
-        # every notice the peek handed over. Marking at the peek instead would
-        # let any failure below — a raising cb.attempts(), a crash mid-exchange
-        # — retire a sentence nobody ever read.
-        auth.store.mark_notices_delivered()
+        # every notice the peek handed over, and this offer of it counts.
+        # Counting at the peek instead would let any failure below — a raising
+        # cb.attempts(), a crash mid-exchange — burn an offer nobody ever read.
+        # A return is still not proof anyone READ it, which is why the offer is
+        # counted rather than the notice retired; the durable count is what
+        # bounds the repeats.
+        auth.store.record_notices_offered()
 
     if out["status"] == "ok" and not out["messages"] and not out["promoted"]:
         # A pass that did nothing must not read as a success. This tool is
@@ -335,17 +338,18 @@ def _locked_pass(auth, cb) -> dict:
     """The pass proper, run under the collect lock.
 
     Every `return` here is a normal return whose `messages` carry the peeked
-    notices; anything raised leaves them undelivered and therefore on disk.
+    notices; anything raised leaves the offer uncounted and them on disk.
     """
     out = {"status": "ok", "messages": [], "promoted": False}
 
     # Anything a previous startup recovery resolved with nobody listening.
     # Peeked FIRST so it reads in the order it happened, and peeked here rather
     # than at the end because every early return below must still carry it.
-    # Peek, not drain: the durable copy outlives this pass and is retired by
-    # collect_pass only once the pass has returned. reconcile_stage runs with
-    # notify False from this point on, so nothing this pass produces can also
-    # land in the notice file.
+    # Peek, not drain: the durable copy outlives this pass, and collect_pass
+    # counts this offer against it only once the pass has returned — the copy
+    # is retired by exhausting its offer budget and by nothing else.
+    # reconcile_stage runs with notify False from this point on, so nothing
+    # this pass produces can also land in the notice file.
     out["messages"].extend(auth.store.peek_notices())
 
     outcome, message = reconcile_stage(auth, cb)
