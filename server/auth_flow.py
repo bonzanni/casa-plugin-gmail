@@ -11,10 +11,12 @@ import fcntl
 import os
 import secrets
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from auth import RefreshRetryable, RefreshTerminal
+from auth import ExchangeRetryable, ExchangeTerminal, RefreshRetryable, RefreshTerminal
+from casa_callback import attempt_order
 from token_store import StagedFlowMismatch
 
 LOCK_NAME = "collect.lock"
@@ -190,3 +192,146 @@ def startup_recover(auth, cb) -> str:
             )
             return "error"
         return outcome
+
+
+_COLLECT_RETRIES = 3
+_COLLECT_BACKOFF_S = 0.2
+
+_DONE_TEXT = {
+    "expired": "that authorization link expired before it was used",
+    "expired_unread": "that authorization completed but expired before I collected it",
+    "publish_failed": "casa could not record that authorization result",
+    "evicted": "that authorization was discarded by casa",
+    "collected": "that authorization was already handled",
+}
+
+
+def _committed_generation(active):
+    """(generation, flow) or None. A migrated legacy credential has neither and
+    therefore supersedes nothing."""
+    if active is None or active.flow is None or active.generation is None:
+        return None
+    return (active.generation, active.flow)
+
+
+def _obtain_result(cb, rec, active):
+    """Return (kind, payload).
+
+    kind: "record" (usable result), "committed" (this flow already promoted),
+    "unrecoverable" (claimed with no journal), "retry" (transient ENOENT).
+    """
+    h = rec["state_hash"]
+    for attempt_no in range(_COLLECT_RETRIES):
+        try:
+            return "record", cb.collect(h)
+        except FileNotFoundError:
+            if rec.get("claimed"):
+                break
+            if attempt_no < _COLLECT_RETRIES - 1:
+                time.sleep(_COLLECT_BACKOFF_S)
+    if not rec.get("claimed"):
+        return "retry", None
+    # Claimed: our own store is the tiebreaker (casa's collect() contract).
+    if active is not None and active.flow == h:
+        return "committed", None
+    held = cb.held(h)
+    if held is None:
+        return "unrecoverable", None
+    return "record", held
+
+
+def collect_pass(auth, cb) -> dict:
+    """Collect and settle every callback result waiting for this plugin.
+
+    Idempotent by contract — casa may nudge more than once.
+    """
+    out = {"status": "ok", "messages": [], "promoted": False}
+    with collect_lock(auth.store.dir) as acquired:
+        if not acquired:
+            return {"status": "busy", "messages": [], "promoted": False}
+
+        outcome, message = reconcile_stage(auth, cb)
+        if message:
+            out["messages"].append(message)
+        if outcome == "retain":
+            out["status"] = "retry_later"
+            return out
+        if outcome == "promoted":
+            out["promoted"] = True
+
+        committed = _committed_generation(auth.store.load_active())
+
+        for rec in cb.attempts():
+            h = rec["state_hash"]
+            if committed is not None and attempt_order(rec) < committed:
+                cb.ack(h)
+                out["messages"].append("Discarded a superseded authorization link.")
+                continue
+
+            status = rec.get("status")
+            if status == "awaiting_redirect":
+                continue
+            if status == "done":
+                reason = _DONE_TEXT.get(rec.get("outcome"), "that authorization ended")
+                out["messages"].append(f"Nothing to collect — {reason}.")
+                cb.ack(h)
+                continue
+
+            active = auth.store.load_active()
+            kind, payload = _obtain_result(cb, rec, active)
+            if kind == "retry":
+                out["status"] = "retry_later"
+                continue
+            if kind == "committed":
+                auth.activate(active)
+                cb.ack(h)
+                out["promoted"] = True
+                out["messages"].append("Gmail is already connected.")
+                continue
+            if kind == "unrecoverable":
+                out["messages"].append(
+                    "An authorization result was lost before I could read it. "
+                    "Please start authorization again.")
+                cb.ack(h)
+                continue
+
+            try:
+                code, error = parse_callback_query(payload.get("query"))
+            except MalformedCallback as exc:
+                out["messages"].append(f"Unusable authorization response ({exc}).")
+                cb.ack(h)
+                continue
+            if error:
+                out["messages"].append(
+                    f"Authorization was not granted ({error}). Nothing has changed.")
+                cb.ack(h)
+                continue
+
+            try:
+                token = auth.exchange_code(code, cb.resolve().redirect_uri)
+            except ExchangeTerminal as exc:
+                out["messages"].append(f"That authorization could not be completed "
+                                       f"({exc}). Please start again.")
+                cb.ack(h)
+                continue                      # terminal: fall through is safe
+            except ExchangeRetryable as exc:
+                out["messages"].append(f"Temporary problem completing authorization "
+                                       f"({exc}); I'll retry.")
+                out["status"] = "retry_later"
+                return out                    # never fall through: it would
+                                              # overwrite the staged slot
+
+            auth.store.stage(token["refresh_token"], h, rec.get("minted_ts"))
+            stage_outcome, stage_message = reconcile_stage(auth, cb)
+            if stage_message:
+                out["messages"].append(stage_message)
+            if stage_outcome == "promoted":
+                out["promoted"] = True
+                committed = _committed_generation(auth.store.load_active())
+                continue
+            if stage_outcome == "retain":
+                out["status"] = "retry_later"
+                return out
+            # "settled" — dead or wrong-account; try the next attempt.
+
+    return out

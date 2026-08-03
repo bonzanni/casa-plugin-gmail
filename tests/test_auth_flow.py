@@ -309,3 +309,186 @@ def test_startup_recover_does_not_catch_system_exit(tmp_path):
 
     with pytest.raises(SystemExit):
         startup_recover(auth, cb)
+
+
+def attempt(h, minted_ts=100.0, status="result_ready", outcome=None, claimed=False):
+    return {"state_hash": h, "minted_ts": minted_ts, "status": status,
+            "outcome": outcome, "claimed": claimed, "meta": None}
+
+
+NEW, OLD = "f" * 64, "0" * 64
+
+
+def wire(tmp_path, attempts, active=None, staged=None):
+    auth, cb, store = build_env(tmp_path, staged=staged, active=active)
+    cb.attempts.return_value = attempts
+    cb.resolve.return_value = fake_route()
+    auth.exchange_code.return_value = {"refresh_token": "rt-new", "access_token": "at"}
+    auth.refresh_and_verify.return_value = "user@example.com"
+    return auth, cb, store
+
+
+def test_collect_exchanges_and_promotes_a_ready_result(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+
+    out = collect_pass(auth, cb)
+    assert out["promoted"] is True
+    assert store.load_active().refresh_token == "rt-new"
+    cb.ack.assert_called_with(NEW)
+
+
+def test_collect_reports_a_denial_and_acks(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW)])
+    cb.collect.return_value = {"query": [["error", "access_denied"]]}
+
+    out = collect_pass(auth, cb)
+    assert out["promoted"] is False
+    assert any("access_denied" in m for m in out["messages"])
+    cb.ack.assert_called_with(NEW)
+    auth.exchange_code.assert_not_called()
+
+
+def test_collect_reports_malformed_query_without_exchanging(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW)])
+    cb.collect.return_value = {"query": [["code", "c1"], ["code", "c2"]]}
+
+    collect_pass(auth, cb)
+    auth.exchange_code.assert_not_called()
+    cb.ack.assert_called_with(NEW)
+
+
+def test_collect_acks_a_done_attempt_and_reports_its_outcome(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW, status="done", outcome="expired_unread")])
+
+    out = collect_pass(auth, cb)
+    assert any("expired" in m for m in out["messages"])
+    cb.ack.assert_called_with(NEW)
+    cb.collect.assert_not_called()
+
+
+def test_collect_leaves_awaiting_redirect_alone(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW, status="awaiting_redirect")])
+
+    collect_pass(auth, cb)
+    cb.ack.assert_not_called()
+    cb.collect.assert_not_called()
+
+
+def test_supersedes_an_older_attempt_across_a_later_pass(tmp_path):
+    """The newer flow was acked and torn down in an earlier pass; the older
+    callback arrives now and must NOT be exchanged."""
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(OLD, minted_ts=50.0)],
+                       active=cred(rt="rt-good", flow=NEW, gen=100.0))
+
+    collect_pass(auth, cb)
+    cb.ack.assert_called_once_with(OLD)
+    cb.collect.assert_not_called()
+    auth.exchange_code.assert_not_called()
+
+
+def test_supersedes_a_claimed_older_attempt_without_reading_its_journal(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(OLD, minted_ts=50.0, claimed=True)],
+                       active=cred(rt="rt-good", flow=NEW, gen=100.0))
+
+    collect_pass(auth, cb)
+    cb.held.assert_not_called()
+    cb.ack.assert_called_once_with(OLD)
+
+
+def test_legacy_active_token_supersedes_nothing(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW)],
+                       active=cred(rt="rt-legacy", flow=None, gen=None))
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+
+    collect_pass(auth, cb)
+    auth.exchange_code.assert_called_once()
+
+
+def test_claimed_attempt_already_committed_activates_then_acks(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW, claimed=True)],
+                       active=cred(rt="rt-new", flow=NEW, gen=100.0))
+    cb.collect.side_effect = FileNotFoundError()
+
+    out = collect_pass(auth, cb)
+    auth.activate.assert_called_once()
+    auth.exchange_code.assert_not_called()
+    cb.ack.assert_called_with(NEW)
+    assert out["promoted"] is True
+
+
+def test_claimed_attempt_resumes_from_the_held_journal(tmp_path):
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW, claimed=True)])
+    cb.collect.side_effect = FileNotFoundError()
+    cb.held.return_value = {"query": [["code", "c-from-journal"]]}
+
+    collect_pass(auth, cb)
+    assert auth.exchange_code.call_args[0][0] == "c-from-journal"
+    assert store.load_active().refresh_token == "rt-new"
+
+
+def test_terminal_exchange_falls_through_to_an_older_flow(tmp_path):
+    from auth import ExchangeTerminal
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW), attempt(OLD, minted_ts=50.0)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+    auth.exchange_code.side_effect = [ExchangeTerminal("invalid_grant"),
+                                      {"refresh_token": "rt-old-flow", "access_token": "at"}]
+
+    collect_pass(auth, cb)
+    assert store.load_active().refresh_token == "rt-old-flow"
+
+
+def test_retryable_exchange_ends_the_pass_without_acking(tmp_path):
+    from auth import ExchangeRetryable
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW), attempt(OLD, minted_ts=50.0)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+    auth.exchange_code.side_effect = ExchangeRetryable("503")
+
+    collect_pass(auth, cb)
+    cb.ack.assert_not_called()
+    assert auth.exchange_code.call_count == 1     # did NOT fall through
+
+
+def test_retain_from_step0_ends_the_pass_before_any_attempt(tmp_path):
+    from auth import RefreshRetryable
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW)], staged=("rt-s", "c" * 64, 5.0))
+    auth.refresh_and_verify.side_effect = RefreshRetryable("timeout")
+
+    collect_pass(auth, cb)
+    cb.collect.assert_not_called()
+    auth.exchange_code.assert_not_called()
+
+
+def test_a_settled_dead_stage_lets_a_later_flow_succeed(tmp_path):
+    """Regression for the round-4 deadlock: the slot must not wedge."""
+    from auth import RefreshTerminal
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW)], staged=("rt-dead", "c" * 64, 5.0))
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+    auth.refresh_and_verify.side_effect = [RefreshTerminal("revoked"),
+                                           "user@example.com"]
+
+    collect_pass(auth, cb)
+    assert store.load_active().refresh_token == "rt-new"
+
+
+def test_contended_lock_is_a_noop(tmp_path):
+    from auth_flow import collect_lock, collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW)])
+    with collect_lock(tmp_path):
+        out = collect_pass(auth, cb)
+    assert out["status"] == "busy"
+    cb.attempts.assert_not_called()
