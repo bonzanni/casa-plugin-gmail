@@ -278,6 +278,15 @@ def test_the_skill_tells_the_agent_to_send_the_operator_to_a_real_browser():
     assert "Google refuses OAuth sign-in" in text
 
 
+def test_the_skill_puts_the_browser_warning_before_the_link_not_after():
+    """On a phone the operator taps the link before reading whatever follows
+    it, so the instruction only works if it comes first. This pins the
+    placement rule, not the rationale already pinned above."""
+    text = _read("skills", "gmail", "SKILL.md")
+    assert "before the link" in text
+    assert "never after" in text
+
+
 def test_the_skill_names_the_signature_and_the_remedy():
     """"Something went wrong" AFTER sign-in is the tell; retrying the tap is
     not the remedy, and neither is a fresh link."""

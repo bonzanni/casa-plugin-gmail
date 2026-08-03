@@ -17,7 +17,9 @@ Tell her the browser will show "Response received" and that nothing needs copyin
 **Whenever you give the user an `auth_url`, tell her to open it in a real browser rather
 than tapping it here — Google refuses OAuth sign-in inside a chat app's built-in
 browser.** Say it every time, in one short clause ("open this in Chrome/Safari rather
-than tapping it — Google blocks sign-in inside the chat app's browser"). Without that
+than tapping it — Google blocks sign-in inside the chat app's browser"), and put that
+clause **before the link** in your message, never after — on a phone she taps the link
+before she finishes reading whatever comes next, so the link must come last. Without that
 line the flow fails silently on her phone: she signs in, Google shows a generic
 **"Something went wrong"** page, the consent screen never appears and nothing is ever
 redirected back, so no result arrives and there is nothing for you to collect.
