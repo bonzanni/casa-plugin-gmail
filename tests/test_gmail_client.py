@@ -350,3 +350,35 @@ def test_reply_to_thread_sets_from_header():
     import base64
     decoded = base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)).decode("utf-8", errors="replace")
     assert "From: alias@workspace.example.com" in decoded
+
+
+# --- get_profile_email ---
+
+def test_get_profile_email_returns_address():
+    client = make_client()
+    client._service.users.return_value.getProfile.return_value.execute.return_value = {
+        "emailAddress": "user@workspace.example.com", "messagesTotal": 100,
+    }
+    assert client.get_profile_email() == "user@workspace.example.com"
+    client._service.users.return_value.getProfile.assert_called_once_with(userId="me")
+
+
+def test_get_profile_email_http_error_translates():
+    from googleapiclient.errors import HttpError
+    client = make_client()
+    resp = MagicMock(status=403)
+    client._service.users.return_value.getProfile.return_value.execute.side_effect = (
+        HttpError(resp, b"Forbidden")
+    )
+    with pytest.raises(ValueError):
+        client.get_profile_email()
+
+
+def test_get_profile_email_missing_address_returns_empty_string():
+    """The caller's account-mismatch check must fail closed: '' must never
+    equal a real GMAIL_USER_EMAIL."""
+    client = make_client()
+    client._service.users.return_value.getProfile.return_value.execute.return_value = {
+        "messagesTotal": 100,
+    }
+    assert client.get_profile_email() == ""

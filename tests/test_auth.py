@@ -147,6 +147,58 @@ def test_transient_refresh_failure_RETAINS_the_token(mock_creds_cls, monkeypatch
     assert (tmp_path / "oauth_token.json").exists()
 
 
+# ── refresh_and_verify ──────────────────────────────────────────────────────
+
+@patch("gmail_client.GmailClient")
+@patch("auth.Credentials")
+def test_refresh_and_verify_returns_profile_email(
+        mock_creds_cls, mock_gmail_client_cls, monkeypatch, tmp_path):
+    """Proves the composition: refresh, then hand the live credentials to
+    GmailClient and return what get_profile_email() reports."""
+    _set_full_env(monkeypatch)
+    mock_creds_cls.return_value = MagicMock()
+    mock_gmail_client_cls.return_value.get_profile_email.return_value = (
+        "user@workspace.example.com"
+    )
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    assert auth.refresh_and_verify("rt-abc") == "user@workspace.example.com"
+    mock_gmail_client_cls.return_value.get_profile_email.assert_called_once()
+
+
+@patch("auth.Credentials")
+def test_refresh_and_verify_propagates_terminal_failure(mock_creds_cls, monkeypatch, tmp_path):
+    from auth import RefreshTerminal
+    from google.auth.exceptions import RefreshError
+    _set_full_env(monkeypatch)
+    creds = MagicMock()
+    creds.refresh.side_effect = RefreshError("invalid_grant")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    with pytest.raises(RefreshTerminal):
+        auth.refresh_and_verify("rt-abc")
+
+
+@patch("auth.Credentials")
+def test_refresh_and_verify_propagates_retryable_failure(mock_creds_cls, monkeypatch, tmp_path):
+    from auth import RefreshRetryable
+    _set_full_env(monkeypatch)
+    creds = MagicMock()
+    creds.refresh.side_effect = OSError("connection reset")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    with pytest.raises(RefreshRetryable):
+        auth.refresh_and_verify("rt-abc")
+
+
 # ── build_auth_url ──────────────────────────────────────────────────────────
 
 def test_build_auth_url_uses_supplied_redirect_and_state(monkeypatch, tmp_path):
