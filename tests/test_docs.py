@@ -7,6 +7,7 @@ console option the reader cannot select, and quoting a diagnostic string the
 code no longer emits. Both shipped. These tests are drift guards, not style
 checks: the diagnostics are compared against the source that emits them.
 """
+import re
 from pathlib import Path
 
 _ROOT = Path(__file__).parent.parent
@@ -17,6 +18,23 @@ def _read(*parts):
 
 
 README = "README.md"
+
+_CASA_SECTION = "### 3. Configure the casa deployment"
+
+
+def _casa_steps():
+    """The top-level numbered items of "3. Configure the casa deployment",
+    indexed from 1 the way the README's own "Step 3.N" pointers count them."""
+    section = _read(README).split(_CASA_SECTION)[1].split("\n####")[0]
+    # Each item runs to the next top-level number, so its indented sub-bullets
+    # count as part of it.
+    return [part.strip() for part in re.split(r"^\d+\. ", section, flags=re.M)[1:]]
+
+
+def _step_number(marker):
+    hits = [i for i, step in enumerate(_casa_steps(), 1) if marker in step]
+    assert len(hits) == 1, f"{marker!r} identifies {len(hits)} steps, need exactly 1"
+    return hits[0]
 
 
 # ── Fix D: the OAuth client type a personal account can actually create ────
@@ -73,6 +91,80 @@ def test_every_quoted_diagnostic_matches_its_source():
         assert fragment in _read(source), f"{fragment!r} is not emitted by {source}"
         readme_fragment = fragment.replace("{error}", "access_denied")
         assert readme_fragment in readme, f"{readme_fragment!r} missing from README"
+
+
+# ── Round 2: a step cannot depend on configuration a later step performs ───
+
+def test_the_env_vars_are_configured_before_the_tool_that_needs_them():
+    """The redirect URI is discovered by calling `gmail_auth_start`, and the
+    server exits in `read_env()` unless all three variables are set. A reader
+    following the numbered steps in order must have set them first."""
+    env_step = _step_number("GMAIL_CLIENT_SECRET")
+    discovery_step = _step_number("gmail_auth_start")
+    assert env_step < discovery_step, (
+        "the tool-based redirect-URI discovery route cannot run before the "
+        "step that sets the environment it needs"
+    )
+
+
+def test_the_env_vars_the_readme_names_are_the_ones_the_server_demands():
+    """The claim above is only load-bearing if these are really the variables
+    whose absence exits the process."""
+    required = re.search(r"_REQUIRED_ENV_VARS = \[(.*?)\]",
+                         _read("server", "auth.py"), re.S).group(1)
+    step = _casa_steps()[_step_number("GMAIL_CLIENT_SECRET") - 1]
+    for name in re.findall(r'"([^"]+)"', required):
+        assert f"`{name}`" in step, f"{name} is required but the step omits it"
+    assert "sys.exit(1)" in _read("server", "auth.py")
+
+
+def test_the_host_side_route_is_the_one_that_needs_no_running_server():
+    step = _casa_steps()[_step_number("gmail_auth_start") - 1]
+    assert "without a running server" in step
+
+
+def test_every_step_3_pointer_names_the_step_it_means():
+    """A renumbering that leaves a stale `Step 3.N` behind is the same class of
+    bug as the ordering it fixes — it sends the reader to the wrong place."""
+    text = _read(README)
+    for marker, pointer in [
+        ("`public_url`", "`public_url` (Step 3.{n})"),
+        ("assigned role", "assigned role (Step 3.{n})"),
+        ("callback-consent DM", "Consent DM not approved (Step 3.{n})"),
+        ("Authorized redirect URIs", "re-check Step 3.{n} above"),
+        ("Authorized redirect URIs", "discovery command in Step 3.{n}"),
+    ]:
+        expected = pointer.format(n=_step_number(marker))
+        assert expected in text, f"stale cross-reference: expected {expected!r}"
+
+    numbered = len(_casa_steps())
+    for ref in re.findall(r"Step 3\.(\d+)", text):
+        assert 1 <= int(ref) <= numbered, f"Step 3.{ref} does not exist"
+
+
+# ── Round 2: External + Testing expires the connection weekly ──────────────
+
+def test_readme_documents_the_testing_status_refresh_token_expiry():
+    """Round 1 told personal-account readers to use External and leave the app
+    unpublished. Google expires refresh tokens issued by an External app in
+    Testing after 7 days, so that advice breaks the connection weekly."""
+    text = _read(README)
+    assert "7 days" in text
+    assert "publishing status" in text
+    assert "In production" in text
+    # ...and no longer claims the unpublished Testing path is equivalent.
+    assert "which works the same here" not in text
+    assert "while the app stays unpublished" not in text
+
+
+def test_readme_is_honest_about_what_production_entails():
+    """These scopes are sensitive/restricted, so "just publish it" must not
+    read as a formality — nor as though verification were mandatory."""
+    text = _read(README)
+    assert "restricted" in text and "sensitive" in text
+    assert "Google hasn't verified this app" in text
+    assert "security assessment" in text
+    assert "does **not** require passing Google verification first" in text
 
 
 # ── Fix C's companion: the skill must relay an empty result honestly ───────

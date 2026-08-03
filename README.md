@@ -31,14 +31,27 @@ Setup spans two systems: the Google Cloud project (OAuth client) and the casa de
 5. Leave **Authorized redirect URIs** empty for now — you'll come back and fill it in during Step 3, once casa has told you the exact value to use.
 6. Click **Create**, then note the **Client ID** and **Client Secret** shown in the dialog.
 
-> If prompted to configure an OAuth consent screen first, fill in the app name and add the three Gmail scopes listed below. **User type:** **Internal** is offered *only* inside a Google Workspace organization (and needs no Google verification); a personal Gmail account cannot select it and must use **External**, which works the same here but also requires adding your own address under **Test users** while the app stays unpublished. Neither choice changes the client type — it must still be **Web application**.
+> If prompted to configure an OAuth consent screen first, fill in the app name and add the three Gmail scopes listed below. **User type** (called **Audience** in the current *Google Auth Platform* console): **Internal** is offered *only* inside a Google Workspace organization, needs no Google verification, and is free of the expiry problem described below; a personal Gmail account cannot select it and must use **External**. Neither choice changes the client type — it must still be **Web application**.
 
-**Scopes needed** (add these on the consent screen):
+**Scopes needed** (add these on the consent screen — **Data Access** in the current console):
 ```
 https://www.googleapis.com/auth/gmail.modify
 https://www.googleapis.com/auth/gmail.send
 https://www.googleapis.com/auth/gmail.settings.basic
 ```
+
+#### External apps: publish, or the connection expires every 7 days
+
+This is the one setup decision that breaks the plugin *later* rather than immediately, so it is worth getting right now. It does not apply to **Internal** (Workspace) apps.
+
+An **External** app whose publishing status is **Testing** is issued refresh tokens that expire after **7 days**. Google's wording: *"A Google Cloud Platform project with an OAuth consent screen configured for an external user type and a publishing status of "Testing" is issued a refresh token expiring in 7 days, unless the only OAuth scopes requested are a subset of name, email address, and user profile"* ([OAuth 2.0 docs](https://developers.google.com/identity/protocols/oauth2), *Refresh token expiration*). Gmail scopes are not in that subset, and adding your own address under **Test users** does not exempt you — the limit applies to test users, including the project owner. In practice the plugin would lose Gmail access roughly weekly, each time needing a fresh `gmail_auth_start`, which defeats the point of persisting a refresh token at all.
+
+**So set the publishing status to "In production"** (**Google Auth Platform → Audience → Publish app**). That, and nothing else, is what removes the 7-day expiry. Publishing does **not** require passing Google verification first, and for a personal single-user install you should not attempt verification:
+
+- **What unverified production costs you.** `gmail.modify` and `gmail.settings.basic` are **restricted** scopes and `gmail.send` is **sensitive**, so until the app is verified the consent screen shows *"Google hasn't verified this app"* and you must click **Advanced → Go to … (unsafe)** to continue. The project is also capped at 100 users for its lifetime. Google allows this explicitly for personal use: *"If the app is for your personal use (fewer than 100 users), you and your limited number of users can continue using the app without going through verification"* ([Exceptions to verification requirements](https://support.google.com/cloud/answer/13464323)). Refresh tokens issued this way do not carry the Testing 7-day expiry.
+- **What verification would cost you.** Restricted-scope verification is a ~6-week review and requires an annual third-party [CASA security assessment](https://support.google.com/cloud/answer/13465431), arranged and paid for directly with an assessor. That is a real project, not a formality — and it is unnecessary for one inbox.
+
+Refresh tokens can still be invalidated for the ordinary reasons in any publishing status: you revoke access, the token goes six months unused, or (with Gmail scopes) the account password changes.
 
 ### 3. Configure the casa deployment
 
@@ -47,14 +60,14 @@ This is where most setup failures happen — each prerequisite below fails silen
 1. **Set casa's `public_url`** to a clean `https://` origin: scheme + host only — no path, no trailing slash, no IP literal, no userinfo (e.g. `https://<your-casa-public-url>`, not `https://<your-casa-public-url>/`, not `https://1.2.3.4`, not `https://user@<your-casa-public-url>`). Casa needs this to construct a real, reachable redirect URI for the plugin.
 2. **Give the plugin a reachable assigned role** *before* installing it. Casa uses this to know where to deliver the callback result.
 3. **Install the plugin**, then **approve casa's callback-consent DM**. Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed.
-4. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). Never construct this value yourself from the plugin's name: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
-   - **Preferred, always available:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use.
-   - **From the host,** without having to know the effective name:
+4. **Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_USER_EMAIL`** in casa's plugin environment configuration for this plugin (not in a secret manager directly — casa is what passes these through to the plugin's server process). `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`). Do this **before** the next step: without all three the plugin's server exits at startup, so none of its tools — including the one that reports the redirect URI — can answer.
+5. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). Never construct this value yourself from the plugin's name: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
+   - **Preferred:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.4 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected.
+   - **From the host,** without a running server and without having to know the effective name:
      ```
      grep -o '"redirect_uri":[^,}]*' /data/callbacks/*/ready.json
      ```
    *Optional, rollback only:* if you are upgrading from v0.4.x, also keep (or add) `http://localhost:8080` as a second entry in **Authorized redirect URIs** — v0.4.1 used that loopback flow, so leaving it registered means a downgrade needs no Google console round-trip. It is unused by v0.5.0 and can be removed once the callback flow is confirmed working.
-5. **Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_USER_EMAIL`** in casa's plugin environment configuration for this plugin (not in a secret manager directly — casa is what passes these through to the plugin's server process). `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`).
 
 #### What breaks if a step above is skipped
 
@@ -74,7 +87,7 @@ Casa closes an authorization-callback route for exactly five reasons. The plugin
 2. Open the link and sign in as the user. After granting access, the browser shows "Response received" — nothing more happens there, and nothing needs to be copied back.
 3. Casa delivers the result to the agent, which calls `gmail_auth_collect` and reports the outcome in chat. Success, denial, and a stale/replayed link all show the same neutral browser page, so **chat is the only place you learn whether it actually worked** — read what the agent reports, don't assume from the browser page alone.
 
-If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registered on the OAuth client, Google will show `redirect_uri_mismatch` instead of the consent screen — re-check Step 3.4 above; the value must match `ready.json` exactly, byte-for-byte.
+If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registered on the OAuth client, Google will show `redirect_uri_mismatch` instead of the consent screen — re-check Step 3.5 above; the value must match `ready.json` exactly, byte-for-byte.
 
 ### Rotating credentials
 
@@ -98,6 +111,9 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 **`Gmail plugin: stored token is dead — re-auth needed (…)`** (server log)
 → The refresh token was revoked or rejected as `invalid_grant`, and the stored credential has been removed. Run `gmail_auth_start` again.
 
+**The connection keeps dying about once a week** (the message above, every 7 days)
+→ Not a plugin fault: the OAuth app's user type is **External** and its publishing status is still **Testing**, so Google expires every refresh token it issues after 7 days. Publish the app — **Google Auth Platform → Audience → Publish app** — and re-authorize once. See "External apps: publish, or the connection expires every 7 days" under Setup, Step 2.
+
 **`Gmail plugin: the stored credential authorizes '…' but GMAIL_USER_EMAIL is '…'`** (server log)
 → The stored credential is for a different inbox. The token file is kept, not deleted; either restore the old `GMAIL_USER_EMAIL` or run `gmail_auth_start` again for the new one.
 
@@ -111,7 +127,7 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 → Check the reason-code table above. The most common cause is `callback_no_target` (plugin has no reachable assigned role) or `callback_pending_ack` (the consent DM hasn't been approved) — both leave the flow silently stuck rather than producing a visible error.
 
 **`redirect_uri_mismatch` from Google**
-→ The URI registered on the OAuth client doesn't match casa's authoritative value. Take the `redirect_uri` that `gmail_auth_start` returns (or use the discovery command in Step 3.4) and register that exact string — do not derive or guess it.
+→ The URI registered on the OAuth client doesn't match casa's authoritative value. Take the `redirect_uri` that `gmail_auth_start` returns (or use the discovery command in Step 3.5) and register that exact string — do not derive or guess it.
 
 **`Authorization was not granted (access_denied). Nothing has changed.`** (from `gmail_auth_collect`)
 → The consent screen was declined. Ask the agent to run `gmail_auth_start` again for a fresh link.
