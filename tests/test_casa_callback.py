@@ -178,6 +178,75 @@ def test_attempts_orders_newest_first_null_oldest_hash_breaks_ties(tmp_path, mon
     assert got == [H3, H2, H1]      # 500/H3 > 500/H2 > None(0.0)/H1
 
 
+# ── pending/ is the only record of a just-minted flow ─────────────────────
+#
+# casa's `mint()` publishes ONLY `pending/<hash>.json`; the attempt record is
+# materialized later by the five-minute `callback_spool_recovery` pass. Reading
+# `attempts/` alone therefore cannot see a link minted moments ago.
+
+def _write_pending(spool_dir: Path, name: str, mtime: float | None = None) -> None:
+    d = spool_dir / "pending"
+    d.mkdir(parents=True, exist_ok=True)
+    # The v2 envelope casa writes — note it carries NO timestamp of any kind,
+    # which is why the file's mtime is the mint clock.
+    (d / name).write_text(json.dumps({"v": 2, "meta": {"kind": "gmail-oauth"}}))
+    if mtime is not None:
+        os.utime(d / name, (mtime, mtime))
+
+
+def test_pending_mint_times_reads_the_file_mtime_newest_first(tmp_path, monkeypatch):
+    spool, root = tmp_path / "spool", tmp_path / "plugin"
+    root.mkdir()
+    write_index(spool, root, good_payload())
+    install_stub_protocol(monkeypatch, tmp_path, [])
+    sd = spool / "gmail"
+    _write_pending(sd, f"{H1}.json", 1000.0)
+    _write_pending(sd, f"{H2}.json", 3000.0)
+
+    assert make_cb(spool, root).pending_mint_times() == [3000.0, 1000.0]
+
+
+def test_pending_mint_times_ignores_everything_that_is_not_a_published_state(
+        tmp_path, monkeypatch):
+    """`.part` residue is an unpublished mint, and a non-hash name is not a
+    state at all — casa's own `_hash_of_pending` grammar."""
+    spool, root = tmp_path / "spool", tmp_path / "plugin"
+    root.mkdir()
+    write_index(spool, root, good_payload())
+    install_stub_protocol(monkeypatch, tmp_path, [])
+    sd = spool / "gmail"
+    _write_pending(sd, f"{H1}.json.part", 2000.0)
+    _write_pending(sd, "not-a-hash.json", 2000.0)
+    _write_pending(sd, H2, 2000.0)                       # no .json suffix
+    _write_pending(sd, f"{'A' * 64}.json", 2000.0)       # casa's grammar is lowercase
+
+    assert make_cb(spool, root).pending_mint_times() == []
+
+
+def test_pending_mint_times_skips_a_non_regular_entry(tmp_path, monkeypatch):
+    """Mirrors casa's `_regular_stat` derivation probe: a swapped-in directory
+    or symlink is not a mint, and its mtime must not read as one."""
+    spool, root = tmp_path / "spool", tmp_path / "plugin"
+    root.mkdir()
+    write_index(spool, root, good_payload())
+    install_stub_protocol(monkeypatch, tmp_path, [])
+    pending = spool / "gmail" / "pending"
+    pending.mkdir(parents=True)
+    (pending / f"{H1}.json").mkdir()
+
+    assert make_cb(spool, root).pending_mint_times() == []
+
+
+def test_pending_mint_times_is_empty_when_the_directory_is_absent(
+        tmp_path, monkeypatch):
+    spool, root = tmp_path / "spool", tmp_path / "plugin"
+    root.mkdir()
+    write_index(spool, root, good_payload())
+    install_stub_protocol(monkeypatch, tmp_path, [])
+
+    assert make_cb(spool, root).pending_mint_times() == []
+
+
 def test_mint_and_ack_delegate_to_casa(tmp_path, monkeypatch):
     calls = []
     spool, root = tmp_path / "spool", tmp_path / "plugin"

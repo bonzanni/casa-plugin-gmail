@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,12 @@ from pathlib import Path
 CALLBACK_NAME = "oauth"
 DEFAULT_SPOOL_ROOT = "/data/callbacks"
 DEFAULT_LIB_DIR = "/opt/casa"
+
+# casa's own pending-name grammar (callback_spool.py `_HASH_RE` /
+# `_hash_of_pending`): a published pending is `<64 lowercase hex>.json`.
+# Everything else in the directory — `<h>.json.part` staging residue, dotfiles
+# — is not a minted state and must not read as one.
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _REASONS = (
     "callback_pending_ack, callback_base_url_invalid, callback_no_target, "
@@ -129,6 +137,55 @@ class CasaCallback:
                 except (OSError, ValueError):
                     return None
         return None
+
+    def pending_mint_times(self) -> list[float]:
+        """Mint clocks of the states published in `pending/`, newest first.
+
+        Why this exists at all: casa's `mint()` publishes ONLY
+        `pending/<hash>.json` (callback_spool.py `mint`). The matching record in
+        `attempts/` is materialized later, by the `callback_spool_recovery` job
+        casa runs every five minutes (casa_core.py). So for minutes after a
+        mint, `attempts()` is empty while a live authorization link is
+        outstanding — a blind window observed in production at ~3 minutes
+        (mint 10:54:54Z, attempt record 10:57). Anything that must not mint a
+        SECOND live link has to read this directory, not only `attempts/`.
+
+        The clock is the file's MTIME, because the protocol has no other one:
+        the payload casa writes is the envelope `{"v": 2, "meta": <meta>}` —
+        it carries no timestamp, and casa never parses it ("Casa never reads or
+        parses a pending file's content — no consumer-supplied timestamps exist
+        anywhere in the protocol", callback_spool.py module docstring). That
+        docstring's first rule is "One clock — mtime": `link(2)`/`rename(2)`
+        preserve the inode's mtime, so the pending file's mtime IS its mint
+        time, and every TTL in the spool — including the claim gate that
+        decides whether this link still works — is computed from it. It is also
+        the same clock the eventual attempt record reports as `minted_ts`
+        (callback_spool.py: "the `pending/` inode's envelope (mtime = the mint
+        time)"), so the pending and attempt paths stay consistent by
+        construction.
+
+        A non-regular inode is skipped, mirroring casa's own `_regular_stat`
+        derivation probe: a swapped-in symlink or directory is not a mint.
+        """
+        directory = self.resolve().spool_dir / "pending"
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        out: list[float] = []
+        for name in names:
+            if not name.endswith(".json") \
+                    or not _HASH_RE.match(name[:-len(".json")]):
+                continue
+            try:
+                st = os.lstat(directory / name)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            out.append(st.st_mtime)
+        out.sort(reverse=True)
+        return out
 
     def attempts(self) -> list[dict]:
         """Validated attempt records, newest first.

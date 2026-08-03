@@ -441,6 +441,118 @@ def test_refresh_and_verify_propagates_retryable_failure(mock_creds_cls, monkeyp
         auth.refresh_and_verify("rt-abc")
 
 
+# ── A refused CLIENT is not a dead credential ──────────────────────────────
+#
+# Rotate the OAuth client secret and Google answers `invalid_client`. Vendored
+# google-auth marks that non-retryable (`_can_retry` lists only
+# internal_failure / server_error / temporarily_unavailable), and treating
+# every non-retryable answer as a revocation deleted a perfectly good refresh
+# token and offered a re-authorization that could not complete either — the
+# code exchange uses the same rejected secret.
+
+def _refresh_error(*args):
+    from google.auth.exceptions import RefreshError
+    return RefreshError(*args)
+
+
+@patch("auth.Credentials")
+def test_a_rejected_client_is_a_config_error_not_a_terminal_one(
+        mock_creds_cls, monkeypatch, tmp_path):
+    from auth import RefreshConfigError
+    _set_full_env(monkeypatch)
+    creds = MagicMock()
+    creds.refresh.side_effect = _refresh_error(
+        "invalid_client: The OAuth client was not found.",
+        {"error": "invalid_client",
+         "error_description": "The OAuth client was not found."})
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    with pytest.raises(RefreshConfigError):
+        auth.probe_refresh("rt-abc")
+
+
+@patch("auth.Credentials")
+def test_an_unclassifiable_non_retryable_refresh_is_not_terminal(
+        mock_creds_cls, monkeypatch, tmp_path):
+    """google-auth also raises RefreshError before any request — e.g. when the
+    credential lacks the fields needed to refresh. Nothing there says the grant
+    is dead, and destroying a credential requires positive evidence."""
+    from auth import RefreshConfigError
+    _set_full_env(monkeypatch)
+    creds = MagicMock()
+    creds.refresh.side_effect = _refresh_error(
+        "The credentials do not contain the necessary fields need to "
+        "refresh the access token.")
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    with pytest.raises(RefreshConfigError):
+        auth.probe_refresh("rt-abc")
+
+
+@patch("auth.Credentials")
+def test_the_parsed_error_body_decides_not_the_message_text(
+        mock_creds_cls, monkeypatch, tmp_path):
+    """google-auth passes the decoded body as a second argument; it is the
+    authoritative source for the code, and the message only a fallback."""
+    from auth import RefreshTerminal
+    _set_full_env(monkeypatch)
+    creds = MagicMock()
+    creds.refresh.side_effect = _refresh_error(
+        "Bad Request", {"error": "invalid_grant", "error_description": "Bad Request"})
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+
+    with pytest.raises(RefreshTerminal):
+        auth.probe_refresh("rt-abc")
+
+
+@patch("auth.Credentials")
+def test_load_active_keeps_the_token_when_the_client_is_rejected(
+        mock_creds_cls, monkeypatch, tmp_path, capsys):
+    """`load_active` is the consumer most at risk from this taxonomy: its
+    RefreshTerminal arm DELETES the credential. A rotated client secret must
+    not cost the operator their refresh token."""
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = _refresh_error(
+        "invalid_client: Unauthorized", {"error": "invalid_client"})
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert (tmp_path / "oauth_token.json").exists(), \
+        "a configuration error destroyed a working credential"
+    err = capsys.readouterr().err
+    assert "OAuth client configuration was rejected" in err
+    assert "token kept" in err
+
+
+@patch("auth.Credentials")
+def test_load_active_still_removes_a_genuinely_dead_token(
+        mock_creds_cls, monkeypatch, tmp_path):
+    """The other half: `invalid_grant` must keep reaping the credential."""
+    _set_full_env(monkeypatch)
+    _write_v2(tmp_path)
+    creds = MagicMock()
+    creds.refresh.side_effect = _refresh_error(
+        "invalid_grant: Token has been expired or revoked.",
+        {"error": "invalid_grant"})
+    mock_creds_cls.return_value = creds
+
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False
+    assert not (tmp_path / "oauth_token.json").exists()
+
+
 # ── build_auth_url ──────────────────────────────────────────────────────────
 
 def test_build_auth_url_uses_supplied_redirect_and_state(monkeypatch, tmp_path):

@@ -281,16 +281,22 @@ def test_the_setup_tool_exists_and_is_argument_free():
     assert inspect.signature(server.setup_gmail).parameters == {}
 
 
-def _spool(monkeypatch, *attempts):
-    """Install a stub casa spool exposing `attempts`.
+def _spool(monkeypatch, *attempts, pending=()):
+    """Install a stub casa spool exposing `attempts` and `pending_mint_times`.
 
     setup_gmail reads the spool before minting (it has to: casa's spool is the
     only record of an outstanding link), so every setup_gmail test needs one —
     the real `_cb` points at /data/callbacks and would raise CallbackUnavailable.
+
+    Both directories are stubbed because casa fills them at different times:
+    `mint()` publishes only `pending/<hash>.json`, and the matching record in
+    `attempts/` appears at the next reconciliation pass, up to five minutes
+    later. `pending` here is that directory's mint clocks (mtimes).
     """
     import server
     cb = MagicMock()
     cb.attempts.return_value = list(attempts)
+    cb.pending_mint_times.return_value = list(pending)
     monkeypatch.setattr(server, "_cb", cb)
     return cb
 
@@ -332,7 +338,15 @@ def test_setup_gmail_does_not_mint_twice_while_disconnected(monkeypatch):
     """Casa's dispatch is at-least-once. The already-connected branch does not
     cover this: while the FIRST link is outstanding `_authenticated` is still
     false, so the old code minted a second independent state and a second live
-    link — both usable, and both completable by the operator."""
+    link — both usable, and both completable by the operator.
+
+    The double models what casa's `mint()` ACTUALLY leaves behind: a file in
+    `pending/` and NOTHING in `attempts/`. The attempt record is materialized
+    by casa's `callback_spool_recovery` job, which runs every five minutes
+    (casa_core.py) — observed at ~3 minutes on the live host. An earlier
+    version of this test fabricated the attempt record at mint time, which is
+    why a check that read only `attempts/` looked like it worked.
+    """
     import server
     monkeypatch.setattr(server, "_authenticated", False)
     cb = _spool(monkeypatch)
@@ -340,20 +354,64 @@ def test_setup_gmail_does_not_mint_twice_while_disconnected(monkeypatch):
     started = _minting_start(calls)
 
     def start_and_publish(auth, cb_arg):
-        # Minting really does publish an awaiting_redirect attempt into the
-        # spool, so the stub must too or the second call sees a clean slate.
         out = started(auth, cb_arg)
-        cb.attempts.return_value = [_awaiting(time.time())]
+        cb.pending_mint_times.return_value = [time.time()]
         return out
     monkeypatch.setattr(server, "_flow_start", start_and_publish)
 
     first = json.loads(server.setup_gmail())
     second = json.loads(server.setup_gmail())          # casa re-dispatches
 
+    assert cb.attempts.return_value == [], "the double invented an attempt record"
     assert len(calls) == 1, "a re-dispatch minted a second authorization"
     assert first["auth_url"].startswith("https://accounts.google.com/")
     assert second["status"] == "already_pending"
     assert "auth_url" not in second, "a second link was handed out"
+
+
+def test_setup_gmail_defers_to_a_pending_state_with_no_attempt_record_yet(monkeypatch):
+    """The blind window itself, stated directly: casa's `mint()` publishes only
+    `pending/<hash>.json`, so a freshly minted flow is invisible in `attempts/`
+    for up to a reconciliation interval. It is still a live link."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, pending=[time.time() - 30])   # no attempt record at all
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("minted a second flow while a pending state was live")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+    assert result["status"] == "already_pending"
+
+
+def test_setup_gmail_mints_when_the_pending_state_is_past_casas_ttl(monkeypatch):
+    """A pending file older than `PENDING_TTL_S` is a link casa's claim gate
+    would refuse (`now - st.st_mtime > PENDING_TTL_S`), and casa's sweep only
+    removes it every ten minutes. Never point the operator at a dead link."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, pending=[time.time() - 1801])
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    result = json.loads(server.setup_gmail())
+
+    assert len(calls) == 1, "deferred to a pending state casa would refuse to claim"
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+
+
+def test_setup_gmail_mints_when_a_pending_mint_clock_is_beyond_casas_skew(monkeypatch):
+    """Casa fails closed on a materially future mtime (`st.st_mtime > now +
+    SKEW_S`), so such an entry is not a link anyone can use."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, pending=[time.time() + 301])
+    calls = []
+    monkeypatch.setattr(server, "_flow_start", _minting_start(calls))
+
+    json.loads(server.setup_gmail())
+    assert len(calls) == 1
 
 
 def test_setup_gmail_reports_an_outstanding_attempt_instead_of_minting(monkeypatch):
@@ -416,6 +474,15 @@ def test_setup_gmail_mints_when_the_only_attempt_already_has_its_result(monkeypa
 
     json.loads(server.setup_gmail())
     assert len(calls) == 1
+
+
+def test_a_boolean_mint_clock_is_never_live(monkeypatch):
+    """`True` is an `int` in Python, so without the bool guard it would read as
+    the clock `1` — and at these coordinates that is a LIVE mint, as the first
+    assertion shows. The guard, not the arithmetic, is what rejects it."""
+    import server
+    assert server._mint_is_live(1.0, 100.0) is True        # same clock, as a float
+    assert server._mint_is_live(True, 100.0) is False      # a bool is not a clock
 
 
 def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
@@ -506,6 +573,33 @@ def test_setup_gmail_does_not_mint_on_a_transient_refresh_failure(monkeypatch):
     assert result["status"] == "retry_later"
     assert result["account"] == "user@example.com"
     assert "temporarily_unavailable" in result["instructions"]
+    mock_auth.store.remove_active.assert_not_called()
+
+
+def test_setup_gmail_reports_a_rejected_client_as_configuration_not_revocation(
+        monkeypatch):
+    """Rotate the OAuth client secret and Google answers `invalid_client`. The
+    refresh token is fine — and a fresh flow could not complete either, because
+    its code exchange uses the same rejected secret. So: no revocation claim,
+    and no link."""
+    import server
+    from auth import RefreshConfigError
+
+    mock_auth = _connected_auth(
+        monkeypatch, RefreshConfigError("invalid_client: Unauthorized"))
+    _spool(monkeypatch)
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("a configuration error minted an unusable flow")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "configuration_error"
+    assert "auth_url" not in result
+    assert result["status"] != "reauthorization_needed"
+    assert "invalid_client" in result["instructions"]
+    assert "GMAIL_CLIENT_SECRET" in result["instructions"]
     mock_auth.store.remove_active.assert_not_called()
 
 

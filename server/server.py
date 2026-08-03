@@ -5,7 +5,7 @@ import time
 
 from mcp.server.fastmcp import FastMCP
 
-from auth import GmailAuth, RefreshRetryable, RefreshTerminal
+from auth import GmailAuth, RefreshConfigError, RefreshRetryable, RefreshTerminal
 from gmail_client import GmailClient
 from attachments import AttachmentManager
 from sent_log import SentLog
@@ -130,7 +130,12 @@ def _connected_credential():
 
 def _stored_credential_failure(cred) -> tuple[str, str] | None:
     """None when the stored credential still refreshes, else (kind, detail)
-    with kind in {"terminal", "retryable"}.
+    with kind in {"terminal", "retryable", "configuration"}.
+
+    "configuration" is not a dead credential and must not be treated as one:
+    the token endpoint refused the CLIENT (a rotated `GMAIL_CLIENT_SECRET`
+    answers `invalid_client`), so the refresh token is still good and a fresh
+    authorization would fail at the code exchange for the same reason.
 
     `_authenticated` is set once, at activation, and never cleared, and the
     on-disk account keeps matching after a revocation — so without this probe
@@ -148,6 +153,8 @@ def _stored_credential_failure(cred) -> tuple[str, str] | None:
         return "terminal", str(exc)
     except RefreshRetryable as exc:
         return "retryable", str(exc)
+    except RefreshConfigError as exc:
+        return "configuration", str(exc)
     except Exception as exc:
         # Unclassified ⇒ retryable, the same policy load_active applies to an
         # ambiguous failure. Minting on "don't know" would hand the operator a
@@ -170,28 +177,48 @@ _PENDING_TTL_S = 1800
 _SKEW_S = 300
 
 
-def _live_pending_attempt(now: float | None = None) -> dict | None:
-    """The newest still-usable `awaiting_redirect` attempt, or None.
+def _mint_is_live(minted, now: float) -> bool:
+    """True when a state minted at `minted` is one casa would still claim.
 
-    `cb.attempts()` returns casa-validated records newest first, so the first
-    match is the newest. `minted_ts` is legitimately None on a legacy or
-    consumer-held record; liveness cannot be established for one, so it does
-    NOT count as pending — minting a link the operator can definitely use
-    beats pointing them at one that may already be dead.
+    Mirrors casa's claim gate in both directions: a beyond-skew FUTURE mint
+    clock is refused there (`st.st_mtime > now + SKEW_S`) and so is anything
+    past the TTL. A missing or non-numeric clock is not live: liveness cannot
+    be established for it, and minting a link the operator can definitely use
+    beats pointing them at one that may already be dead. A NaN clock fails
+    every comparison below and so lands on that same safe side.
+    """
+    if isinstance(minted, bool) or not isinstance(minted, (int, float)):
+        return False
+    age = now - minted
+    return -_SKEW_S <= age <= _PENDING_TTL_S
+
+
+def _outstanding_authorization(now: float | None = None) -> bool:
+    """True when an authorization this plugin minted is still usable.
+
+    BOTH spool directories are consulted, because casa populates them at
+    different times. `mint()` publishes only `pending/<hash>.json`; the record
+    in `attempts/` appears when casa's reconciliation pass next runs, five
+    minutes apart. Reading `attempts/` alone therefore leaves a multi-minute
+    blind window right after minting — the exact window casa's at-least-once
+    setup dispatch lands in — during which a second call would see nothing
+    outstanding and mint a second live link.
+
+    `pending/` empties again once casa CLAIMS the state (the redirect arrived),
+    and `attempts()` covers the flow from reconciliation onward; between the
+    two, an outstanding link is visible for as long as it is worth reporting.
     """
     now = time.time() if now is None else now
+    for minted in _cb.pending_mint_times():
+        if _mint_is_live(minted, now):
+            return True
     for rec in _cb.attempts():
-        if rec.get("status") != "awaiting_redirect":
-            continue
-        minted = rec.get("minted_ts")
-        if not isinstance(minted, (int, float)) or isinstance(minted, bool):
-            continue
-        age = now - minted
-        # Mirrors casa's claim gate in both directions: a beyond-skew future
-        # mint clock is refused there, and so is anything past the TTL.
-        if -_SKEW_S <= age <= _PENDING_TTL_S:
-            return rec
-    return None
+        # Only `awaiting_redirect` is a link the operator still has to open;
+        # `result_ready` is waiting on gmail_auth_collect instead.
+        if rec.get("status") == "awaiting_redirect" \
+                and _mint_is_live(rec.get("minted_ts"), now):
+            return True
+    return False
 
 
 @mcp.tool()
@@ -216,7 +243,10 @@ def setup_gmail() -> str:
     #    two authorizations the operator can both complete. Casa's spool
     #    stores only the state HASH, so the earlier `auth_url` cannot be
     #    reconstructed (and this plugin keeps no local flow store, by design);
-    #    what it CAN do is see that an attempt is still outstanding and say so.
+    #    what it CAN do is see that a state is still outstanding and say so.
+    #    That check reads casa's `pending/` directory as well as `attempts/`:
+    #    minting publishes only the former, and the latter trails it by up to
+    #    a reconciliation interval. See _outstanding_authorization.
     dead_credential = None
     connected = _connected_credential()
     if connected is not None:
@@ -246,14 +276,34 @@ def setup_gmail() -> str:
                     "setup_gmail again shortly if it persists."
                 ),
             })
+        if kind == "configuration":
+            # The client was refused, not the grant. Minting here would be
+            # doubly wrong: the stored credential does not need replacing, and
+            # the new flow could not complete anyway — its code exchange uses
+            # the same rejected client. Name the problem instead.
+            return _ok({
+                "status": "configuration_error",
+                "account": connected.account,
+                "instructions": (
+                    f"Gmail is still connected as {connected.account} and its "
+                    f"stored authorization is intact, but Google rejected this "
+                    f"plugin's OAuth client credentials ({detail}). This is a "
+                    "configuration problem, not a revoked connection: check "
+                    "that GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in casa's "
+                    "plugin environment still match the Google OAuth client. "
+                    "No authorization link has been created — a new one could "
+                    "not complete either, because it would use the same "
+                    "rejected credentials. Do not start one; run setup_gmail "
+                    "again once the configuration is fixed."
+                ),
+            })
         # Terminal (revoked / invalid_grant): the connection is genuinely
         # broken, so fall through and mint a recovery link. The credential is
         # deliberately NOT removed here.
         dead_credential = detail
 
     try:
-        pending = _live_pending_attempt()
-        if pending is not None:
+        if _outstanding_authorization():
             return _ok({
                 "status": "already_pending",
                 "instructions": (

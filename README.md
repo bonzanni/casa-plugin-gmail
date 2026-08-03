@@ -66,7 +66,7 @@ This is where most setup failures happen — each prerequisite below fails silen
 
    Approving also publishes casa's redirect URI, which is what makes Step 3.5 possible. the agent will post an `auth_url` in chat within a minute or two — **finish Step 3.5 before opening it**, or Google will answer `redirect_uri_mismatch`. The link stays valid for 30 minutes, which is ample.
 5. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). This step comes after consent because it has to: casa publishes a plugin's redirect URI only once its callback is *routed*, and an unapproved callback is never routed — before Step 3.4 the value does not exist to be read. Never construct it yourself from the plugin's name either: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
-   - **Preferred:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected.
+   - **Preferred:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected. Note that `gmail_auth_start` answers a direct request and therefore **always mints a fresh link**: if approving consent has already put a link in chat, asking for another leaves two live authorizations. Either use the message already posted (it carries the same `redirect_uri`) or use the host-side command below, and treat the newest link as the one to open.
    - **From the host,** without a running server and without having to know the effective name:
      ```
      grep -o '"redirect_uri":[^,}]*' /data/callbacks/*/ready.json
@@ -98,14 +98,14 @@ Casa closes an authorization-callback route for exactly five reasons. The plugin
 - **The consent DM was never approved** (`callback_pending_ack`).
 - **The plugin has no reachable assigned role** (`callback_no_target`) — in which case no consent DM is ever sent either.
 
-See the reason-code table in Step 3. Re-running `setup_gmail` is always safe: if Gmail is already connected it reports the account and mints nothing, and if a link is already outstanding it says so rather than issuing a second one.
+See the reason-code table in Step 3. Re-running `setup_gmail` will not leave you with two live links: if Gmail is already connected it reports the account and mints nothing, and if a link it minted is still outstanding it says so rather than issuing a second one. It checks casa's spool for that — both the `pending/` entry a mint publishes immediately and the `attempts/` record casa materializes a few minutes later — so a link minted seconds ago already counts. `gmail_auth_start` is different by design: it answers a direct request and always mints a fresh link, so ask for one only when you actually need a new one.
 
 If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registered on the OAuth client, Google will show `redirect_uri_mismatch` instead of the consent screen — re-check Step 3.5 above; the value must match `ready.json` exactly, byte-for-byte.
 
 ### Rotating credentials
 
 - **Changing `GMAIL_USER_EMAIL`** invalidates the stored credential by design: at startup, the plugin refuses to serve an inbox that doesn't match the configured email, so a stored token for the old address is treated as unusable. Re-run the authorization flow (Step 4) after changing this value.
-- **Rotating the OAuth client** (new Client ID/Secret) requires exactly one re-authorization — update `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin env, then run `gmail_auth_start` again.
+- **Rotating the OAuth client** (new Client ID/Secret) requires exactly one re-authorization — update `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin env, then run `gmail_auth_start` again. Rotating only the **secret** of the same client does not: a refresh token is tied to the client ID, so once the new secret is in place the existing connection resumes untouched. Between the rotation and the update the plugin reports a configuration problem rather than a revoked connection, and keeps the credential — see Troubleshooting.
 
 ## Env vars
 
@@ -129,6 +129,9 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 
 **`Gmail plugin: the stored credential authorizes '…' but GMAIL_USER_EMAIL is '…'`** (server log)
 → The stored credential is for a different inbox. The token file is kept, not deleted; either restore the old `GMAIL_USER_EMAIL` or run `gmail_auth_start` again for the new one.
+
+**`Gmail plugin: the OAuth client configuration was rejected (…); token kept`** (server log, or `status: "configuration_error"` from `setup_gmail`)
+→ Google refused the plugin's OAuth **client** credentials — typically `invalid_client` after `GMAIL_CLIENT_SECRET` was rotated, mistyped, or the client was deleted. This is **not** a revoked connection: the stored credential is deliberately kept, and no authorization link is offered, because a new one would fail at the same step. Check `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin environment against the Google OAuth client, then restart the plugin — no re-authorization is needed as long as the client **ID** is unchanged.
 
 **`Gmail plugin: could not refresh right now (…); token kept`** (server log)
 → A transient failure — network, or a Google 5xx / `temporarily_unavailable`. The token is deliberately **retained**; nothing needs re-authorizing. The next startup or tool call retries.

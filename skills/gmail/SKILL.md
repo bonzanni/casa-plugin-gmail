@@ -41,6 +41,11 @@ asked for anything. Call it with no arguments and relay its output exactly as yo
   rather than asking for a new link; do not call the tool again to get one.
 - `status` of `reauthorization_needed` → the stored connection was found revoked. The
   `auth_url` is a genuine link and reconnects Gmail; relay it as one.
+- `status` of `configuration_error` → Google rejected the plugin's OAuth **client**
+  credentials, not the user's authorization. The stored connection is intact and needs
+  no re-authorizing — and a new link could not work anyway, which is why none was
+  created. Relay the `instructions` verbatim (they name what to check) and do **not**
+  offer or request an authorization link.
 - `status` of `retry_later` → the connection could not be checked just now. Nothing
   changed and nothing needs re-authorizing; say you'll confirm shortly and do **not**
   start an authorization.

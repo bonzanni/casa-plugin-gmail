@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -42,6 +43,55 @@ class RefreshTerminal(RuntimeError):
 
 class RefreshRetryable(RuntimeError):
     """Transport failure refreshing. The token is still good — retain it."""
+
+
+class RefreshConfigError(RuntimeError):
+    """The token endpoint refused the CLIENT or the request, not the grant.
+
+    Deliberately a SIBLING of RefreshTerminal, not a subclass: every existing
+    `except RefreshTerminal` means "this credential is dead" and acts on it —
+    `load_active` deletes the token, `setup_gmail` mints a recovery link,
+    `reconcile_stage` settles and discards the staged flow. None of those is
+    right here. The refresh token is untouched and works again the moment the
+    configuration is corrected; and a fresh authorization could not complete
+    either, because the code exchange uses the same rejected client.
+    """
+
+
+# OAuth2 error codes that mean THE GRANT is dead — the only verdicts that
+# justify deleting a stored refresh token or asking for a new authorization.
+# `invalid_grant` is RFC 6749 §5.2's "the provided authorization grant ... is
+# invalid, expired, revoked", and is what Google returns for a revoked or
+# expired refresh token; `invalid_token` (RFC 6750 §3.1) is the same verdict
+# under a different name. Everything else non-retryable — `invalid_client` from
+# a rotated secret, `unauthorized_client`, `invalid_request`, a RefreshError
+# raised before any request — is a configuration failure, and the DEFAULT is
+# that side of the line: destroying a working credential requires positive
+# evidence that it is dead, never the mere absence of evidence that it lives.
+_CREDENTIAL_DEAD_CODES = frozenset({"invalid_grant", "invalid_token"})
+
+_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _refresh_error_code(exc) -> str:
+    """The OAuth2 error code carried by a google-auth RefreshError, or "".
+
+    google-auth raises `RefreshError(f"{error}: {error_description}",
+    response_data, retryable=...)` (oauth2/_client.py `_handle_error_response`),
+    so the parsed body is read first and the message only as a fallback — and
+    the fallback reads `args[0]`, not `str(exc)`, because a multi-arg exception
+    stringifies to its whole args tuple. A RefreshError raised without ever
+    reaching the token endpoint carries neither form and correctly yields "".
+    """
+    args = getattr(exc, "args", ())
+    for arg in args:
+        if isinstance(arg, dict):
+            code = arg.get("error")
+            if isinstance(code, str) and code.strip():
+                return code.strip().lower()
+    text = args[0] if args and isinstance(args[0], str) else str(exc)
+    head = text.split(":", 1)[0].strip().lower()
+    return head if _ERROR_CODE_RE.match(head) else ""
 
 
 class GmailAuth:
@@ -118,6 +168,14 @@ class GmailAuth:
                   file=sys.stderr)
             self.store.remove_active()
             return False
+        except RefreshConfigError as exc:
+            # RETAIN the token: the client, not the grant, was refused. A
+            # rotated or mistyped GMAIL_CLIENT_SECRET must not cost the
+            # operator a working refresh token — it works again as soon as the
+            # configuration is right, and no re-authorization can substitute.
+            print(f"Gmail plugin: the OAuth client configuration was rejected "
+                  f"({exc}); token kept.", file=sys.stderr)
+            return False
         except RefreshRetryable as exc:
             # RETAIN the token: a network blip is not a revocation.
             print(f"Gmail plugin: could not refresh right now ({exc}); token kept.",
@@ -158,7 +216,15 @@ class GmailAuth:
             # that drops the attribute must degrade to "terminal", not crash.
             if getattr(exc, "retryable", False):
                 raise RefreshRetryable(str(exc)) from exc
-            raise RefreshTerminal(str(exc)) from exc
+            # Nor is every non-retryable RefreshError a revocation. Rotate the
+            # OAuth client secret and Google answers `invalid_client`: the
+            # refresh token is fine, the CLIENT was refused. Calling that
+            # terminal deleted the credential and offered a re-authorization
+            # that could not complete either, since the code exchange uses the
+            # same rejected secret. Only a grant-invalidating code is terminal.
+            if _refresh_error_code(exc) in _CREDENTIAL_DEAD_CODES:
+                raise RefreshTerminal(str(exc)) from exc
+            raise RefreshConfigError(str(exc)) from exc
         except Exception as exc:
             raise RefreshRetryable(str(exc)) from exc
         return credentials
@@ -192,8 +258,9 @@ class GmailAuth:
         """Liveness probe: refresh once, discard the result, keep the token.
 
         A read-only public view of the SAME RefreshTerminal / RefreshRetryable
-        split `_refresh` already raises — no new OAuth behaviour, and no new
-        classification. It exists so a caller can ask "is this credential still
+        / RefreshConfigError split `_refresh` already raises — no new OAuth
+        behaviour, and no new classification. It exists so a caller can ask
+        "is this credential still
         good?" without `load_active`'s side effects: `load_active` removes a
         terminally dead token and activates a live one, neither of which a mere
         health check may do. Performs no writes and touches no runtime state.

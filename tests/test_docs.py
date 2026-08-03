@@ -335,6 +335,31 @@ def test_the_skill_covers_every_status_the_setup_tool_can_return():
             f"server.py returns {status!r} but SKILL.md never mentions it"
 
 
+# ── Sol round 2: the README must not promise what the code cannot keep ────
+
+def test_the_readme_no_longer_calls_re_running_setup_always_safe():
+    """The old sentence promised re-running `setup_gmail` was "always safe"
+    because it would report an outstanding link instead of minting a second
+    one. The check behind it read only `attempts/`, which casa materializes up
+    to five minutes AFTER the mint — so for those minutes it minted twice. The
+    promise now has to name what the check actually consults."""
+    text = _read(README)
+    assert "Re-running `setup_gmail` is always safe" not in text
+    assert "`pending/`" in text and "`attempts/`" in text
+    # ...and the code must really consult both.
+    assert "pending_mint_times" in _read("server", "casa_callback.py")
+    assert "_cb.pending_mint_times()" in _read("server", "server.py")
+
+
+def test_the_redirect_uri_step_warns_that_asking_for_a_link_mints_another():
+    """Step 3.5's preferred route asks the agent to call `gmail_auth_start`, which
+    answers a direct request and always mints — so following it after automatic
+    setup has already posted a link leaves two live authorizations. The
+    setup-tool guard cannot prevent that; the reader has to know."""
+    step = _casa_steps()[_step_number("gmail_auth_start") - 1]
+    assert "always mints a fresh link" in step
+
+
 def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():
     """Same drift guard as the diagnostics above: the status the skill tells the
     agent to recognise must be the one server.py emits."""
