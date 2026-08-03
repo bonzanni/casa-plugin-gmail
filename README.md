@@ -59,7 +59,7 @@ This is where most setup failures happen — each prerequisite below fails silen
 
 1. **Set casa's `public_url`** to a clean `https://` origin: scheme + host only — no path, no trailing slash, no IP literal, no userinfo (e.g. `https://<your-casa-public-url>`, not `https://<your-casa-public-url>/`, not `https://1.2.3.4`, not `https://user@<your-casa-public-url>`). Casa needs this to construct a real, reachable redirect URI for the plugin.
 2. **Give the plugin a reachable assigned role** *before* installing it. Casa uses this to know where to deliver the callback result.
-3. **Install the plugin**, then **approve casa's callback-consent DM**. Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed.
+3. **Install the plugin**, then **approve casa's callback-consent DM**. Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed. Approving it is also what triggers Step 4: the plugin declares `setup_gmail` as its setup tool, and casa hands that to the agent automatically once consent settles.
 4. **Set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_USER_EMAIL`** in casa's plugin environment configuration for this plugin (not in a secret manager directly — casa is what passes these through to the plugin's server process). `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`). Do this **before** the next step: without all three the plugin's server exits at startup, so none of its tools — including the one that reports the redirect URI — can answer.
 5. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). Never construct this value yourself from the plugin's name: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
    - **Preferred:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.4 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected.
@@ -83,9 +83,11 @@ Casa closes an authorization-callback route for exactly five reasons. The plugin
 
 ### 4. Run the authorization flow
 
-1. In chat, ask the agent to connect Gmail — she calls `gmail_auth_start`, which returns an `auth_url`.
+1. **Wait for the link — you should not have to ask for it.** Once the consent DM in Step 3.3 is approved, casa dispatches `setup_gmail` automatically and the agent posts the `auth_url` in chat without being asked. This is the normal path; the plugin declares the tool for exactly this purpose.
 2. Open the link and sign in as the user. After granting access, the browser shows "Response received" — nothing more happens there, and nothing needs to be copied back.
 3. Casa delivers the result to the agent, which calls `gmail_auth_collect` and reports the outcome in chat. Success, denial, and a stale/replayed link all show the same neutral browser page, so **chat is the only place you learn whether it actually worked** — read what the agent reports, don't assume from the browser page alone.
+
+**If no link arrives,** ask the agent to connect Gmail and she will call `gmail_auth_start`, which returns the same `auth_url` — the manual fallback, and the route to use for any later re-authorization. A missing automatic link usually means the consent DM was never approved or the plugin has no reachable role, so check those first (see the reason-code table in Step 3). Re-running `setup_gmail` when Gmail is already connected is harmless: it reports the connected account and mints nothing.
 
 If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registered on the OAuth client, Google will show `redirect_uri_mismatch` instead of the consent screen — re-check Step 3.5 above; the value must match `ready.json` exactly, byte-for-byte.
 
@@ -152,6 +154,7 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 
 | Tool | Description |
 |---|---|
+| `setup_gmail` | Casa's declared setup tool (`casa.setupTool`), auto-dispatched once the consent DM is approved. Argument-free and idempotent: mints an authorization link when not connected, or reports `already_connected` and mints nothing when it is. Not a protected tool — casa dispatches it unprompted, so an approval prompt would deadlock the setup episode |
 | `gmail_auth_start` | Begin OAuth: returns an authorization URL to open in a browser, the redirect URI in use, and instructions |
 | `gmail_auth_collect` | Collect a pending authorization result delivered by casa's callback facility: returns `{status, messages, promoted}`. Not a protected tool — deliberately callable without the user's tap-approval, since it only checks for and consumes a result the browser step already produced; call it whenever a turn says a result is waiting, and it's safe to call repeatedly |
 | `search_emails` | Search inbox with Gmail query syntax |

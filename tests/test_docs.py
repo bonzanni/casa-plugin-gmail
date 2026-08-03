@@ -173,3 +173,40 @@ def test_skill_tells_the_agent_an_empty_collect_is_not_a_success():
     text = _read("skills", "gmail", "SKILL.md")
     assert "Nothing waiting" in text
     assert "never\n  report `status: \"ok\"` on its own as confirmation" in text
+
+
+# ── v0.5.1: casa auto-runs the declared setup tool after consent ───────────
+
+def test_docs_name_the_setup_tool_the_manifest_declares():
+    """Casa dispatches whatever `casa.setupTool` names, and nothing else. Docs
+    naming a different tool would describe a flow that never happens; a name the
+    server does not define would fail the episode at the agent."""
+    import json
+    name = json.loads(_read(".claude-plugin", "plugin.json"))["casa"]["setupTool"]
+    assert f"`{name}`" in _read(README), f"README never names {name}"
+    assert f"`{name}`" in _read("skills", "gmail", "SKILL.md"), \
+        f"SKILL.md never names {name}"
+    assert f"def {name}(" in _read("server", "server.py"), \
+        "the manifest declares a setup tool the server does not define"
+
+
+def test_readme_documents_the_automatic_setup_dispatch():
+    """The v0.5.0 walkthrough ended with the operator asking the agent to connect
+    Gmail — the manual step the consent gate was supposed to replace."""
+    text = _read(README)
+    assert "dispatches `setup_gmail` automatically" in text
+    assert "without being asked" in text
+    assert "gmail_auth_start" in text          # manual fallback still documented
+
+
+def test_skill_tells_the_agent_already_connected_is_not_a_new_authorization():
+    text = _read("skills", "gmail", "SKILL.md")
+    assert "casa may dispatch `setup_gmail`" in text
+    assert "do not report it as a new authorization" in text
+
+
+def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():
+    """Same drift guard as the diagnostics above: the status the skill tells the
+    agent to recognise must be the one server.py emits."""
+    assert '"already_connected"' in _read("server", "server.py")
+    assert "`already_connected`" in _read("skills", "gmail", "SKILL.md")

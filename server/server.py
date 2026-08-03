@@ -11,7 +11,7 @@ from sent_log import SentLog
 from auth_flow import collect_pass as _flow_collect
 from auth_flow import start as _flow_start
 from auth_flow import startup_recover as _flow_startup
-from casa_callback import CasaCallback
+from casa_callback import CallbackUnavailable, CasaCallback
 
 PLUGIN_DATA = os.environ.get("CLAUDE_PLUGIN_DATA", "/tmp/gmail-plugin-data")
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(
@@ -106,6 +106,61 @@ def _ok(data) -> str:
 def gmail_auth_start() -> str:
     """Begin Gmail OAuth: returns a link to open in a browser. After you grant access the browser shows a confirmation page and the setup completes automatically — nothing to copy back."""
     return _ok(_flow_start(_auth, _cb))
+
+
+def _connected_account() -> str | None:
+    """The account of the credential actually in service, or None.
+
+    "In service" is both halves: a rebuilt runtime (`_authenticated`) AND an
+    active credential on disk whose account is the configured subject. A
+    credential for a different inbox is precisely the case that needs
+    re-authorization, so it must not read as connected.
+    """
+    if not _authenticated:
+        return None
+    active = _auth.store.load_active()
+    if active is None or not active.account:
+        return None
+    subject = _auth.subject_email
+    if not subject or active.account.lower() != subject.lower():
+        return None
+    return active.account
+
+
+@mcp.tool()
+def setup_gmail() -> str:
+    """Connect Gmail: returns an authorization link to open in a browser, or reports that Gmail is already connected. Takes no arguments and is safe to run repeatedly."""
+    # Casa auto-runs this once the plugin's trigger-consent episode settles with
+    # an approval (plugin_store.manifest_setup_tool), dispatching it to the
+    # agent with no arguments. Two consequences shape the body:
+    #
+    #  * It must be idempotent — casa may re-dispatch, so an existing, matching
+    #    connection returns a statement of fact and mints nothing. Re-minting
+    #    would invalidate a working setup's in-flight links for no reason.
+    #  * It must not raise when the callback route is closed. Nobody asked for
+    #    this call, so an exception surfaces to the operator as a bare tool
+    #    error explaining nothing. gmail_auth_start deliberately still raises:
+    #    it answers a direct request, where a raise is the honest answer.
+    account = _connected_account()
+    if account:
+        return _ok({
+            "status": "already_connected",
+            "account": account,
+            "instructions": (
+                f"Gmail is already connected as {account} — nothing to do. "
+                "This is not a new authorization; do not report it as one."
+            ),
+        })
+    try:
+        return _ok(_flow_start(_auth, _cb))
+    except CallbackUnavailable as exc:
+        return _ok({
+            "status": "unavailable",
+            "instructions": (
+                f"Gmail could not be connected yet: {exc} Nothing has been "
+                "authorized. Once that is resolved, run setup_gmail again."
+            ),
+        })
 
 
 @mcp.tool()

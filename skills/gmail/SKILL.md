@@ -15,6 +15,18 @@ To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `au
 as a tappable link. Tell her the browser will show "Response received" and that
 nothing needs copying back.
 
+**Unprompted setup:** casa may dispatch `setup_gmail` on its own — it does this once
+the user approves the plugin's consent DM, so the instruction arrives without her having
+asked for anything. Call it with no arguments and relay its output exactly as you would
+`gmail_auth_start`'s: an `auth_url` is a tappable link, with the same "Response
+received" wording. Two of its results are not links, and neither is a failure:
+
+- `status` of `already_connected` → Gmail is already connected as the named `account`
+  and nothing was changed. Say that plainly, and do not offer a link — it is not a
+  new connection, so **do not report it as a new authorization**.
+- `status` of `unavailable` → the callback route is not open yet (usually the consent
+  DM or the plugin's role). Relay the `instructions` verbatim; nothing was authorized.
+
 Reporting rules — the browser page is deliberately identical for success, denial and a
 replayed link, so **chat is the only place the user learns the real outcome**:
 

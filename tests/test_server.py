@@ -1,5 +1,9 @@
+import inspect
 import json
+import re
 import time
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock
 
@@ -225,12 +229,135 @@ def test_gmail_auth_complete_is_gone():
     assert not hasattr(server, "gmail_auth_complete")
 
 
-def test_manifest_declares_the_callback_and_no_stale_protected_tool():
-    from pathlib import Path
-    manifest = json.loads(
+def _manifest():
+    return json.loads(
         (Path(__file__).parent.parent / ".claude-plugin" / "plugin.json").read_text())
+
+
+def test_manifest_declares_the_callback_and_no_stale_protected_tool():
+    manifest = _manifest()
     assert manifest["casa"]["callbacks"] == [{"name": "oauth"}]
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.5.0"
+    assert manifest["version"] == "0.5.1"
+
+
+# ── v0.5.1: casa.setupTool — the hand-back the consent gate was missing ────
+
+# Casa's own grammar, copied from plugin_store.py:925 (`_SETUP_TOOL_RE`). A
+# manifest that fails it raises StoreError(reason_code="setup_tool_invalid")
+# from manifest_setup_tool(), which blocks install/update outright.
+_CASA_SETUP_TOOL_RE = re.compile(r"^setup_[a-z0-9_]{1,64}$")
+
+
+def test_manifest_declares_the_setup_tool_casa_auto_runs():
+    """v0.5.0 shipped casa.callbacks but no casa.setupTool, so casa opened a
+    setup episode, found nothing to dispatch ("No setup tool shipped — nothing
+    to hand back") and the operator had to ask for authorization by hand."""
+    manifest = _manifest()
+    name = manifest["casa"]["setupTool"]
+    assert name == "setup_gmail"
+    assert _CASA_SETUP_TOOL_RE.fullmatch(name), (
+        f"{name!r} fails casa's ^setup_[a-z0-9_]{{1,64}}$ — install would be "
+        "rejected with setup_tool_invalid")
+
+
+def test_the_setup_tool_is_not_protected():
+    """Casa dispatches it unprompted, so a tap-approval prompt would deadlock
+    the episode — the same reason gmail_auth_collect stays unprotected. The two
+    real protected tools must be untouched."""
+    names = [t["name"] for t in _manifest()["casa"]["protectedTools"]]
+    assert "setup_gmail" not in names
+    assert names == ["send_email", "reply_to_thread"]
+
+
+def test_the_setup_tool_exists_and_is_argument_free():
+    """Casa's composed instruction says "Call it with no arguments"
+    (plugin_setup_episodes._compose), so a required parameter would strand it."""
+    import server
+    assert inspect.signature(server.setup_gmail).parameters == {}
+
+
+def test_setup_gmail_mints_a_flow_when_not_connected(monkeypatch):
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    calls = []
+
+    def fake_start(auth, cb):
+        calls.append((auth, cb))
+        return {"auth_url": "https://accounts.google.com/o?state=s",
+                "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
+                "instructions": "open it"}
+    monkeypatch.setattr(server, "_flow_start", fake_start)
+
+    result = json.loads(server.setup_gmail())
+
+    assert len(calls) == 1                      # the flow really was minted
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
+
+
+def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
+    """Casa's authoring doctrine requires idempotence and casa may re-dispatch.
+    A second run must not mint a second flow or re-authorize."""
+    import server
+    from token_store import Credential
+
+    mock_auth = MagicMock()
+    mock_auth.subject_email = "user@example.com"
+    mock_auth.store.load_active.return_value = Credential(
+        refresh_token="rt", flow="a" * 64, generation=1.0,
+        account="user@example.com")
+    monkeypatch.setattr(server, "_auth", mock_auth)
+    monkeypatch.setattr(server, "_authenticated", True)
+
+    def must_not_mint(auth, cb):
+        raise AssertionError("setup_gmail minted a flow while already connected")
+    monkeypatch.setattr(server, "_flow_start", must_not_mint)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "already_connected"
+    assert result["account"] == "user@example.com"
+
+
+def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeypatch):
+    """"Already connected" is an account match, not merely a live credential:
+    a credential for the wrong inbox is exactly the case needing re-auth."""
+    import server
+    from token_store import Credential
+
+    mock_auth = MagicMock()
+    mock_auth.subject_email = "user@example.com"
+    mock_auth.store.load_active.return_value = Credential(
+        refresh_token="rt", flow="a" * 64, generation=1.0,
+        account="someone.else@example.com")
+    monkeypatch.setattr(server, "_auth", mock_auth)
+    monkeypatch.setattr(server, "_authenticated", True)
+    monkeypatch.setattr(server, "_flow_start", lambda auth, cb: {
+        "auth_url": "https://accounts.google.com/o?state=s",
+        "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
+        "instructions": "open it"})
+
+    result = json.loads(server.setup_gmail())
+    assert result["auth_url"].startswith("https://accounts.google.com/")
+    assert "status" not in result
+
+
+def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatch):
+    """Casa dispatched this unprompted, so a raise reaches the operator as a
+    bare tool error explaining nothing. Unlike gmail_auth_start — which answers
+    a direct request and may raise — this returns the reason as its result."""
+    import server
+    from casa_callback import CallbackUnavailable
+
+    monkeypatch.setattr(server, "_authenticated", False)
+
+    def boom(auth, cb):
+        raise CallbackUnavailable("route not open: callback_no_target ...")
+    monkeypatch.setattr(server, "_flow_start", boom)
+
+    result = json.loads(server.setup_gmail())          # must not raise
+    assert result["status"] == "unavailable"
+    assert "callback_no_target" in result["instructions"]
