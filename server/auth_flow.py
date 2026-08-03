@@ -10,6 +10,7 @@ import errno
 import fcntl
 import os
 import secrets
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -182,6 +183,10 @@ def startup_recover(auth, cb) -> str:
         auth.validate_and_init()
         try:
             outcome, _message = reconcile_stage(auth, cb)
-        except Exception:
+        except Exception as exc:
+            print(
+                f"Gmail plugin: credential startup recovery failed ({exc}).",
+                file=sys.stderr,
+            )
             return "error"
         return outcome

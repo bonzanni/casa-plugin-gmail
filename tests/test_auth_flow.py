@@ -1,6 +1,4 @@
 # tests/test_auth_flow.py
-import json
-
 import pytest
 from unittest.mock import MagicMock
 
@@ -233,3 +231,81 @@ def test_reconcile_unlinks_post_promote_residue(tmp_path):
     assert reconcile_stage(auth, cb)[0] == "none"
     assert store.load_staged() is None
     auth.refresh_and_verify.assert_not_called()
+
+
+def test_startup_recover_returns_busy_when_lock_contended(tmp_path):
+    """Contention is a no-op: no validate_and_init, no stage work."""
+    from auth_flow import collect_lock, startup_recover
+    auth, cb, _ = build_env(tmp_path)
+
+    with collect_lock(tmp_path):
+        result = startup_recover(auth, cb)
+
+    assert result == "busy"
+    auth.validate_and_init.assert_not_called()
+    auth.refresh_and_verify.assert_not_called()
+
+
+def test_startup_recover_loads_active_before_reconciling_stage(tmp_path):
+    """Ordering pin: validate_and_init runs before stage verification."""
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    order = []
+    auth.validate_and_init.side_effect = lambda: order.append("validate_and_init")
+
+    def verify(rt):
+        order.append("refresh_and_verify")
+        return "user@example.com"
+    auth.refresh_and_verify.side_effect = verify
+
+    startup_recover(auth, cb)
+
+    assert order == ["validate_and_init", "refresh_and_verify"]
+
+
+def test_startup_recover_holds_the_lock_through_reconcile_stage(tmp_path):
+    """Both validate_and_init and reconcile_stage run under ONE acquisition.
+
+    Proof: from inside refresh_and_verify (called by reconcile_stage), a
+    re-entrant startup_recover call can only see "busy" if the outer call's
+    lock is still held at that point — i.e. reconcile_stage has not yet run
+    past the `with collect_lock(...)` block.
+    """
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    calls = {"n": 0}
+    nested = {}
+
+    def verify(rt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            nested["result"] = startup_recover(auth, cb)
+        return "user@example.com"
+    auth.refresh_and_verify.side_effect = verify
+
+    startup_recover(auth, cb)
+
+    assert nested["result"] == "busy"
+
+
+def test_startup_recover_returns_error_when_reconcile_stage_raises(tmp_path, capsys):
+    """A bug or I/O error in step 0 must not propagate — and must be logged."""
+    from auth_flow import startup_recover
+    auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
+    auth.refresh_and_verify.side_effect = RuntimeError("boom")
+
+    result = startup_recover(auth, cb)
+
+    assert result == "error"
+    captured = capsys.readouterr()
+    assert "boom" in captured.err
+
+
+def test_startup_recover_does_not_catch_system_exit(tmp_path):
+    """A missing env var still exits the process: SystemExit is a BaseException."""
+    from auth_flow import startup_recover
+    auth, cb, _ = build_env(tmp_path)
+    auth.validate_and_init.side_effect = SystemExit(1)
+
+    with pytest.raises(SystemExit):
+        startup_recover(auth, cb)
