@@ -1,6 +1,8 @@
 # tests/test_token_store.py
 import json
+import os
 import pytest
+import stat
 from pathlib import Path
 
 
@@ -119,6 +121,18 @@ def test_write_active_roundtrips_v2_schema(tmp_path):
     assert raw["flow"] == "d" * 64
     assert raw["generation"] == 42.0
     assert "committed_ts" in raw
+
+
+def test_files_written_with_0o600_permissions(tmp_path):
+    """Credential files hold refresh tokens: they must be written 0o600."""
+    s = store(tmp_path)
+    s.stage("rt-1", "a" * 64, 1.0)
+    staged_path = Path(tmp_path) / "oauth_token.staged.json"
+    assert stat.S_IMODE(os.stat(staged_path).st_mode) == 0o600
+
+    s.write_active(_cred("rt-x", "b" * 64, 2.0, "a@b.c"))
+    active_path = Path(tmp_path) / "oauth_token.json"
+    assert stat.S_IMODE(os.stat(active_path).st_mode) == 0o600
 
 
 def test_remove_active_is_idempotent(tmp_path):

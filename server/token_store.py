@@ -45,11 +45,7 @@ def _durable_write(path: Path, payload: dict) -> None:
     finally:
         os.close(fd)
     os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_dir(path.parent)
 
 
 def _fsync_dir(directory: Path) -> None:
