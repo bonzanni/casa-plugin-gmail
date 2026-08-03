@@ -374,3 +374,25 @@ def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():
     agent to recognise must be the one server.py emits."""
     assert '"already_connected"' in _read("server", "server.py")
     assert "`already_connected`" in _read("skills", "gmail", "SKILL.md")
+
+
+# ── configuration_error recovery must not promise same-session success ────
+#
+# GMAIL_CLIENT_ID/SECRET are read once into process memory by read_env() and
+# cached there; casa's env reload only re-sources plugin-env.conf into casa's
+# own process, never the live MCP server subprocess. So re-running
+# `setup_gmail` in the same session probes with the stale secret forever. The
+# MCP server is per-session, so a new session (lighter than a full restart)
+# is what actually picks up the fix.
+
+def test_the_configuration_error_recovery_does_not_promise_same_session_fix():
+    """The troubleshooting entry for `configuration_error` must not tell the
+    reader that re-running `setup_gmail` alone recovers — that only works
+    after a new session (or a restart) re-reads the corrected env vars."""
+    text = _read(README)
+    entry = text.split("the OAuth client configuration was rejected")[1] \
+                .split("\n\n**`")[0]
+    assert "brings it straight back into service without a restart" not in entry
+    assert "same" in entry and "session" in entry
+    assert "new session" in entry
+    assert "restart" in entry
