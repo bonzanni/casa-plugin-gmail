@@ -16,9 +16,17 @@ SCOPES = [
 
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
-_REDIRECT_URI = "http://localhost:8080"
 
 _REQUIRED_ENV_VARS = ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_USER_EMAIL"]
+
+
+class ExchangeTerminal(RuntimeError):
+    """The authorization code is dead — 4xx, or a 2xx whose body is unusable.
+    The flow must be acked and restarted."""
+
+
+class ExchangeRetryable(RuntimeError):
+    """Transport failure, 5xx or 429. The flow may still succeed: do NOT ack."""
 
 
 class GmailAuth:
@@ -71,25 +79,32 @@ class GmailAuth:
             os.remove(self._token_file)
             return False
 
-    def build_auth_url(self) -> str:
-        """Build the OAuth authorization URL for the loopback redirect flow."""
+    def build_auth_url(self, redirect_uri: str, state: str) -> str:
+        """Authorization URL for casa's callback endpoint.
+
+        `redirect_uri` is READ from casa's .index entry by the caller and never
+        derived here: it is matched byte-for-byte by Google.
+        """
         params = {
             "client_id": self._client_id,
-            "redirect_uri": _REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": " ".join(SCOPES),
             "access_type": "offline",
             "prompt": "consent",
+            "state": state,
         }
         return f"{_AUTH_URI}?{urllib.parse.urlencode(params)}"
 
-    def exchange_code(self, code: str) -> Credentials:
-        """Exchange authorization code for tokens, persist refresh token, return credentials."""
+    def exchange_code(self, code: str, redirect_uri: str) -> dict:
+        """Exchange the code for tokens. Performs NO writes and mutates no
+        runtime state — persistence is TokenStore's job, activation is
+        activate()'s. Raises ExchangeTerminal or ExchangeRetryable."""
         body = urllib.parse.urlencode({
             "code": code,
             "client_id": self._client_id,
             "client_secret": self._client_secret,
-            "redirect_uri": _REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
         }).encode()
 
@@ -98,35 +113,47 @@ class GmailAuth:
 
         try:
             with urllib.request.urlopen(req) as resp:
-                token_data = json.load(resp)
+                raw = resp.read()
         except urllib.error.HTTPError as e:
-            error_body = json.loads(e.read().decode())
-            raise ValueError(
-                f"Token exchange failed: {error_body.get('error', 'unknown')} — "
-                f"{error_body.get('error_description', str(e))}"
+            detail = self._error_detail(e)
+            if e.code == 429 or e.code >= 500:
+                raise ExchangeRetryable(f"Token exchange retryable ({e.code}): {detail}")
+            raise ExchangeTerminal(f"Token exchange failed ({e.code}): {detail}")
+        except urllib.error.URLError as e:
+            raise ExchangeRetryable(f"Token exchange transport failure: {e}")
+
+        try:
+            token_data = json.loads(raw)
+        except ValueError:
+            raise ExchangeTerminal(
+                "Token endpoint returned a 2xx whose body is not JSON."
             )
+        if not isinstance(token_data, dict):
+            raise ExchangeTerminal("Token endpoint returned a non-object body.")
+        for field in ("refresh_token", "access_token"):
+            if not token_data.get(field):
+                raise ExchangeTerminal(
+                    f"Token response is missing {field}. Re-authorization is needed."
+                )
+        return token_data
 
-        if "refresh_token" not in token_data:
-            raise ValueError(
-                "No refresh_token in response. This can happen if consent was previously "
-                "granted; the auth URL forces re-consent (prompt=consent), so re-visiting "
-                "the URL from gmail_auth_start should resolve this."
-            )
+    @staticmethod
+    def _error_detail(e: "urllib.error.HTTPError") -> str:
+        try:
+            parsed = json.loads(e.read().decode())
+            return f"{parsed.get('error', 'unknown')} — {parsed.get('error_description', '')}"
+        except Exception:
+            return "unparseable error body"
 
-        os.makedirs(os.path.dirname(self._token_file), exist_ok=True)
-        with open(self._token_file, "w") as f:
-            json.dump({"refresh_token": token_data["refresh_token"]}, f)
-
-        credentials = Credentials(
-            token=token_data.get("access_token"),
-            refresh_token=token_data["refresh_token"],
+    def credentials_for(self, refresh_token: str) -> Credentials:
+        return Credentials(
+            token=None,
+            refresh_token=refresh_token,
             token_uri=_TOKEN_URI,
             client_id=self._client_id,
             client_secret=self._client_secret,
             scopes=SCOPES,
         )
-        self._credentials = credentials
-        return credentials
 
     @property
     def credentials(self) -> Credentials:

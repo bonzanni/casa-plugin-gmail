@@ -129,70 +129,138 @@ def test_invalid_token_removes_file(mock_creds_cls, monkeypatch, tmp_path):
 
 # ── build_auth_url ──────────────────────────────────────────────────────────
 
-def test_build_auth_url_contains_expected_components(monkeypatch, tmp_path):
+def test_build_auth_url_uses_supplied_redirect_and_state(monkeypatch, tmp_path):
     _set_full_env(monkeypatch)
     auth = make_auth(tmp_path)
     auth.validate_and_init()
 
-    url = auth.build_auth_url()
+    url = auth.build_auth_url("https://casa.example.com/callback/plg-gmail--oauth",
+                              "state-xyz")
     assert "accounts.google.com" in url
     assert "client-id" in url
-    assert "localhost" in url
+    assert "state-xyz" in url
+    assert "casa.example.com%2Fcallback%2Fplg-gmail--oauth" in url
+    assert "localhost" not in url
     assert "offline" in url
     assert "gmail.modify" in url
-    assert "gmail.send" in url
 
 
 # ── exchange_code ───────────────────────────────────────────────────────────
 
-def _make_token_response(refresh_token="rt-new", access_token="at-123"):
-    return io.BytesIO(json.dumps({
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_in": 3600,
-        "token_type": "Bearer",
-    }).encode())
+import urllib.error
+
+
+def _http_error(status, body=b'{"error":"invalid_grant"}'):
+    return urllib.error.HTTPError(
+        "https://oauth2.googleapis.com/token", status, "err", {}, io.BytesIO(body))
+
+
+def _ok_body(**over):
+    payload = {"access_token": "at-123", "refresh_token": "rt-new",
+               "expires_in": 3600, "token_type": "Bearer"}
+    payload.update(over)
+    return io.BytesIO(json.dumps(payload).encode())
+
+
+def _exchange(auth):
+    return auth.exchange_code("code-1", "https://casa.example.com/callback/x")
 
 
 @patch("auth.urllib.request.urlopen")
-def test_exchange_code_saves_token_file(mock_urlopen, monkeypatch, tmp_path):
+def test_exchange_code_returns_token_response(mock_urlopen, monkeypatch, tmp_path):
     _set_full_env(monkeypatch)
-    mock_urlopen.return_value = _make_token_response("rt-persisted")
-
+    mock_urlopen.return_value = _ok_body(refresh_token="rt-persisted")
     auth = make_auth(tmp_path)
     auth.validate_and_init()
-    auth.exchange_code("auth-code-xyz")
 
-    token_file = tmp_path / "oauth_token.json"
-    assert token_file.exists()
-    assert json.loads(token_file.read_text())["refresh_token"] == "rt-persisted"
+    assert _exchange(auth)["refresh_token"] == "rt-persisted"
 
 
 @patch("auth.urllib.request.urlopen")
-def test_exchange_code_sets_authenticated(mock_urlopen, monkeypatch, tmp_path):
+def test_exchange_code_writes_nothing_and_does_not_authenticate(
+        mock_urlopen, monkeypatch, tmp_path):
+    """Persistence and activation are the store's job, not the exchange's."""
     _set_full_env(monkeypatch)
-    mock_urlopen.return_value = _make_token_response()
-
+    mock_urlopen.return_value = _ok_body()
     auth = make_auth(tmp_path)
     auth.validate_and_init()
-    auth.exchange_code("auth-code-xyz")
 
-    assert auth.is_authenticated
-    assert auth.credentials is not None
+    _exchange(auth)
+    assert list(tmp_path.iterdir()) == []
+    assert not auth.is_authenticated
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_4xx_is_terminal(mock_urlopen, monkeypatch, tmp_path, status):
+    from auth import ExchangeTerminal
+    _set_full_env(monkeypatch)
+    mock_urlopen.side_effect = _http_error(status)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeTerminal):
+        _exchange(auth)
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_429_and_5xx_are_retryable(mock_urlopen, monkeypatch, tmp_path, status):
+    from auth import ExchangeRetryable
+    _set_full_env(monkeypatch)
+    mock_urlopen.side_effect = _http_error(status)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeRetryable):
+        _exchange(auth)
 
 
 @patch("auth.urllib.request.urlopen")
-def test_exchange_code_raises_if_no_refresh_token(mock_urlopen, monkeypatch, tmp_path):
+def test_exchange_code_connection_failure_is_retryable(mock_urlopen, monkeypatch, tmp_path):
+    from auth import ExchangeRetryable
     _set_full_env(monkeypatch)
-    mock_urlopen.return_value = io.BytesIO(json.dumps({
-        "access_token": "at-only",
-        "expires_in": 3600,
-    }).encode())
-
+    mock_urlopen.side_effect = urllib.error.URLError("timed out")
     auth = make_auth(tmp_path)
     auth.validate_and_init()
-    with pytest.raises(ValueError, match="refresh_token"):
-        auth.exchange_code("auth-code-xyz")
+    with pytest.raises(ExchangeRetryable):
+        _exchange(auth)
+
+
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_malformed_error_body_still_terminal_on_4xx(
+        mock_urlopen, monkeypatch, tmp_path):
+    from auth import ExchangeTerminal
+    _set_full_env(monkeypatch)
+    mock_urlopen.side_effect = _http_error(400, b"<html>nope</html>")
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeTerminal):
+        _exchange(auth)
+
+
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_malformed_2xx_body_is_terminal(mock_urlopen, monkeypatch, tmp_path):
+    from auth import ExchangeTerminal
+    _set_full_env(monkeypatch)
+    mock_urlopen.return_value = io.BytesIO(b"<html>not json</html>")
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeTerminal):
+        _exchange(auth)
+
+
+@pytest.mark.parametrize("missing", ["refresh_token", "access_token"])
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_incomplete_2xx_body_is_terminal(
+        mock_urlopen, monkeypatch, tmp_path, missing):
+    from auth import ExchangeTerminal
+    _set_full_env(monkeypatch)
+    payload = {"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+    del payload[missing]
+    mock_urlopen.return_value = io.BytesIO(json.dumps(payload).encode())
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeTerminal):
+        _exchange(auth)
 
 
 # ── scopes ──────────────────────────────────────────────────────────────────
