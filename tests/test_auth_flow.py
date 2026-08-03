@@ -778,6 +778,12 @@ def test_claimed_attempt_resumes_from_the_held_journal(tmp_path):
 
 
 def test_terminal_exchange_falls_through_to_an_older_flow(tmp_path):
+    """Regression pin for the configuration split. A genuinely dead
+    authorization code (`invalid_grant`) must keep the settled behaviour it has
+    had since round 3: ack THAT attempt, then move on to the next one. Counts,
+    not just statuses — a status-only assertion cannot tell "acked and moved
+    on" apart from "acked and stopped"."""
+    from unittest.mock import call
     from auth import ExchangeTerminal
     from auth_flow import collect_pass
     auth, cb, store = wire(tmp_path, [attempt(NEW), attempt(OLD, minted_ts=50.0)])
@@ -785,8 +791,56 @@ def test_terminal_exchange_falls_through_to_an_older_flow(tmp_path):
     auth.exchange_code.side_effect = [ExchangeTerminal("invalid_grant"),
                                       {"refresh_token": "rt-old-flow", "access_token": "at"}]
 
-    collect_pass(auth, cb)
+    out = collect_pass(auth, cb)
     assert store.load_active().refresh_token == "rt-old-flow"
+    assert auth.exchange_code.call_count == 2       # DID fall through
+    assert cb.ack.call_args_list == [call(NEW), call(OLD)]
+    assert out["status"] == "ok"
+    assert any("Please start again" in m for m in out["messages"])
+
+
+def test_configuration_failure_at_exchange_neither_acks_nor_falls_through(tmp_path):
+    """A rotated client secret at code-exchange time. The authorization code is
+    still good, so the attempt must NOT be acked — casa's ack tears it down.
+    And every other attempt would be exchanged against the same rejected
+    client, so the pass must not fall through and burn them either."""
+    from auth import ExchangeConfigError
+    from auth_flow import collect_pass
+    auth, cb, store = wire(tmp_path, [attempt(NEW), attempt(OLD, minted_ts=50.0)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+    auth.exchange_code.side_effect = ExchangeConfigError(
+        "Token exchange refused this OAuth client (401): invalid_client — "
+        "The OAuth client was not found.")
+
+    out = collect_pass(auth, cb)
+
+    assert cb.ack.call_count == 0                   # nothing torn down
+    assert auth.exchange_code.call_count == 1       # did NOT fall through
+    assert out["status"] == "configuration_error"
+    assert out["promoted"] is False
+    assert store.load_active() is None
+    assert store.load_staged() is None
+
+
+def test_the_configuration_message_names_the_cause_and_the_new_session(tmp_path):
+    """It is relayed verbatim to the operator, so it has to be true prose: name
+    the configuration problem, not a dead authorization, and say plainly that
+    correcting the variables needs a new session before it takes effect. The
+    "Please start again" of the terminal branch would be false twice over
+    here."""
+    from auth import ExchangeConfigError
+    from auth_flow import collect_pass
+    auth, cb, _ = wire(tmp_path, [attempt(NEW)])
+    cb.collect.return_value = {"query": [["code", "c1"]]}
+    auth.exchange_code.side_effect = ExchangeConfigError("invalid_client — nope")
+
+    message = " ".join(collect_pass(auth, cb)["messages"])
+
+    assert "OAuth client configuration" in message
+    assert "GMAIL_CLIENT_ID" in message and "GMAIL_CLIENT_SECRET" in message
+    assert "new session" in message and "restart" in message
+    assert "Please start again" not in message
+    assert "invalid_client — nope" in message
 
 
 def test_retryable_exchange_ends_the_pass_without_acking(tmp_path):

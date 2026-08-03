@@ -15,7 +15,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from auth import ExchangeRetryable, ExchangeTerminal, RefreshRetryable, RefreshTerminal
+from auth import (ExchangeConfigError, ExchangeRetryable, ExchangeTerminal,
+                  RefreshRetryable, RefreshTerminal)
 from casa_callback import attempt_order
 from token_store import StagedFlowMismatch
 
@@ -427,6 +428,30 @@ def _locked_pass(auth, cb) -> dict:
                                    f"({exc}). Please start again.")
             cb.ack(h)
             continue                      # terminal: fall through is safe
+        except ExchangeConfigError as exc:
+            # Neither of the other two dispositions. NOT an ack: the
+            # authorization code is still good, and casa's ack tears the
+            # attempt down, so acking here would destroy something usable over
+            # a misconfiguration. NOT a fall-through either: every remaining
+            # attempt would be exchanged against the same rejected client and
+            # fail identically, burning them all. So end the pass, as the
+            # retryable branch does — but say the opposite thing, because
+            # waiting will not fix this and neither will re-authorizing.
+            out["messages"].append(
+                f"That authorization could not be completed: Google refused "
+                f"the token exchange in a way that points at this plugin's "
+                f"OAuth client configuration rather than at the authorization "
+                f"itself ({exc}). The authorization is still good and nothing "
+                "has been discarded, so do NOT start another one — it would be "
+                "exchanged against the same rejected client and fail at "
+                "exactly this point. Check that GMAIL_CLIENT_ID and "
+                "GMAIL_CLIENT_SECRET in casa's plugin environment still match "
+                "the Google OAuth client. Correcting them is not enough on its "
+                "own: I read them once when this session started, so a new "
+                "session (or a plugin restart) has to pick up the corrected "
+                "values before this authorization can be completed.")
+            out["status"] = "configuration_error"
+            return out                    # never fall through, and never ack
         except ExchangeRetryable as exc:
             out["messages"].append(f"Temporary problem completing authorization "
                                    f"({exc}); I'll retry.")

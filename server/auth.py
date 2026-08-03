@@ -25,12 +25,29 @@ _REQUIRED_ENV_VARS = ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_USER_EMAI
 
 
 class ExchangeTerminal(RuntimeError):
-    """The authorization code is dead — 4xx, or a 2xx whose body is unusable.
-    The flow must be acked and restarted."""
+    """The authorization code is dead — the token endpoint said the GRANT is
+    invalid, or answered 2xx with an unusable body. The flow must be acked and
+    restarted."""
 
 
 class ExchangeRetryable(RuntimeError):
     """Transport failure, 5xx or 429. The flow may still succeed: do NOT ack."""
+
+
+class ExchangeConfigError(RuntimeError):
+    """The token endpoint refused the CLIENT or the request, not the code.
+
+    Deliberately a SIBLING of ExchangeTerminal, not a subclass — the same
+    reasoning as RefreshConfigError, one step earlier in the flow. Every
+    `except ExchangeTerminal` means "this authorization code is dead" and acts
+    on it: `auth_flow.collect_pass` acks the attempt, which tears the flow down
+    at casa, and then falls through to the next attempt. Neither is right here.
+    The authorization code is untouched and would exchange cleanly the moment
+    the client credentials are corrected; and every remaining attempt would be
+    exchanged against that same rejected client, so falling through would burn
+    them all. Nor is it retryable: waiting changes nothing until the
+    configuration does.
+    """
 
 
 class AccountMismatch(RuntimeError):
@@ -59,15 +76,20 @@ class RefreshConfigError(RuntimeError):
 
 
 # OAuth2 error codes that mean THE GRANT is dead — the only verdicts that
-# justify deleting a stored refresh token or asking for a new authorization.
-# `invalid_grant` is RFC 6749 §5.2's "the provided authorization grant ... is
-# invalid, expired, revoked", and is what Google returns for a revoked or
-# expired refresh token; `invalid_token` (RFC 6750 §3.1) is the same verdict
-# under a different name. Everything else non-retryable — `invalid_client` from
-# a rotated secret, `unauthorized_client`, `invalid_request`, a RefreshError
-# raised before any request — is a configuration failure, and the DEFAULT is
-# that side of the line: destroying a working credential requires positive
-# evidence that it is dead, never the mere absence of evidence that it lives.
+# justify deleting a stored refresh token, discarding an authorization code, or
+# asking for a new authorization. `invalid_grant` is RFC 6749 §5.2's "the
+# provided authorization grant ... is invalid, expired, revoked", and it covers
+# BOTH grant types this plugin uses: it is what Google returns for a revoked or
+# expired refresh token AND for a spent, expired or mismatched authorization
+# code, which is why the refresh path and the exchange path read the same set.
+# `invalid_token` (RFC 6750 §3.1) is the same verdict under a different name.
+# Everything else non-retryable — `invalid_client` from a rotated secret,
+# `unauthorized_client`, `invalid_request`, `redirect_uri_mismatch`, a
+# RefreshError raised before any request, an error body that cannot be parsed
+# at all — is a configuration failure, and the DEFAULT is that side of the
+# line: destroying a working credential (or a still-usable authorization)
+# requires positive evidence that it is dead, never the mere absence of
+# evidence that it lives.
 _CREDENTIAL_DEAD_CODES = frozenset({"invalid_grant", "invalid_token"})
 
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -287,7 +309,8 @@ class GmailAuth:
     def exchange_code(self, code: str, redirect_uri: str) -> dict:
         """Exchange the code for tokens. Performs NO writes and mutates no
         runtime state — persistence is TokenStore's job, activation is
-        activate()'s. Raises ExchangeTerminal or ExchangeRetryable."""
+        activate()'s. Raises ExchangeTerminal, ExchangeConfigError or
+        ExchangeRetryable."""
         body = urllib.parse.urlencode({
             "code": code,
             "client_id": self._client_id,
@@ -303,10 +326,25 @@ class GmailAuth:
             with urllib.request.urlopen(req) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
-            detail = self._error_detail(e)
+            code, detail = self._error_report(e)
             if e.code == 429 or e.code >= 500:
                 raise ExchangeRetryable(f"Token exchange retryable ({e.code}): {detail}")
-            raise ExchangeTerminal(f"Token exchange failed ({e.code}): {detail}")
+            # NOT every non-retryable status means the authorization CODE is
+            # dead. Rotate the OAuth client secret and Google answers
+            # `invalid_client`; register the wrong redirect URI and it answers
+            # `redirect_uri_mismatch`. In both, the code is still perfectly
+            # good and the CLIENT was refused — so acking the attempt would
+            # destroy a usable authorization, and telling the operator to start
+            # again would be false twice over, since a fresh authorization ends
+            # at this same exchange against this same client. Only a
+            # grant-invalidating code is terminal, and a failure this cannot
+            # classify (no `error` field, an unparseable body) defaults to the
+            # configuration side for the reason _CREDENTIAL_DEAD_CODES gives:
+            # tearing a flow down needs positive evidence that it is dead.
+            if code in _CREDENTIAL_DEAD_CODES:
+                raise ExchangeTerminal(f"Token exchange failed ({e.code}): {detail}")
+            raise ExchangeConfigError(
+                f"Token exchange refused this OAuth client ({e.code}): {detail}")
         except urllib.error.URLError as e:
             raise ExchangeRetryable(f"Token exchange transport failure: {e}")
 
@@ -326,12 +364,25 @@ class GmailAuth:
         return token_data
 
     @staticmethod
-    def _error_detail(e: "urllib.error.HTTPError") -> str:
+    def _error_report(e: "urllib.error.HTTPError") -> tuple[str, str]:
+        """(OAuth2 error code, human detail) from a SINGLE read of the body.
+
+        One read, two answers, on purpose: `e.read()` drains a stream, so a
+        second reader gets b"" and would silently see an empty body. The code
+        is normalized the way `_refresh_error_code` normalizes its own, and is
+        "" whenever the body cannot supply one — which the caller treats as
+        unclassified, not as a dead grant.
+        """
         try:
             parsed = json.loads(e.read().decode())
-            return f"{parsed.get('error', 'unknown')} — {parsed.get('error_description', '')}"
         except Exception:
-            return "unparseable error body"
+            return "", "unparseable error body"
+        if not isinstance(parsed, dict):
+            return "", "unparseable error body"
+        raw = parsed.get("error")
+        code = raw.strip().lower() if isinstance(raw, str) else ""
+        return code, (f"{parsed.get('error', 'unknown')} — "
+                      f"{parsed.get('error_description', '')}")
 
     def credentials_for(self, refresh_token: str) -> Credentials:
         return Credentials(

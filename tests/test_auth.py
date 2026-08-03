@@ -628,6 +628,65 @@ def test_exchange_code_4xx_is_terminal(mock_urlopen, monkeypatch, tmp_path, stat
         _exchange(auth)
 
 
+@pytest.mark.parametrize("code", ["invalid_grant", "invalid_token"])
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_grant_dead_codes_stay_terminal(
+        mock_urlopen, monkeypatch, tmp_path, code):
+    """Regression pin for the configuration split: only a verdict about the
+    GRANT may stay terminal, because terminal is what acks the attempt and
+    throws the authorization away. A spent or expired authorization code really
+    does answer `invalid_grant`, and that must keep working exactly as before —
+    it is the one case where "please start again" is honest advice."""
+    from auth import ExchangeConfigError, ExchangeTerminal
+    _set_full_env(monkeypatch)
+    body = json.dumps({"error": code, "error_description": "Bad Request"}).encode()
+    mock_urlopen.side_effect = _http_error(400, body)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeTerminal) as caught:
+        _exchange(auth)
+    assert not isinstance(caught.value, ExchangeConfigError)
+    # One read of the body produced both the classification and the detail.
+    assert code in str(caught.value) and "Bad Request" in str(caught.value)
+
+
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_invalid_client_is_a_configuration_error(
+        mock_urlopen, monkeypatch, tmp_path):
+    """A rotated GMAIL_CLIENT_SECRET answers `invalid_client` at the exchange.
+    The authorization code is untouched and perfectly good — only the client
+    was refused — so this must NOT be the class that acks the attempt."""
+    from auth import ExchangeConfigError, ExchangeRetryable, ExchangeTerminal
+    _set_full_env(monkeypatch)
+    body = json.dumps({"error": "invalid_client",
+                       "error_description": "The OAuth client was not found."}).encode()
+    mock_urlopen.side_effect = _http_error(401, body)
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeConfigError) as caught:
+        _exchange(auth)
+    assert not isinstance(caught.value, (ExchangeTerminal, ExchangeRetryable))
+    assert "invalid_client" in str(caught.value)
+    assert "The OAuth client was not found." in str(caught.value)
+
+
+@pytest.mark.parametrize("code", ["unauthorized_client", "invalid_request",
+                                  "redirect_uri_mismatch", "some_future_code"])
+@patch("auth.urllib.request.urlopen")
+def test_exchange_code_unknown_non_retryable_code_defaults_to_configuration(
+        mock_urlopen, monkeypatch, tmp_path, code):
+    """The non-destructive default, mirroring `_refresh`: discarding a usable
+    authorization needs positive evidence that it is dead, and an unrecognized
+    code is not that evidence."""
+    from auth import ExchangeConfigError
+    _set_full_env(monkeypatch)
+    mock_urlopen.side_effect = _http_error(400, json.dumps({"error": code}).encode())
+    auth = make_auth(tmp_path)
+    auth.validate_and_init()
+    with pytest.raises(ExchangeConfigError):
+        _exchange(auth)
+
+
 @pytest.mark.parametrize("status", [429, 500, 503])
 @patch("auth.urllib.request.urlopen")
 def test_exchange_code_429_and_5xx_are_retryable(mock_urlopen, monkeypatch, tmp_path, status):
@@ -651,16 +710,25 @@ def test_exchange_code_connection_failure_is_retryable(mock_urlopen, monkeypatch
         _exchange(auth)
 
 
+@pytest.mark.parametrize("body", [b"<html>nope</html>", b"[]", b"{}",
+                                  b'{"error": 17}'])
 @patch("auth.urllib.request.urlopen")
-def test_exchange_code_malformed_error_body_still_terminal_on_4xx(
-        mock_urlopen, monkeypatch, tmp_path):
-    from auth import ExchangeTerminal
+def test_exchange_code_unclassifiable_4xx_is_a_configuration_error(
+        mock_urlopen, monkeypatch, tmp_path, body):
+    """Was `..._still_terminal_on_4xx`, and deliberately changed. A 4xx whose
+    body yields no OAuth error code says nothing about whether the
+    authorization code is alive, and terminal is the destructive answer: it
+    acks the attempt and tells the operator to start again. Same rule as
+    `_refresh`, where an unreadable RefreshError lands on RefreshConfigError.
+    The failure is still CLASSIFIED — it does not escape as a bare 4xx."""
+    from auth import ExchangeConfigError, ExchangeTerminal
     _set_full_env(monkeypatch)
-    mock_urlopen.side_effect = _http_error(400, b"<html>nope</html>")
+    mock_urlopen.side_effect = _http_error(400, body)
     auth = make_auth(tmp_path)
     auth.validate_and_init()
-    with pytest.raises(ExchangeTerminal):
+    with pytest.raises(ExchangeConfigError) as caught:
         _exchange(auth)
+    assert not isinstance(caught.value, ExchangeTerminal)
 
 
 @patch("auth.urllib.request.urlopen")
