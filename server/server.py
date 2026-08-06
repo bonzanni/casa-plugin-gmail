@@ -388,7 +388,7 @@ def setup_gmail() -> str:
                     "An authorization link for Gmail was already sent and is "
                     "still valid — no new link has been created, because a "
                     "second one would leave two live authorizations. Ask "
-                    "the user to use the link from that earlier message. If she "
+                    "the user to use the link from that earlier message. If they "
                     "no longer has it, run setup_gmail again once that link "
                     "expires and a fresh one will be minted."
                 ),
@@ -514,7 +514,7 @@ def send_email(
     attachment_paths: list[str] | None = None,
     from_address: str = "",
 ) -> str:
-    """Send a plain-text email. from_address: optional SendAs alias (defaults to subject's primary address). Protected: requires the user tap-approval."""
+    """Send a plain-text email. from_address: optional SendAs alias (defaults to subject's primary address). Protected: requires the user's tap-approval."""
     _require_auth()
     _validate_paths(attachment_paths or [])
     if request_id:
@@ -536,7 +536,7 @@ def reply_to_thread(
     attachment_paths: list[str] | None = None,
     from_address: str = "",
 ) -> str:
-    """Reply to an email thread. display_subject is for the approval prompt only. from_address: optional SendAs alias. Protected: requires the user tap-approval."""
+    """Reply to an email thread. display_subject is for the approval prompt only. from_address: optional SendAs alias. Protected: requires the user's tap-approval."""
     _require_auth()
     _validate_paths(attachment_paths or [])
     if request_id:

@@ -1,6 +1,6 @@
 # casa-plugin-gmail
 
-Gives the agent (Casa resident assistant) full Gmail access on the user's behalf via per-user OAuth 2.0. Authorization runs through casa's authorization-callback facility: the user opens a link, grants access in the browser, and casa delivers the result back to the agent automatically — nothing is copied and pasted between browser and chat. The refresh token is persisted inside the plugin's data directory (`CLAUDE_PLUGIN_DATA`). No service account, no domain-wide delegation, no gcloud, no ADC.
+Gives the agent (casa's resident assistant) full Gmail access on the user's behalf via per-user OAuth 2.0. Authorization runs through casa's authorization-callback facility: the user opens a link, grants access in the browser, and casa delivers the result back to the agent automatically — nothing is copied and pasted between browser and chat. The refresh token is persisted inside the plugin's data directory (`CLAUDE_PLUGIN_DATA`). No service account, no domain-wide delegation, no gcloud, no ADC.
 
 ## Prerequisites
 
@@ -64,9 +64,9 @@ This is where most setup failures happen — each prerequisite below fails silen
 
    **Order matters here more than anywhere else in this document.** Approving is what makes casa dispatch the setup tool: the plugin declares `setup_gmail`, and casa hands it to the agent automatically the moment consent settles. Casa dispatches it **once** — it treats an accepted agent turn as dispatched and does not correlate whether the tool actually ran, so there is **no automatic retry**. If the three environment variables are still missing, the server exits at startup, the dispatched call fails, and the setup episode is spent: the promised automatic link never arrives. That is not hypothetical — it is exactly how a live install failed, with consent approved about a minute before the variables were wired. Recovery is manual (ask the agent to connect Gmail — see Step 4) and entirely avoidable by configuring the environment first.
 
-   Approving also publishes casa's redirect URI, which is what makes Step 3.5 possible. the agent will post an `auth_url` in chat within a minute or two — **finish Step 3.5 before opening it**, or Google will answer `redirect_uri_mismatch`. The link stays valid for 30 minutes, which is ample.
+   Approving also publishes casa's redirect URI, which is what makes Step 3.5 possible. The agent will post an `auth_url` in chat within a minute or two — **finish Step 3.5 before opening it**, or Google will answer `redirect_uri_mismatch`. The link stays valid for 30 minutes, which is ample.
 5. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). This step comes after consent because it has to: casa publishes a plugin's redirect URI only once its callback is *routed*, and an unapproved callback is never routed — before Step 3.4 the value does not exist to be read. Never construct it yourself from the plugin's name either: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
-   - **Preferred:** ask the agent to connect Gmail (she calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected. Note that `gmail_auth_start` answers a direct request and therefore **always mints a fresh link**: if approving consent has already put a link in chat, asking for another leaves two live authorizations. Either use the message already posted (it carries the same `redirect_uri`) or use the host-side command below, and treat the newest link as the one to open.
+   - **Preferred:** ask the agent to connect Gmail (it calls `gmail_auth_start`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the `auth_url` it also returns will report `redirect_uri_mismatch` until you finish this step, which is expected. Note that `gmail_auth_start` answers a direct request and therefore **always mints a fresh link**: if approving consent has already put a link in chat, asking for another leaves two live authorizations. Either use the message already posted (it carries the same `redirect_uri`) or use the host-side command below, and treat the newest link as the one to open.
    - **From the host,** without a running server and without having to know the effective name:
      ```
      grep -o '"redirect_uri":[^,}]*' /data/callbacks/*/ready.json
@@ -89,10 +89,10 @@ Casa closes an authorization-callback route for exactly five reasons. The plugin
 
 1. **Wait for the link — you should not have to ask for it.** Once the consent DM in Step 3.4 is approved, casa dispatches `setup_gmail` automatically and the agent posts the `auth_url` in chat without being asked. This is the normal path; the plugin declares the tool for exactly this purpose.
 2. **Open the link in a real browser — do not tap it inside the chat client.** Tapping a link in a chat app usually opens it in that app's built-in (embedded) browser, and **Google refuses to run OAuth sign-in in an embedded browser**. When that happens Google shows a generic "Something went wrong" page *after* you sign in, never reaches the consent screen, and never redirects — so casa sees nothing at all and the flow just stops. Long-press the link and choose *Open in Chrome* / *Open in Safari* (or copy it into a browser). This is Google's policy and the plugin cannot see which browser is used, so it cannot detect or work around it — opening the link correctly is the only fix.
-3. Sign in as the user and grant access. The browser then shows "Response received" — nothing more happens there, and nothing needs to be copied back.
+3. Sign in as the Gmail account being connected and grant access. The browser then shows "Response received" — nothing more happens there, and nothing needs to be copied back.
 4. Casa delivers the result to the agent, which calls `gmail_auth_collect` and reports the outcome in chat. Success, denial, and a stale/replayed link all show the same neutral browser page, so **chat is the only place you learn whether it actually worked** — read what the agent reports, don't assume from the browser page alone.
 
-**If no link arrives within about two minutes of approving the consent DM,** ask the agent to connect Gmail and she will call `gmail_auth_start`, which returns the same `auth_url` — the manual fallback, and the route to use for any later re-authorization. Casa dispatches the setup tool only once, so waiting longer does not help; nothing will retry on its own. Three causes account for nearly all missing links:
+**If no link arrives within about two minutes of approving the consent DM,** ask the agent to connect Gmail and it will call `gmail_auth_start`, which returns the same `auth_url` — the manual fallback, and the route to use for any later re-authorization. Casa dispatches the setup tool only once, so waiting longer does not help; nothing will retry on its own. Three causes account for nearly all missing links:
 
 - **The plugin's MCP server is not running or not healthy** — most often the three environment variables (Step 3.3) were still missing when the consent DM was approved, so the server exited at startup and the dispatched call failed. Check the plugin's health in casa and its server log.
 - **The consent DM was never approved** (`callback_pending_ack`).
@@ -119,7 +119,7 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 ## Troubleshooting
 
 **`Gmail is not authenticated. Call gmail_auth_start …`** (tool error)
-→ No credential is in service. Ask the agent to connect Gmail, which calls `gmail_auth_start`; follow the link and confirm the outcome she reports (see Setup, Step 4).
+→ No credential is in service. Ask the agent to connect Gmail, which calls `gmail_auth_start`; follow the link and confirm the outcome it reports (see Setup, Step 4).
 
 **`Gmail plugin: stored token is dead — re-auth needed (…)`** (server log)
 → The refresh token was revoked or rejected as `invalid_grant`, and the stored credential has been removed. Run `gmail_auth_start` again.
@@ -182,8 +182,8 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 | `download_attachment` | Download attachment to 7-day cache |
 | `save_attachment` | Permanently save a cached attachment |
 | `list_send_as` | List available SendAs aliases (includes verification status) |
-| `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user approval) |
-| `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user approval) |
+| `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user's approval) |
+| `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user's approval) |
 
 ⚠️ Protected tools — require tap-approval from the user before execution.
 

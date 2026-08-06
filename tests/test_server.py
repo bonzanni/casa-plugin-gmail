@@ -240,7 +240,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.5.3"
+    assert manifest["version"] == "0.5.4"
 
 
 # ── v0.5.1: casa.setupTool — the hand-back the consent gate was missing ────
@@ -610,7 +610,7 @@ def test_setup_gmail_reports_a_rejected_client_as_configuration_not_revocation(
 def test_the_configuration_error_instructions_require_a_new_session(monkeypatch):
     """SKILL.md has the agent relay these `instructions` VERBATIM, so this
     string is not a diagnostic — it IS what the operator hears, and it is the
-    only recovery advice she gets.
+    only recovery advice they get.
 
     `read_env()` copied GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET into process
     memory once at startup and nothing re-reads them, so "correct them and run

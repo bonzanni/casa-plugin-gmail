@@ -1,5 +1,5 @@
 ---
-description: Use when the user asks the agent to read, search, send, reply to, or manage email in her Gmail inbox, or when a task manager needs to process received emails.
+description: Use when the user asks the agent to read, search, send, reply to, or manage email in their Gmail inbox, or when a task manager needs to process received emails.
 ---
 
 # Gmail Skill
@@ -12,25 +12,25 @@ the result expires 900 seconds after it lands. `gmail_auth_collect` takes no arg
 and is safe to call repeatedly.
 
 To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `auth_url`.
-Tell her the browser will show "Response received" and that nothing needs copying back.
+Tell them the browser will show "Response received" and that nothing needs copying back.
 
-**Whenever you give the user an `auth_url`, tell her to open it in a real browser rather
+**Whenever you give the user an `auth_url`, tell them to open it in a real browser rather
 than tapping it here — Google refuses OAuth sign-in inside a chat app's built-in
 browser.** Say it every time, in one short clause ("open this in Chrome/Safari rather
 than tapping it — Google blocks sign-in inside the chat app's browser"), and put that
-clause **before the link** in your message, never after — on a phone she taps the link
-before she finishes reading whatever comes next, so the link must come last. Without that
-line the flow fails silently on her phone: she signs in, Google shows a generic
+clause **before the link** in your message, never after — on a phone they tap the link
+before they finish reading whatever comes next, so the link must come last. Without that
+line the flow fails silently on their phone: they sign in, Google shows a generic
 **"Something went wrong"** page, the consent screen never appears and nothing is ever
 redirected back, so no result arrives and there is nothing for you to collect.
 
-If she reports "Something went wrong" **after signing in**, that is the signature of
+If they report "Something went wrong" **after signing in**, that is the signature of
 this. The fix is to reopen the *same* link in a proper browser (long-press → *Open in
 Chrome* / *Open in Safari*, or copy the URL across) — tapping it again will fail
 identically, and a new link will not help. Do not mint a fresh authorization for this.
 
 **Unprompted setup:** casa may dispatch `setup_gmail` on its own — it does this once
-the user approves the plugin's consent DM, so the instruction arrives without her having
+the user approves the plugin's consent DM, so the instruction arrives without them having
 asked for anything. Call it with no arguments and relay its output exactly as you would
 `gmail_auth_start`'s: an `auth_url` gets the same "open it in a real browser" and
 "Response received" wording. Its other results are not links:
@@ -59,7 +59,7 @@ asked for anything. Call it with no arguments and relay its output exactly as yo
 Reporting rules — the browser page is deliberately identical for success, denial and a
 replayed link, so **chat is the only place the user learns the real outcome**:
 
-- `messages` from `gmail_auth_collect` are written for her. Relay them; do not
+- `messages` from `gmail_auth_collect` are written for the user. Relay them; do not
   summarise a failure into a success.
 - Nothing waiting → `messages` says so in as many words. Relay that too, and never
   report `status: "ok"` on its own as confirmation: a stale or already-handled link
@@ -67,9 +67,9 @@ replayed link, so **chat is the only place the user learns the real outcome**:
 - Authorization denied → say so plainly. Do not imply it worked.
 - Wrong Google account → report it as a failure, and say the existing connection is
   untouched.
-- `redirect_uri_mismatch` from Google → give her the `redirect_uri` value returned by
+- `redirect_uri_mismatch` from Google → give them the `redirect_uri` value returned by
   `gmail_auth_start` and say it must be registered on the OAuth client exactly.
-- `status: "retry_later"` → a transient problem; tell her you'll finish shortly and do
+- `status: "retry_later"` → a transient problem; tell them you'll finish shortly and do
   not start a second authorization.
 
 ## Interactive Use

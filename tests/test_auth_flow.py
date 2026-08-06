@@ -111,7 +111,7 @@ def test_start_warns_against_the_chat_clients_embedded_browser():
     tapping the link inside Telegram: Google refuses OAuth in an embedded
     browser, so no callback ever arrives. SKILL.md tells the agent to say this,
     but the warning must also travel with the link itself — these `instructions`
-    reach her through both `gmail_auth_start` and an unprompted `setup_gmail`.
+    reach the user through both `gmail_auth_start` and an unprompted `setup_gmail`.
     """
     from auth_flow import start
     cb, auth = MagicMock(), MagicMock()
@@ -122,8 +122,8 @@ def test_start_warns_against_the_chat_clients_embedded_browser():
 
     assert "browser" in instructions
     assert "Telegram" in instructions, \
-        "name the chat client — 'a real browser' alone does not tell her what to avoid"
-    # The remedy, not just the prohibition: she is already holding the link.
+        "name the chat client — 'a real browser' alone does not tell them what to avoid"
+    # The remedy, not just the prohibition: the user is already holding the link.
     assert "copy" in instructions or "Open in" in instructions
 
 
