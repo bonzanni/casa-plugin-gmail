@@ -50,6 +50,87 @@ def test_missing_required_var_names_it_in_stderr(missing_var, monkeypatch, capsy
     assert missing_var in capsys.readouterr().err
 
 
+# ── Unexpanded ${VAR} placeholders ──────────────────────────────────────────
+
+@pytest.mark.parametrize("var", [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_USER_EMAIL",
+])
+def test_unexpanded_placeholder_exits(var, monkeypatch, tmp_path):
+    """The host passed the .mcp.json template through without resolving it:
+    the value is the literal `${VAR}`. That is missing configuration, not a
+    credential — treat it exactly as absence does."""
+    _set_full_env(monkeypatch, **{var: "${%s}" % var})
+    with pytest.raises(SystemExit):
+        make_auth(tmp_path).validate_and_init()
+
+
+@pytest.mark.parametrize("var", [
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_USER_EMAIL",
+])
+def test_unexpanded_placeholder_names_it_in_stderr(var, monkeypatch, capsys, tmp_path):
+    _set_full_env(monkeypatch, **{var: "${%s}" % var})
+    with pytest.raises(SystemExit):
+        make_auth(tmp_path).validate_and_init()
+    assert var in capsys.readouterr().err
+
+
+def test_unexpanded_placeholder_is_reported_as_unresolved_not_as_missing(
+        monkeypatch, capsys, tmp_path):
+    """The two failures need different remedies — set the variable vs. wire the
+    secret on the host and start a new session — so they must not read alike."""
+    _set_full_env(monkeypatch, GMAIL_CLIENT_ID="${GMAIL_CLIENT_ID}")
+    with pytest.raises(SystemExit):
+        make_auth(tmp_path).validate_and_init()
+    err = capsys.readouterr().err
+    assert "missing env var" not in err
+    assert "unexpanded" in err.lower()
+
+
+def test_a_placeholder_naming_another_variable_is_still_unresolved(
+        monkeypatch, capsys, tmp_path):
+    """The literal that arrives is whatever the template said; nothing
+    guarantees it names the variable it was assigned to."""
+    _set_full_env(monkeypatch, GMAIL_CLIENT_SECRET="${SOME_OTHER_SECRET}")
+    with pytest.raises(SystemExit):
+        make_auth(tmp_path).validate_and_init()
+    assert "GMAIL_CLIENT_SECRET" in capsys.readouterr().err
+
+
+def test_every_unexpanded_variable_is_named_at_once(monkeypatch, capsys, tmp_path):
+    """One report, not one per restart: the operator wires all of them in the
+    same pass."""
+    _set_full_env(monkeypatch,
+                  GMAIL_CLIENT_ID="${GMAIL_CLIENT_ID}",
+                  GMAIL_CLIENT_SECRET="${GMAIL_CLIENT_SECRET}")
+    with pytest.raises(SystemExit):
+        make_auth(tmp_path).validate_and_init()
+    err = capsys.readouterr().err
+    assert "GMAIL_CLIENT_ID" in err and "GMAIL_CLIENT_SECRET" in err
+
+
+@pytest.mark.parametrize("value", [
+    "not-a-placeholder",
+    "${lowercase}",
+    "prefix${GMAIL_CLIENT_ID}",
+    "${GMAIL_CLIENT_ID}suffix",
+    "${GMAIL CLIENT ID}",
+    "${}",
+    "$GMAIL_CLIENT_ID",
+])
+def test_a_value_that_merely_resembles_a_placeholder_is_accepted(
+        value, monkeypatch, tmp_path):
+    """A secret is an opaque string. Only the exact shell-template form the
+    host emits is refused — anything looser would reject a real credential
+    that happens to contain those characters."""
+    _set_full_env(monkeypatch, GMAIL_CLIENT_SECRET=value)
+    auth = make_auth(tmp_path)
+    assert auth.validate_and_init() is False  # no token file, but no exit
+
+
 # ── No token file ───────────────────────────────────────────────────────────
 
 def test_no_token_file_returns_false(monkeypatch, tmp_path):

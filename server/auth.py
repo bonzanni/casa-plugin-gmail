@@ -23,6 +23,18 @@ _AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 
 _REQUIRED_ENV_VARS = ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_USER_EMAIL"]
 
+# The `${VAR}` template form casa writes into .mcp.json. When the host spawns
+# the server before the secret is wired, the substitution never happens and the
+# variable arrives holding its own template text — non-empty, so the presence
+# check below would pass it through, and every credential-consuming path
+# downstream (the authorization URL, the code exchange, the API client) would
+# be built from a string Google can only answer `invalid_client` to. An
+# unresolved template is missing configuration, so it fails where absence
+# fails: at startup, before anything is minted. Anchored and deliberately
+# narrow — a real secret is an opaque string, and a looser match would refuse
+# a credential that merely contains these characters.
+_UNEXPANDED_RE = re.compile(r"^\$\{[A-Z_][A-Z0-9_]*\}$")
+
 
 class ExchangeTerminal(RuntimeError):
     """The authorization code is dead — the token endpoint said the GRANT is
@@ -137,6 +149,20 @@ class GmailAuth:
         if missing:
             print(
                 f"Gmail plugin misconfigured: missing env var(s): {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        unexpanded = [name for name, val in values.items()
+                      if _UNEXPANDED_RE.match(val)]
+        if unexpanded:
+            # Named separately from "missing" on purpose: the remedy is not the
+            # operator's to apply here — the host has to resolve the secret and
+            # respawn, and re-running setup against this process cannot help,
+            # because these values are cached once, right here.
+            print(
+                "Gmail plugin misconfigured: unexpanded ${...} placeholder(s) "
+                f"in env var(s): {', '.join(unexpanded)}. The host has not "
+                "resolved them yet — wire the secrets and start a new session.",
                 file=sys.stderr,
             )
             sys.exit(1)
