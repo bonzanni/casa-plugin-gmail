@@ -106,6 +106,27 @@ def test_start_uses_the_redirect_uri_from_casa_verbatim():
         "https://x.example/callback/plg-fin.gmail--oauth"
 
 
+def test_start_warns_against_the_chat_clients_embedded_browser():
+    """The one failure mode the plugin cannot see or recover from is the user
+    tapping the link inside Telegram: Google refuses OAuth in an embedded
+    browser, so no callback ever arrives. SKILL.md tells the agent to say this,
+    but the warning must also travel with the link itself — these `instructions`
+    reach her through both `gmail_auth_start` and an unprompted `setup_gmail`.
+    """
+    from auth_flow import start
+    cb, auth = MagicMock(), MagicMock()
+    cb.resolve.return_value = fake_route()
+    auth.build_auth_url.return_value = "https://accounts.google.com/o"
+
+    instructions = start(auth, cb)["instructions"]
+
+    assert "browser" in instructions
+    assert "Telegram" in instructions, \
+        "name the chat client — 'a real browser' alone does not tell her what to avoid"
+    # The remedy, not just the prohibition: she is already holding the link.
+    assert "copy" in instructions or "Open in" in instructions
+
+
 def test_start_generates_a_fresh_state_each_call():
     from auth_flow import start
     cb, auth = MagicMock(), MagicMock()

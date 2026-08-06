@@ -240,7 +240,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.5.2"
+    assert manifest["version"] == "0.5.3"
 
 
 # ── v0.5.1: casa.setupTool — the hand-back the consent gate was missing ────
