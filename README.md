@@ -107,6 +107,12 @@ If `gmail_auth_start` returns a `redirect_uri` that doesn't match what's registe
 - **Changing `GMAIL_USER_EMAIL`** invalidates the stored credential by design: at startup, the plugin refuses to serve an inbox that doesn't match the configured email, so a stored token for the old address is treated as unusable. Re-run the authorization flow (Step 4) after changing this value.
 - **Rotating the OAuth client** (new Client ID/Secret) requires exactly one re-authorization — update `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` in casa's plugin env, then run `gmail_auth_start` again. Rotating only the **secret** of the same client does not: a refresh token is tied to the client ID, so once the new secret is in place the existing connection resumes untouched. Between the rotation and the update the plugin reports a configuration problem rather than a revoked connection, and keeps the credential — see Troubleshooting.
 
+### Updating an already-connected install
+
+Updating the plugin on a working system does not disturb the connection, and does not need a re-authorization. The refresh token is kept in `CLAUDE_PLUGIN_DATA`, which is casa's persistent plugin-data directory for a role-assigned plugin — the update replaces the plugin artifact, and the credential is not in it. This plugin also declares a callback and **no triggers**, so an update re-mints no per-trigger secret that could reach the stored grant (a callback declaration carries no secret at all, and its consent ack survives an update that leaves `casa.callbacks` unchanged).
+
+Casa's update hand-back nonetheless says the integration is **not live** until the plugin's setup tool runs. That sentence is generic — it is written for a plugin that must re-publish a webhook URL and key to an external service, which this one does not — so do not read it as a statement about your Gmail authorization. `setup_gmail` is what actually knows: on a healthy install it answers `already_connected` with the connected account and mints nothing. Ask the agent to run it if you want the update confirmed; it is argument-free and changes nothing when there is nothing to change.
+
 ## Env vars
 
 | Variable | Required | Description |

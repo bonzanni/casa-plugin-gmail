@@ -332,7 +332,11 @@ def setup_gmail() -> str:
                 "instructions": (
                     f"Gmail is already connected as {stored.account} — "
                     "nothing to do. This is not a new authorization; do not "
-                    "report it as one."
+                    "report it as one. An update, reload or restart does not "
+                    "change this authorization: the credential is kept in the "
+                    "plugin's data directory, not in the plugin artifact. If "
+                    "something reported that the integration would not be "
+                    "live until setup ran, this result is the answer to it."
                 ),
             })
         kind, detail = failure

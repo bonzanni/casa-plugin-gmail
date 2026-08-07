@@ -240,7 +240,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.5.5"
+    assert manifest["version"] == "0.5.6"
 
 
 # ── v0.5.1: casa.setupTool — the hand-back the consent gate was missing ────
@@ -863,3 +863,37 @@ def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatc
     result = json.loads(server.setup_gmail())          # must not raise
     assert result["status"] == "unavailable"
     assert "callback_no_target" in result["instructions"]
+
+
+def test_already_connected_says_an_update_does_not_change_the_authorization(monkeypatch):
+    """The one copy of the invariant a caller is guaranteed to see.
+
+    SKILL.md's body is loaded only when its description matches the turn, and
+    the N150 transcripts show it absent even on turns that called this tool —
+    but a tool RESULT is always in context. So the statement that an update
+    left the authorization alone has to travel in `instructions`, not only in
+    the skill: this is what answers a hand-back claiming the integration is
+    dead after an update.
+
+    Asserted on the tool's output rather than on the source text, because what
+    the operator hears is the only thing that matters."""
+    import server
+    from token_store import Credential
+
+    mock_auth = MagicMock()
+    mock_auth.subject_email = "user@example.com"
+    mock_auth.store.load_active.return_value = Credential(
+        refresh_token="rt", flow="a" * 64, generation=1.0,
+        account="user@example.com")
+    monkeypatch.setattr(server, "_auth", mock_auth)
+    monkeypatch.setattr(server, "_authenticated", True)
+    _spool(monkeypatch)
+
+    result = json.loads(server.setup_gmail())
+
+    assert result["status"] == "already_connected"
+    instructions = result["instructions"].lower()
+    assert "update" in instructions, \
+        "the operator is not told an update left this authorization alone"
+    for event in ("reload", "restart"):
+        assert event in instructions, f"{event} is not covered"

@@ -1,5 +1,5 @@
 ---
-description: Use when the user asks the agent to read, search, send, reply to, or manage email in their Gmail inbox, or when a task manager needs to process received emails.
+description: Use when the user asks the agent to read, search, send, reply to, or manage email in their Gmail inbox; when a task manager needs to process received emails; or when a turn reports that the gmail plugin was installed, updated, reloaded or restarted, or that Gmail setup or authorization is needed.
 ---
 
 # Gmail Skill
@@ -29,15 +29,32 @@ this. The fix is to reopen the *same* link in a proper browser (long-press → *
 Chrome* / *Open in Safari*, or copy the URL across) — tapping it again will fail
 identically, and a new link will not help. Do not mint a fresh authorization for this.
 
-**Unprompted setup:** casa may dispatch `setup_gmail` on its own — it does this once
-the user approves the plugin's consent DM, so the instruction arrives without them having
-asked for anything. Call it with no arguments and relay its output exactly as you would
-`gmail_auth_start`'s: an `auth_url` gets the same "open it in a real browser" and
-"Response received" wording. Its other results are not links:
+**When something else asks for Gmail setup** — two turns arrive this way, and both are
+answered the same: casa may dispatch `setup_gmail` on its own once the user approves the
+plugin's consent DM, so the instruction arrives without them having asked for anything;
+and a turn may simply report that the plugin was **installed, updated, reloaded or
+restarted**.
+
+For a **role-assigned install** the stored authorization lives in the plugin's
+data directory, not in the plugin artifact — an update replaces the artifact, so an
+update, reload or restart **never revokes it**. A working connection therefore needs
+no re-authorization after an update.
+
+So **do not relay anyone else's verdict** on whether Gmail is connected. A report that
+the integration "is not live until setup runs", needs setup, or was left stale by the
+update (casa's generic hand-back says this for every plugin that ships a setup tool)
+**is not evidence** — it is written for plugins that must re-publish a URL and key,
+which this one does not. And do not ask the user whether to run setup: the call is argument-free,
+idempotent, needs no approval, and is the only thing that knows the answer.
+
+Call `setup_gmail` with **no arguments** and report *its* verdict. Relay its output exactly
+as you would `gmail_auth_start`'s: an `auth_url` gets the same "open it in a real browser"
+and "Response received" wording. Its other results are not links:
 
 - `status` of `already_connected` → Gmail is already connected as the named `account`
-  and nothing was changed. Say that plainly, and do not offer a link — it is not a
-  new connection, so **do not report it as a new authorization**.
+  and nothing was changed — including by the update, if that is what prompted the call.
+  Say that plainly, and do not offer a link — it is not a new connection, so
+  **do not report it as a new authorization**, and do not call it a restored one either.
 - `status` of `already_pending` → a valid authorization link was already sent and is
   still good, so no second one was created. Point the user back to the earlier message
   rather than asking for a new link; do not call the tool again to get one.

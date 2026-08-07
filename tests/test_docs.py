@@ -689,3 +689,117 @@ def test_advice_to_fix_a_startup_cached_env_var_names_the_session_requirement():
             f"new session is needed first: {text!r}"
         )
     assert checked, "the guard matched nothing — it has stopped guarding"
+
+
+# ── 2026-08-07: an update must acknowledge the authorization it did not touch
+#
+# Observed on the N150 (session 6e80ce7f, 07:59Z): the configurator handed back
+# "The integration is not live until `setup_gmail` runs", the resident relayed
+# it as fact and asked the operator whether to run setup — while Gmail was
+# connected and serving. One minute later `search_emails` returned the inbox.
+#
+# The deadness claim is casa's generic doctrine (recipes/plugin/update.md,
+# written for a webhook-repointing plugin that must re-publish its URL and
+# key). It is not a fact about this plugin: the refresh token lives in
+# CLAUDE_PLUGIN_DATA, outside the versioned artifact, and this plugin declares
+# a callback and no triggers, so an update re-mints no secret that could reach
+# the stored grant. Only the store knows, and `setup_gmail` is what asks it.
+
+_SETUP_BLOCK_MARKER = "**When something else asks for Gmail setup"
+
+
+def _setup_block():
+    """The SKILL.md block covering setup the operator did not ask for — casa's
+    post-consent dispatch AND a turn that merely reports an update. Extracted
+    so the assertions below hold of that passage and not of the file as a
+    whole, which trivially satisfies any vocabulary test."""
+    text = _read("skills", "gmail", "SKILL.md")
+    assert _SETUP_BLOCK_MARKER in text, "SKILL.md has no unprompted-setup block"
+    return text.split(_SETUP_BLOCK_MARKER)[1].split("\n## ")[0]
+
+
+def test_the_skill_description_triggers_on_a_plugin_update_report():
+    """The load-bearing half of the fix. Casa runs `skills="all"` — ordinary
+    description-gated loading — and grepping both N150 transcripts for a
+    `Skill` invocation naming `gmail` returns nothing: the body was not in
+    context on the turn that relayed the false claim, nor even on the turn that
+    called `setup_gmail`. A description covering only reading, searching,
+    sending and managing email never matches a turn that reports a DEPLOYMENT,
+    so guidance in the body below is unreachable without this."""
+    description = re.search(r"^description:\s*(.+?)\n(?=\w+:|---)",
+                            _read("skills", "gmail", "SKILL.md"),
+                            re.S | re.M).group(1).lower()
+    assert "updated" in description, \
+        "the description never mentions an update, so the body will not load on one"
+    assert "reload" in description or "restart" in description
+    assert "authorization" in description or "setup" in description
+
+
+def test_the_skill_tells_the_agent_an_update_cannot_revoke_the_authorization():
+    """The invariant, scoped. For a role-assigned install the data directory is
+    on casa's persistent volume; for an executor engagement it is scratch. This
+    plugin requires a role assignment, so the scoped claim is the true one and
+    the unscoped claim would be the same class of overstatement as the bug."""
+    block = _setup_block()
+    assert "role-assigned install" in block
+    assert "never revokes it" in block
+    assert "data directory" in block
+
+
+def test_the_skill_forbids_relaying_someone_elses_verdict_on_the_connection():
+    """The observed failure in one assertion. Stated as a class, not as casa's
+    sentence: the issue filed against casa asks it to reword that sentence, and
+    an instruction pinned to the old wording would stop matching what the agent
+    sees."""
+    block = _setup_block()
+    assert "do not relay" in block.lower()
+    assert "is not evidence" in block
+
+
+def test_the_skill_does_not_ask_the_operator_whether_to_run_setup():
+    """What the resident actually did wrong — "Want me to kick that off?" —
+    asked about a tool that is argument-free, idempotent and needs no approval.
+    The question also can't be answered honestly: nobody knows yet whether
+    anything needs doing, which is what the call determines."""
+    block = _setup_block()
+    flat = re.sub(r"[`*]", "", block)
+    offenders = re.findall(
+        r"ask (?:the )?(?:user|operator)[^.;]{0,40}whether|want me to",
+        flat, re.I)
+    # Prohibitions are allowed to quote the shape they forbid; an instruction
+    # to perform it is not. Only a match that is not being denied counts.
+    offenders = [m for m in offenders
+                 if not re.search(r"\bdo not\b|\bdon't\b|\bnever\b|\bwithout\b",
+                                  flat[:flat.index(m)].rsplit(".", 1)[-1], re.I)]
+    assert offenders == [], \
+        f"SKILL.md tells the agent to ask instead of checking: {offenders}"
+    assert "no arguments" in block
+
+
+_README_UPDATE_HEADING = "### Updating an already-connected install"
+
+
+def test_the_readme_tells_a_working_operator_an_update_changes_nothing():
+    """Placed with "Rotating credentials" — both answer "what happens to the
+    stored credential when X changes" — and deliberately NOT in
+    Troubleshooting: nothing is broken, so an operator with a working install
+    never looks there."""
+    text = _read(README)
+    assert _README_UPDATE_HEADING in text, "the README never covers an update"
+    section = text.split(_README_UPDATE_HEADING)[1].split("\n### ")[0].split("\n## ")[0]
+    assert "setup_gmail" in section, \
+        "the section never names the tool that answers the question"
+    assert "no triggers" in section, \
+        "the section does not say why no secret an update re-mints can reach the grant"
+    assert "already_connected" in section
+    # The claim being contradicted, named once so the operator recognises it.
+    assert "not live" in section
+
+
+def test_the_readme_update_section_sits_outside_troubleshooting():
+    """Guard on the placement, not the prose: inside `## Troubleshooting` the
+    section would join the `_same_session_promises` corpus, where a passage
+    pairing "run `setup_gmail`" with a no-session-change word fails a detector
+    written for an unrelated falsehood."""
+    troubleshooting = _read(README).split("## Troubleshooting")[1]
+    assert _README_UPDATE_HEADING not in troubleshooting
