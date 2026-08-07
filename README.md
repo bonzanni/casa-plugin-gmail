@@ -188,3 +188,15 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 ⚠️ Protected tools — require tap-approval from the user before execution.
 
 > **SendAs note:** Only aliases with `verification_status: accepted` can be used as `from_address`. Unverified aliases will be rejected by Gmail.
+
+## License
+
+[MIT](LICENSE) — copyright (c) 2026 Nicola Bonzanni.
+
+The MIT license covers this plugin's own code (`server/*.py`, `skills/`, `tests/`, and the manifests). It does **not** cover `server/vendor/`, which vendors 37 third-party Python packages so the plugin can run without a network install step. Those packages remain under their own licenses (Apache-2.0, MIT, BSD and others); each ships its license text in its `*.dist-info/` directory — most under `*.dist-info/licenses/`, a few as `*.dist-info/LICENSE`.
+
+**Platform constraint:** `server/vendor/` contains compiled extension modules built for **CPython 3.11 on linux x86_64** (`_cffi_backend`, `pydantic_core`, `charset_normalizer`, `cryptography`). The vendored tree will not import on another Python version or architecture, so a deployment or fork targeting anything else must re-vendor it from `server/requirements.txt`.
+
+## Disclaimer
+
+Not affiliated with, endorsed by, or sponsored by Google. "Gmail" is a trademark of Google LLC.
