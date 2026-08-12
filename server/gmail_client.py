@@ -46,7 +46,10 @@ def _decode_part_data(data: str) -> str:
 
 
 def _extract_part(payload: dict, mime_type: str) -> str:
-    mime = payload.get("mimeType", "")
+    if payload.get("filename"):
+        return ""  # attachments are _extract_attachments' business, never the body
+    # Strip Content-Type parameters ("text/html; charset=utf-8") before matching.
+    mime = payload.get("mimeType", "").split(";", 1)[0].strip().lower()
     if mime == mime_type:
         return _decode_part_data(payload.get("body", {}).get("data", ""))
     if mime.startswith("multipart/"):
@@ -70,7 +73,8 @@ class _LinkParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            href = dict(attrs).get("href")
+            # First href wins on duplicates, matching how browsers render.
+            href = next((v for k, v in attrs if k == "href"), None)
             if href:
                 self._href = href
                 self._text_parts = []

@@ -232,6 +232,55 @@ def test_get_email_links_skip_anchors_without_href():
     result = client.get_email("msg1")
     assert result["links"] == [{"text": "Real", "href": "https://x.example/a"}]
 
+def test_get_email_html_attachment_is_not_body_or_links():
+    # An HTML *attachment* must not supply the body fallback or the links
+    # field — its links belong to the attachment, not the message.
+    client = make_client()
+    html = '<a href="https://attacker.example/pay">Pay invoice</a>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": _b64("See attached invoice.")}},
+                {"mimeType": "text/html", "filename": "invoice.html",
+                 "body": {"data": _b64(html), "attachmentId": "att1", "size": 10}},
+            ],
+        },
+    }
+    result = client.get_email("msg1")
+    assert result["body"] == "See attached invoice."
+    assert result["links"] == []
+
+def test_get_email_duplicate_href_keeps_first_like_rendering():
+    client = make_client()
+    html = '<a href="https://rendered.example/confirm" href="https://wrong.example/confirm">Confirm</a>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": _alternative_payload("body", html),
+    }
+    result = client.get_email("msg1")
+    assert result["links"] == [{"text": "Confirm", "href": "https://rendered.example/confirm"}]
+
+def test_get_email_mime_type_with_parameters_still_matches():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "multipart/alternative; boundary=x",
+            "headers": [],
+            "parts": [
+                {"mimeType": "text/plain; charset=utf-8", "body": {"data": _b64("Plain")}},
+                {"mimeType": "TEXT/HTML; charset=utf-8",
+                 "body": {"data": _b64('<a href="https://example.test/v">Hi</a>')}},
+            ],
+        },
+    }
+    result = client.get_email("msg1")
+    assert result["body"] == "Plain"
+    assert result["links"] == [{"text": "Hi", "href": "https://example.test/v"}]
+
 def test_get_thread_messages_include_links():
     client = make_client()
     html = '<a href="https://example.com/verify">Verify</a>'
