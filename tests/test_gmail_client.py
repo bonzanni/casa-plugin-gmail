@@ -253,6 +253,26 @@ def test_get_email_html_attachment_is_not_body_or_links():
     assert result["body"] == "See attached invoice."
     assert result["links"] == []
 
+def test_get_email_inline_filename_html_body_is_still_the_body():
+    # A filename-bearing part with inline data and no attachmentId is not an
+    # attachment (cf. _extract_attachments) — if it is the only body, use it.
+    client = make_client()
+    html = '<a href="https://example.test/read">Read</a>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [],
+            "parts": [
+                {"mimeType": "text/html", "filename": "message.html",
+                 "body": {"data": _b64(html)}},
+            ],
+        },
+    }
+    result = client.get_email("msg1")
+    assert "https://example.test/read" in result["body"]
+    assert result["links"] == [{"text": "Read", "href": "https://example.test/read"}]
+
 def test_get_email_duplicate_href_keeps_first_like_rendering():
     client = make_client()
     html = '<a href="https://rendered.example/confirm" href="https://wrong.example/confirm">Confirm</a>'
