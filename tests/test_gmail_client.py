@@ -146,6 +146,106 @@ def test_get_thread_marks_trashed():
     assert result["messages"][0]["trashed"] is True
 
 
+# --- HTML bodies and links (issue #1) ---
+
+def _b64(text: str) -> str:
+    import base64
+    return base64.urlsafe_b64encode(text.encode()).decode()
+
+def _alternative_payload(plain: str, html: str) -> dict:
+    return {
+        "mimeType": "multipart/alternative",
+        "headers": [],
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _b64(plain)}},
+            {"mimeType": "text/html", "body": {"data": _b64(html)}},
+        ],
+    }
+
+def test_get_email_extracts_links_from_html_part():
+    client = make_client()
+    html = '<html><body><p>Hi,</p><a href="https://example.com/magic?t=abc">Sign in to Provider</a></body></html>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": _alternative_payload("Sign in to Provider", html),
+    }
+    result = client.get_email("msg1")
+    assert result["body"] == "Sign in to Provider"
+    assert result["links"] == [
+        {"text": "Sign in to Provider", "href": "https://example.com/magic?t=abc"}
+    ]
+
+def test_get_email_plain_only_has_empty_links():
+    client = make_client()
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [],
+            "body": {"data": _b64("just text, no html part")},
+        },
+    }
+    result = client.get_email("msg1")
+    assert result["links"] == []
+
+def test_get_email_html_only_falls_back_to_html_body():
+    client = make_client()
+    html = '<html><body><a href="https://example.com/confirm">Confirm</a></body></html>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [],
+            "body": {"data": _b64(html)},
+        },
+    }
+    result = client.get_email("msg1")
+    assert "https://example.com/confirm" in result["body"]
+    assert result["links"] == [{"text": "Confirm", "href": "https://example.com/confirm"}]
+
+def test_get_email_links_found_in_nested_multipart():
+    client = make_client()
+    html = '<div><a href="https://example.com/unsub">Unsubscribe</a></div>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [],
+            "parts": [
+                _alternative_payload("plain body", html),
+                {"mimeType": "application/pdf", "filename": "a.pdf",
+                 "body": {"attachmentId": "att1", "size": 10}},
+            ],
+        },
+    }
+    result = client.get_email("msg1")
+    assert result["body"] == "plain body"
+    assert result["links"] == [{"text": "Unsubscribe", "href": "https://example.com/unsub"}]
+
+def test_get_email_links_skip_anchors_without_href():
+    client = make_client()
+    html = '<a name="top">Anchor</a><a href="">Empty</a><a href="https://x.example/a">Real</a>'
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1",
+        "payload": _alternative_payload("body", html),
+    }
+    result = client.get_email("msg1")
+    assert result["links"] == [{"text": "Real", "href": "https://x.example/a"}]
+
+def test_get_thread_messages_include_links():
+    client = make_client()
+    html = '<a href="https://example.com/verify">Verify</a>'
+    msg = {
+        "id": "msg1", "threadId": "thr1", "labelIds": [],
+        "payload": _alternative_payload("Verify", html),
+    }
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {"messages": [msg]}
+    result = client.get_thread("thr1")
+    assert result["messages"][0]["links"] == [
+        {"text": "Verify", "href": "https://example.com/verify"}
+    ]
+
+
 # --- manage_email ---
 
 def test_manage_archive_calls_modify():

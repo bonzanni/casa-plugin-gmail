@@ -96,6 +96,7 @@ Use these tools when the user asks to check, search, or read email; send or repl
 ### Tool Sequence Rules
 
 - **Before `get_email`:** always call `search_emails` first — never construct a message_id
+- **Acting on a link in a message** (sign-in, confirmation, unsubscribe): take the URL from the `links` field (`{text, href}` pairs from the HTML part) returned by `get_email`/`get_thread` — the plain-text `body` often shows only the link's anchor text, not its target
 - **Before `reply_to_thread`:** always call `get_thread` to read full context; if `truncated: true`, retry with a higher `max_messages` value to load more history before replying; if still truncated, tell the user how many messages are loaded vs. total
 - **Before `download_attachment`:** always call `list_attachments` first to identify the specific file
 - **Before any send/reply:** summarise to the user (recipient, subject/display_subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows

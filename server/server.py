@@ -435,14 +435,14 @@ def search_emails(query: str, max_results: int = 20) -> str:
 
 @mcp.tool()
 def get_email(message_id: str) -> str:
-    """Get full email content including headers, body, and attachment list."""
+    """Get full email content including headers, body, links, and attachment list. links is the list of {text, href} pairs from the HTML part — use href when asked to act on a link (sign-in, confirmation, unsubscribe); the plain-text body often omits the target URL."""
     _require_auth()
     return _ok(_client.get_email(message_id))
 
 
 @mcp.tool()
 def get_thread(thread_id: str, max_messages: int = 20) -> str:
-    """Get all messages in an email thread (oldest first). Includes truncated/total_messages fields."""
+    """Get all messages in an email thread (oldest first). Includes truncated/total_messages fields; each message carries a links list of {text, href} pairs from its HTML part."""
     _require_auth()
     return _ok(_client.get_thread(thread_id, max_messages))
 

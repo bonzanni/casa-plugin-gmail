@@ -2,6 +2,7 @@ import base64
 import os
 from datetime import timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any
 
 from googleapiclient.discovery import build
@@ -37,20 +38,72 @@ def _get_header(headers: list[dict], name: str) -> str:
     return ""
 
 
-def _extract_body(payload: dict) -> str:
-    mime = payload.get("mimeType", "")
-    if mime == "text/plain":
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            missing = (4 - len(data) % 4) % 4
-            return base64.urlsafe_b64decode(data + "=" * missing).decode("utf-8", errors="replace")
+def _decode_part_data(data: str) -> str:
+    if not data:
         return ""
+    missing = (4 - len(data) % 4) % 4
+    return base64.urlsafe_b64decode(data + "=" * missing).decode("utf-8", errors="replace")
+
+
+def _extract_part(payload: dict, mime_type: str) -> str:
+    mime = payload.get("mimeType", "")
+    if mime == mime_type:
+        return _decode_part_data(payload.get("body", {}).get("data", ""))
     if mime.startswith("multipart/"):
         for part in payload.get("parts", []):
-            body = _extract_body(part)
+            body = _extract_part(part, mime_type)
             if body:
                 return body
     return ""
+
+
+def _extract_body(payload: dict) -> str:
+    return _extract_part(payload, "text/plain")
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[dict] = []
+        self._href: str | None = None
+        self._text_parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self._href = href
+                self._text_parts = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            text = " ".join("".join(self._text_parts).split())
+            self.links.append({"text": text, "href": self._href})
+            self._href = None
+            self._text_parts = []
+
+
+def _extract_links(html: str) -> list[dict]:
+    parser = _LinkParser()
+    parser.feed(html)
+    return parser.links
+
+
+def _body_and_links(payload: dict) -> dict:
+    """Body plus link targets from the HTML part (issue #1).
+
+    Plain text stays the body; HTML-only mail falls back to the raw HTML
+    so the body is never empty when content exists.
+    """
+    body = _extract_body(payload)
+    html = _extract_part(payload, "text/html")
+    if not body and html:
+        body = html
+    return {"body": body, "links": _extract_links(html) if html else []}
 
 
 def _extract_attachments(payload: dict) -> list[dict]:
@@ -143,7 +196,7 @@ class GmailClient:
                 "date": _parse_date(_get_header(headers, "Date")),
                 "subject": _get_header(headers, "Subject") or "(no subject)",
             },
-            "body": _extract_body(detail.get("payload", {})),
+            **_body_and_links(detail.get("payload", {})),
             "attachments": _extract_attachments(detail.get("payload", {})),
         }
 
@@ -175,7 +228,7 @@ class GmailClient:
                     "date": _parse_date(_get_header(headers, "Date")),
                     "subject": _get_header(headers, "Subject") or "(no subject)",
                 },
-                "body": _extract_body(msg.get("payload", {})),
+                **_body_and_links(msg.get("payload", {})),
                 "attachments": _extract_attachments(msg.get("payload", {})),
             })
         return {"messages": messages, "truncated": truncated, "total_messages": total}
