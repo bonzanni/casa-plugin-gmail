@@ -46,8 +46,10 @@ def _decode_part_data(data: str) -> str:
 
 
 def _extract_part(payload: dict, mime_type: str) -> str:
-    if payload.get("filename") and payload.get("body", {}).get("attachmentId"):
-        return ""  # a real attachment (same rule as _extract_attachments), never the body
+    if payload.get("filename"):
+        # Gmail's contract: filename is present only on attachment parts
+        # (attachmentId absent just means the content is inline). Never the body.
+        return ""
     # Strip Content-Type parameters ("text/html; charset=utf-8") before matching.
     mime = payload.get("mimeType", "").split(";", 1)[0].strip().lower()
     if mime == mime_type:
