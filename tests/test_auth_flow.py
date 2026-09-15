@@ -111,7 +111,7 @@ def test_start_warns_against_the_chat_clients_embedded_browser():
     tapping the link inside Telegram: Google refuses OAuth in an embedded
     browser, so no callback ever arrives. SKILL.md tells the agent to say this,
     but the warning must also travel with the link itself — these `instructions`
-    reach the user through both `gmail_auth_start` and an unprompted `setup_gmail`.
+    reach the user through `setup_gmail`, prompted or unprompted.
     """
     from auth_flow import start
     cb, auth = MagicMock(), MagicMock()
@@ -388,7 +388,7 @@ def _real_auth(tmp_path, monkeypatch, **env):
 
 def test_startup_recover_reads_env_even_when_the_lock_is_contended(tmp_path, monkeypatch):
     """Two overlapping server processes are the only reason the lock exists. The
-    loser must still be configured: without the env, gmail_auth_start emits
+    loser must still be configured: without the env, setup_gmail emits
     client_id=None and gmail_auth_collect crashes on the account comparison."""
     from auth_flow import collect_lock, startup_recover
     auth = _real_auth(tmp_path, monkeypatch)

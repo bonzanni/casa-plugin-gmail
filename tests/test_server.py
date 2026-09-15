@@ -94,27 +94,14 @@ def test_unauthenticated_tools_raise(monkeypatch):
         server.search_emails("from:me")
 
 
-def test_gmail_auth_start_returns_url_and_redirect_uri(monkeypatch):
+def test_gmail_auth_start_is_gone_and_setup_gmail_is_the_only_minter():
+    """0.7.0: under casa's result contract a non-setup tool has no way to
+    hand an authorization link to the operator, so the direct-request
+    minter was removed and connect/reconnect goes through setup_gmail."""
     import server
-    monkeypatch.setattr(server, "_flow_start", lambda auth, cb: {
-        "auth_url": "https://accounts.google.com/o?state=s",
-        "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
-        "instructions": "open it",
-    })
-    result = json.loads(server.gmail_auth_start())
-    assert result["auth_url"].startswith("https://accounts.google.com/")
-    assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
-
-
-def test_gmail_auth_start_surfaces_callback_unavailable(monkeypatch):
-    import server
-    from casa_callback import CallbackUnavailable
-
-    def boom(auth, cb):
-        raise CallbackUnavailable("route not open: callback_no_target ...")
-    monkeypatch.setattr(server, "_flow_start", boom)
-    with pytest.raises(Exception, match="callback_no_target"):
-        server.gmail_auth_start()
+    assert not hasattr(server, "gmail_auth_start")
+    with pytest.raises(ValueError, match="Call setup_gmail"):
+        server._require_auth()
 
 
 def test_gmail_auth_collect_reports_and_rebuilds_clients(monkeypatch):
@@ -273,10 +260,8 @@ def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
 
 def test_manifest_result_contract_entries_are_all_safe():
     """Every entry is exactly {"result": "safe"}: no tool deposits a
-    capability with Casa's broker, so none may claim to. gmail_auth_start's
-    entry is PROVISIONAL — it returns an authorization link, and how such a
-    link should reach the operator under the contract is the operator's
-    open decision (issue #2)."""
+    capability with Casa's broker, so none may claim to. The only tool that
+    returns an authorization link is setup_gmail, which is exempt."""
     tools = _manifest()["casa"]["resultContract"]["tools"]
     assert all(entry == {"result": "safe"} for entry in tools.values())
 
@@ -891,8 +876,8 @@ def test_setup_gmail_does_not_claim_connected_when_activation_fails(monkeypatch)
 
 def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatch):
     """Casa dispatched this unprompted, so a raise reaches the operator as a
-    bare tool error explaining nothing. Unlike gmail_auth_start — which answers
-    a direct request and may raise — this returns the reason as its result."""
+    bare tool error explaining nothing, and since 0.7.0 it is the only tool
+    that mints a link — so this returns the reason as its result."""
     import server
     from casa_callback import CallbackUnavailable
 

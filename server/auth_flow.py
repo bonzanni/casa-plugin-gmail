@@ -240,7 +240,7 @@ def startup_recover(auth, cb) -> str:
     The env read is hoisted OUT of the lock. It touches no store state, so the
     "env validation, active-token loading and staged recovery are one unit"
     rule is untouched — but a contended lock must not leave the process with no
-    client id and no subject email, which would make gmail_auth_start emit
+    client id and no subject email, which would make setup_gmail emit
     `client_id=None` and gmail_auth_collect fail on the account comparison.
     """
     auth.read_env()
@@ -338,7 +338,10 @@ def collect_pass(auth, cb) -> dict:
         out["messages"].append(
             "No authorization result was waiting — nothing was collected. This "
             "does NOT confirm that Gmail authorization succeeded. If you were "
-            "expecting a result, run gmail_auth_start and follow the link again."
+            "expecting a result, open the link you were already given and "
+            "complete it; if that link is gone, run setup_gmail — it reports "
+            "already_pending until the outstanding link expires, and mints a "
+            "fresh one after that."
         )
     return out
 

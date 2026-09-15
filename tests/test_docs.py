@@ -23,6 +23,10 @@ def _read(*parts):
 README = "README.md"
 
 _CASA_SECTION = "### 3. Configure the casa deployment"
+# The one step (3.5) whose preferred redirect-URI discovery route calls the
+# setup tool; `setup_gmail` itself also appears in step 3.4, so it cannot
+# serve as the step marker.
+_DISCOVERY_ROUTE = "**Preferred:** ask the agent to connect Gmail"
 
 
 def _casa_steps():
@@ -83,7 +87,7 @@ def test_every_quoted_diagnostic_matches_its_source():
         ("server/auth.py", "stored token is dead — re-auth needed"),
         ("server/auth.py", "the stored credential authorizes "),
         ("server/auth.py", "could not refresh right now "),
-        ("server/server.py", "Gmail is not authenticated. Call gmail_auth_start"),
+        ("server/server.py", "Gmail is not authenticated. Call setup_gmail"),
         ("server/auth_flow.py",
          "Authorization was not granted ({error}). Nothing has changed."),
         ("server/auth_flow.py", "That authorization was granted by "),
@@ -99,11 +103,11 @@ def test_every_quoted_diagnostic_matches_its_source():
 # ── Round 2: a step cannot depend on configuration a later step performs ───
 
 def test_the_env_vars_are_configured_before_the_tool_that_needs_them():
-    """The redirect URI is discovered by calling `gmail_auth_start`, and the
+    """The redirect URI is discovered by calling `setup_gmail`, and the
     server exits in `read_env()` unless all three variables are set. A reader
     following the numbered steps in order must have set them first."""
     env_step = _step_number("GMAIL_CLIENT_SECRET")
-    discovery_step = _step_number("gmail_auth_start")
+    discovery_step = _step_number(_DISCOVERY_ROUTE)
     assert env_step < discovery_step, (
         "the tool-based redirect-URI discovery route cannot run before the "
         "step that sets the environment it needs"
@@ -122,7 +126,7 @@ def test_the_env_vars_the_readme_names_are_the_ones_the_server_demands():
 
 
 def test_the_host_side_route_is_the_one_that_needs_no_running_server():
-    step = _casa_steps()[_step_number("gmail_auth_start") - 1]
+    step = _casa_steps()[_step_number(_DISCOVERY_ROUTE) - 1]
     assert "without a running server" in step
 
 
@@ -253,7 +257,7 @@ def test_readme_documents_the_automatic_setup_dispatch():
     text = _read(README)
     assert "dispatches `setup_gmail` automatically" in text
     assert "without being asked" in text
-    assert "gmail_auth_start" in text          # manual fallback still documented
+    assert "ask the agent to connect Gmail and it will call `setup_gmail`" in text
 
 
 def test_skill_tells_the_agent_already_connected_is_not_a_new_authorization():
@@ -363,13 +367,24 @@ def test_the_readme_no_longer_calls_re_running_setup_always_safe():
     assert "_cb.pending_mint_times()" in _read("server", "server.py")
 
 
-def test_the_redirect_uri_step_warns_that_asking_for_a_link_mints_another():
-    """Step 3.5's preferred route asks the agent to call `gmail_auth_start`, which
-    answers a direct request and always mints — so following it after automatic
-    setup has already posted a link leaves two live authorizations. The
-    setup-tool guard cannot prevent that; the reader has to know."""
-    step = _casa_steps()[_step_number("gmail_auth_start") - 1]
-    assert "always mints a fresh link" in step
+def test_the_redirect_uri_step_says_a_second_ask_does_not_mint_another():
+    """Step 3.5's preferred route asks the agent to call `setup_gmail`, which
+    reports `already_pending` rather than minting while a link is outstanding
+    — so a reader who already has a link in chat must be told to use that one
+    (it carries the same redirect_uri), not to wait for a second."""
+    step = _casa_steps()[_step_number(_DISCOVERY_ROUTE) - 1]
+    assert "already_pending" in step
+    assert "always mints a fresh link" not in step
+
+
+def test_no_artifact_still_names_the_removed_direct_minter():
+    """0.7.0 removed gmail_auth_start. A dangling mention in the skill, the
+    README or the server would send the agent or the reader to a tool casa
+    would refuse as undeclared."""
+    for parts in (("README.md",), ("skills", "gmail", "SKILL.md"),
+                  ("server", "server.py"), ("server", "auth_flow.py"),
+                  (".claude-plugin", "plugin.json")):
+        assert "gmail_auth_start" not in _read(*parts), "/".join(parts)
 
 
 def test_the_skill_quotes_the_status_the_setup_tool_actually_returns():

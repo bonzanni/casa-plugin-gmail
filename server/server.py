@@ -81,7 +81,7 @@ def _startup():
 def _require_auth() -> None:
     if not _authenticated:
         raise ValueError(
-            "Gmail is not authenticated. Call gmail_auth_start to get an "
+            "Gmail is not authenticated. Call setup_gmail to get an "
             "authorization link; after you grant access I'll be notified and "
             "will finish setup with gmail_auth_collect."
         )
@@ -102,12 +102,6 @@ def _ok(data) -> str:
 
 
 # ── OAuth setup ────────────────────────────────────────────────────────────
-
-@mcp.tool()
-def gmail_auth_start() -> str:
-    """Begin Gmail OAuth: returns a link to open in a browser. After you grant access the browser shows a confirmation page and the setup completes automatically — nothing to copy back."""
-    return _ok(_flow_start(_auth, _cb))
-
 
 def _stored_credential():
     """The DURABLE credential for the configured subject, or None.
@@ -292,8 +286,10 @@ def setup_gmail() -> str:
     #    _stored_credential_failure.
     #  * It must not raise when the callback route is closed. Nobody asked for
     #    this call, so an exception surfaces to the operator as a bare tool
-    #    error explaining nothing. gmail_auth_start deliberately still raises:
-    #    it answers a direct request, where a raise is the honest answer.
+    #    error explaining nothing. This is also the only tool that mints a
+    #    link (0.7.0 removed the direct-request minter: under casa's result
+    #    contract a non-setup tool cannot hand a link to the operator), so a closed
+    #    route must be reported as a result the operator can act on.
     #  * A re-dispatch must not mint a SECOND authorization. `_authenticated`
     #    is still false while the first link is outstanding, so minting again
     #    would produce a second independent state and a second live link —

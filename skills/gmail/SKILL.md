@@ -11,7 +11,10 @@ description: Use when the user asks the agent to read, search, send, reply to, o
 the result expires 900 seconds after it lands. `gmail_auth_collect` takes no arguments
 and is safe to call repeatedly.
 
-To connect or reconnect Gmail, call `gmail_auth_start` and give the user the `auth_url`.
+To connect or reconnect Gmail, call `setup_gmail` with **no arguments** and give the user the
+`auth_url` it returns. It is the only tool that mints a link, and it mints one only when one is
+needed: while a link it minted is still outstanding it reports `already_pending` instead of a
+second link (see below).
 Tell them the browser will show "Response received" and that nothing needs copying back.
 
 **Whenever you give the user an `auth_url`, tell them to open it in a real browser rather
@@ -47,9 +50,9 @@ update (casa's generic hand-back says this for every plugin that ships a setup t
 which this one does not. And do not ask the user whether to run setup: the call is argument-free,
 idempotent, needs no approval, and is the only thing that knows the answer.
 
-Call `setup_gmail` with **no arguments** and report *its* verdict. Relay its output exactly
-as you would `gmail_auth_start`'s: an `auth_url` gets the same "open it in a real browser"
-and "Response received" wording. Its other results are not links:
+Call `setup_gmail` with **no arguments** and report *its* verdict. An `auth_url` gets the
+"open it in a real browser" and "Response received" wording above. Its other results are
+not links:
 
 - `status` of `already_connected` → Gmail is already connected as the named `account`
   and nothing was changed — including by the update, if that is what prompted the call.
@@ -84,8 +87,8 @@ replayed link, so **chat is the only place the user learns the real outcome**:
 - Authorization denied → say so plainly. Do not imply it worked.
 - Wrong Google account → report it as a failure, and say the existing connection is
   untouched.
-- `redirect_uri_mismatch` from Google → give them the `redirect_uri` value returned by
-  `gmail_auth_start` and say it must be registered on the OAuth client exactly.
+- `redirect_uri_mismatch` from Google → give them the `redirect_uri` value that `setup_gmail`
+  returned beside the `auth_url` and say it must be registered on the OAuth client exactly.
 - `status: "retry_later"` → a transient problem; tell them you'll finish shortly and do
   not start a second authorization.
 
