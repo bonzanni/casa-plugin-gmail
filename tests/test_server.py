@@ -240,7 +240,50 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.6.1"
+    assert manifest["version"] == "0.7.0"
+
+
+# ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
+
+def _registered_tool_names():
+    import asyncio
+    import server
+    return {t.name for t in asyncio.run(server.mcp.list_tools())}
+
+
+def test_manifest_result_contract_has_exactly_version_and_tools():
+    """Casa's validator (plugin_store.manifest_result_contract) refuses any
+    member other than version/tools, and a refused declaration blocks
+    install/update outright — worse than declaring nothing."""
+    contract = _manifest()["casa"]["resultContract"]
+    assert set(contract) == {"version", "tools"}
+    assert contract["version"] == 1
+
+
+def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
+    """`tools` is exhaustive: a served tool absent from it is refused before
+    it runs, silently from the plugin's point of view. The setup tool is
+    exempt and is deliberately not listed."""
+    manifest = _manifest()
+    declared = set(manifest["casa"]["resultContract"]["tools"])
+    served = _registered_tool_names()
+    assert manifest["casa"]["setupTool"] in served
+    assert declared == served - {manifest["casa"]["setupTool"]}
+
+
+def test_manifest_result_contract_entries_are_all_safe():
+    """Every entry is exactly {"result": "safe"}: no tool deposits a
+    capability with Casa's broker, so none may claim to. gmail_auth_start's
+    entry is PROVISIONAL — it returns an authorization link, and how such a
+    link should reach the operator under the contract is the operator's
+    open decision (issue #2)."""
+    tools = _manifest()["casa"]["resultContract"]["tools"]
+    assert all(entry == {"result": "safe"} for entry in tools.values())
+
+
+def test_every_protected_tool_is_a_served_tool():
+    names = [t["name"] for t in _manifest()["casa"]["protectedTools"]]
+    assert set(names) <= _registered_tool_names()
 
 
 # ── v0.5.1: casa.setupTool — the hand-back the consent gate was missing ────

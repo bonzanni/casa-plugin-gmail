@@ -191,6 +191,12 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 | `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user's approval) |
 | `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user's approval) |
 
+Every tool except `setup_gmail` is declared `{"result": "safe"}` in `casa.resultContract`
+(Casa >= 0.290.0): Casa refuses, before it runs, any tool missing from that declaration, so
+a new tool must be added there too. `gmail_auth_start`'s entry is provisional — it returns an
+authorization link, and how such a link should reach the operator under the contract is the
+operator's open decision on issue #2.
+
 ⚠️ Protected tools — require tap-approval from the user before execution.
 
 > **SendAs note:** Only aliases with `verification_status: accepted` can be used as `from_address`. Unverified aliases will be rejected by Gmail.

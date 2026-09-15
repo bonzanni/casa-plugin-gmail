@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -13,6 +13,23 @@
     "protectedTools": [
       {"name": "send_email", "summary": "Send email to {to}: {subject}"},
       {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"}
-    ]
+    ],
+    "resultContract": {
+      "version": 1,
+      "tools": {
+        "gmail_auth_start": {"result": "safe"},
+        "gmail_auth_collect": {"result": "safe"},
+        "search_emails": {"result": "safe"},
+        "get_email": {"result": "safe"},
+        "get_thread": {"result": "safe"},
+        "manage_email": {"result": "safe"},
+        "list_attachments": {"result": "safe"},
+        "download_attachment": {"result": "safe"},
+        "save_attachment": {"result": "safe"},
+        "list_send_as": {"result": "safe"},
+        "send_email": {"result": "safe"},
+        "reply_to_thread": {"result": "safe"}
+      }
+    }
   }
 }
