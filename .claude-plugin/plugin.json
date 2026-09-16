@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -17,6 +17,8 @@
     "resultContract": {
       "version": 1,
       "tools": {
+        "setup_gmail": {"result": "capability", "provides": ["auth_url"],
+                        "delivers": {"auth_url": "operator_link"}},
         "gmail_auth_collect": {"result": "safe"},
         "search_emails": {"result": "safe"},
         "get_email": {"result": "safe"},

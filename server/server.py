@@ -13,6 +13,7 @@ from auth_flow import collect_pass as _flow_collect
 from auth_flow import start as _flow_start
 from auth_flow import startup_recover as _flow_startup
 from casa_callback import CallbackUnavailable, CasaCallback
+import casa_broker
 
 PLUGIN_DATA = os.environ.get("CLAUDE_PLUGIN_DATA", "/tmp/gmail-plugin-data")
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(
@@ -99,6 +100,28 @@ def _validate_paths(paths: list[str]) -> None:
 
 def _ok(data) -> str:
     return json.dumps(data)
+
+
+# ── The sign-in link: delivered by Casa, never returned ───────────────────
+#
+# `setup_gmail` is declared in casa.resultContract as a capability that
+# provides `auth_url` and `delivers` it as an `operator_link` (Casa >=
+# 0.318.0, ha-casa-app#1015). The link is deposited with Casa's broker and the
+# result carries only Casa's reference in `auth_url`; Casa posts the link in
+# the user's chat itself, labelled and captioned as below, and replaces the
+# result with a receipt when it arrived. A result that made no link carries
+# `auth_url: null`, which Casa >= 0.319.0 passes on unchanged.
+
+AUTH_SLOT = "auth_url"
+LINK_LABEL = "Sign in with Google"
+LINK_CAPTION = ("Open in a real browser, not the chat app's \u2014 Google refuses "
+                "sign-in there. Casa is told when you finish.")
+_deposit_link = casa_broker.deposit_link     # test seam
+
+
+def _no_link(**fields) -> str:
+    """A `setup_gmail` result that made no link this time."""
+    return _ok({AUTH_SLOT: None, **fields})
 
 
 # ── OAuth setup ────────────────────────────────────────────────────────────
@@ -267,7 +290,7 @@ def _outstanding_authorization(now: float | None = None) -> bool:
 
 @mcp.tool()
 def setup_gmail() -> str:
-    """Connect Gmail: returns an authorization link to open in a browser, or reports that Gmail is already connected. Takes no arguments and is safe to run repeatedly."""
+    """Connect Gmail: hands an authorization link to Casa, which posts it in the user's chat (the result carries only Casa's reference, in auth_url), or reports why no link was needed, with auth_url null. Takes no arguments and is safe to run repeatedly."""
     # Casa auto-runs this once the plugin's trigger-consent episode settles with
     # an approval (plugin_store.manifest_setup_tool), dispatching it to the
     # agent with no arguments. Three consequences shape the body:
@@ -310,7 +333,7 @@ def setup_gmail() -> str:
             # would be true of the store and false of every Gmail tool.
             blocked = _bring_into_service(stored)
             if blocked is not None:
-                return _ok({
+                return _no_link(**{
                     "status": "unavailable",
                     "account": stored.account,
                     "instructions": (
@@ -322,7 +345,7 @@ def setup_gmail() -> str:
                         "restart the plugin, once that is resolved."
                     ),
                 })
-            return _ok({
+            return _no_link(**{
                 "status": "already_connected",
                 "account": stored.account,
                 "instructions": (
@@ -339,7 +362,7 @@ def setup_gmail() -> str:
         if kind == "retryable":
             # Transient: the credential is presumed good and is untouched.
             # Minting here would start a re-authorization nobody needs.
-            return _ok({
+            return _no_link(**{
                 "status": "retry_later",
                 "account": stored.account,
                 "instructions": (
@@ -356,7 +379,7 @@ def setup_gmail() -> str:
             # doubly wrong: the stored credential does not need replacing, and
             # the new flow could not complete anyway — its code exchange uses
             # the same rejected client. Name the problem instead.
-            return _ok({
+            return _no_link(**{
                 "status": "configuration_error",
                 "account": stored.account,
                 "instructions": (
@@ -382,32 +405,56 @@ def setup_gmail() -> str:
 
     try:
         if _outstanding_authorization():
-            return _ok({
+            return _no_link(**{
                 "status": "already_pending",
                 "instructions": (
-                    "An authorization link for Gmail was already sent and is "
-                    "still valid — no new link has been created, because a "
-                    "second one would leave two live authorizations. Ask "
-                    "the user to use the link from that earlier message. If they "
-                    "no longer has it, run setup_gmail again once that link "
-                    "expires and a fresh one will be minted."
+                    "An authorization link for Gmail was already created and "
+                    "handed to Casa, and it is still outstanding — no new link "
+                    "has been created, because a second one would leave two "
+                    "live authorizations. If the user has that link, they "
+                    "should use it. If they never received it or no longer "
+                    "have it, run setup_gmail again once it expires (30 "
+                    "minutes after it was created) and a fresh one will be "
+                    "made."
                 ),
             })
         result = _flow_start(_auth, _cb)
     except CallbackUnavailable as exc:
-        return _ok({
+        return _no_link(**{
             "status": "unavailable",
             "instructions": (
                 f"Gmail could not be connected yet: {exc} Nothing has been "
                 "authorized. Once that is resolved, run setup_gmail again."
             ),
         })
+    try:
+        reference = _deposit_link(AUTH_SLOT, result[AUTH_SLOT],
+                                  label=LINK_LABEL, caption=LINK_CAPTION)
+    except casa_broker.DepositFailed as exc:
+        # The state is minted and stays outstanding in Casa's spool, so the
+        # next call reports `already_pending` until it expires. Said here, so
+        # nobody is told to wait for a link that never left.
+        return _no_link(
+            status="link_not_handed_over",
+            redirect_uri=result["redirect_uri"],
+            instructions=(
+                "An authorization link for Gmail was created, but Casa did "
+                f"not accept it for delivery ({exc.code}), so this call put no "
+                "link in front of the user. It stays outstanding for 30 "
+                "minutes, and until then setup_gmail reports it as pending "
+                "instead of making another; run setup_gmail again after "
+                "that." + (
+                    f" The stored Gmail connection is no longer valid "
+                    f"({dead_credential}), so it does need authorizing again."
+                    if dead_credential is not None else "")),
+        )
+    result[AUTH_SLOT] = reference
     if dead_credential is not None:
         result["status"] = "reauthorization_needed"
         result["instructions"] = (
             f"The stored Gmail connection is no longer valid "
-            f"({dead_credential}), so it must be authorized again — this link "
-            f"does that. {result['instructions']}"
+            f"({dead_credential}), so it must be authorized again — the link "
+            f"handed to Casa does that. {result['instructions']}"
         )
     return _ok(result)
 

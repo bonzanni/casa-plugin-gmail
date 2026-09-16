@@ -105,16 +105,19 @@ def start(auth, cb) -> dict:
     return {
         "auth_url": auth.build_auth_url(route.redirect_uri, state),
         "redirect_uri": route.redirect_uri,
-        # The warning leads, because on a phone the link is tapped before the
-        # rest is read. Its failure is the one this flow cannot see: Google
+        # Delivery-neutral: `setup_gmail` hands `auth_url` to Casa, which posts
+        # it and alone can say whether it arrived. The browser warning still
+        # travels with it. Its failure is the one this flow cannot see: Google
         # refuses OAuth inside an embedded browser, so no callback ever arrives
         # and there is nothing to collect or report.
         "instructions": (
-            "Open auth_url in a real browser — not Telegram's or another chat "
-            "app's built-in browser, which Google refuses to run OAuth sign-in "
-            "in; long-press the link and choose 'Open in Chrome'/'Open in "
+            "An authorization link for the user was handed to Casa, which "
+            "reports whether it reached their chat. It must be opened in a "
+            "real browser — not Telegram's or another chat app's built-in "
+            "browser, which Google refuses to run OAuth sign-in in; "
+            "long-press the link and choose 'Open in Chrome'/'Open in "
             "Safari', or copy it across. Then grant access. When the browser "
-            "shows 'Response received', you're done — I'll be notified "
+            "shows 'Response received', the user is done — I'll be notified "
             "automatically and will finish the setup. If Google reports "
             "redirect_uri_mismatch, register the redirect_uri above with the "
             "OAuth client."

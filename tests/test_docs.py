@@ -285,13 +285,21 @@ def test_the_skill_tells_the_agent_to_send_the_operator_to_a_real_browser():
     assert "Google refuses OAuth sign-in" in text
 
 
-def test_the_skill_puts_the_browser_warning_before_the_link_not_after():
-    """On a phone the operator taps the link before reading whatever follows
-    it, so the instruction only works if it comes first. This pins the
-    placement rule, not the rationale already pinned above."""
-    text = _read("skills", "gmail", "SKILL.md")
-    assert "before the link" in text
-    assert "never after" in text
+def test_the_skill_says_casa_posts_the_link_and_the_receipt_is_the_only_claim():
+    """ha-casa-app#1015: the agent no longer composes the link message — casa
+    posts it (with the browser note as its caption) and replaces the result
+    with a receipt. So the old "put the warning before the link" placement
+    rule has nothing to place; what must hold instead is that the agent never
+    writes the link, claims delivery only on the receipt, and still repeats the
+    browser warning."""
+    text = " ".join(_read("skills", "gmail", "SKILL.md").split())
+    assert "You never hold the link and you never send it." in text
+    assert "casa, which posts it in the user's chat itself" in text
+    assert "`casa_delivery` with `status` equal to `delivered`" in text
+    assert "means the link is unconfirmed" in text
+    assert "When `auth_url` is `null`, `setup_gmail` made no link" in text
+    assert "do not write out a Google URL" in text
+    assert "even though casa's message carries the same note" in text
 
 
 def test_the_skill_names_the_signature_and_the_remedy():
@@ -345,6 +353,7 @@ def test_the_skill_covers_every_status_the_setup_tool_can_return():
     source = _read("server", "server.py")
     skill = _read("skills", "gmail", "SKILL.md")
     emitted = set(re.findall(r'"status": "(\w+)"', source))
+    emitted |= set(re.findall(r'status="(\w+)"', source))
     emitted |= set(re.findall(r'result\["status"\] = "(\w+)"', source))
     for status in emitted:
         assert f"`{status}`" in skill, \

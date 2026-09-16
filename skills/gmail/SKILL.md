@@ -11,21 +11,28 @@ description: Use when the user asks the agent to read, search, send, reply to, o
 the result expires 900 seconds after it lands. `gmail_auth_collect` takes no arguments
 and is safe to call repeatedly.
 
-To connect or reconnect Gmail, call `setup_gmail` with **no arguments** and give the user the
-`auth_url` it returns. It is the only tool that mints a link, and it mints one only when one is
-needed: while a link it minted is still outstanding it reports `already_pending` instead of a
-second link (see below).
-Tell them the browser will show "Response received" and that nothing needs copying back.
+To connect or reconnect Gmail, call `setup_gmail` with **no arguments**. It is the only tool
+that mints a link, and it mints one only when one is needed: while a link it minted is still
+outstanding it reports `already_pending` instead of a second link (see below).
 
-**Whenever you give the user an `auth_url`, tell them to open it in a real browser rather
-than tapping it here — Google refuses OAuth sign-in inside a chat app's built-in
-browser.** Say it every time, in one short clause ("open this in Chrome/Safari rather
-than tapping it — Google blocks sign-in inside the chat app's browser"), and put that
-clause **before the link** in your message, never after — on a phone they tap the link
-before they finish reading whatever comes next, so the link must come last. Without that
-line the flow fails silently on their phone: they sign in, Google shows a generic
-**"Something went wrong"** page, the consent screen never appears and nothing is ever
-redirected back, so no result arrives and there is nothing for you to collect.
+**You never hold the link and you never send it.** `setup_gmail` hands it to casa, which posts
+it in the user's chat itself, as a "Sign in with Google" link with a one-line note to open it in
+a real browser. The `auth_url` field in the result is casa's reference to that link, never the
+link: do not quote it, and do not write out a Google URL. The link counts as delivered only when
+the result carries `casa_delivery` with `status` equal to `delivered`; a result without that
+receipt, or one casa withheld, means the link is unconfirmed — say so, tell the user a link
+message that arrived just now is valid, and otherwise to ask again. When `auth_url` is `null`,
+`setup_gmail` made no link: report what its `status` and `instructions` say, not an unconfirmed
+link. Tell them the browser will show "Response received" and that nothing needs copying back.
+
+**Whenever a link was handed over, tell the user to open it in a real browser rather than
+tapping it — Google refuses OAuth sign-in inside a chat app's built-in browser.** Say it
+every time, in one short clause ("open it in Chrome/Safari rather than tapping it — Google
+blocks sign-in inside the chat app's browser"), even though casa's message carries the same
+note: on a phone they tap the link before they finish reading. Without that line the flow
+fails silently on their phone: they sign in, Google shows a generic **"Something went
+wrong"** page, the consent screen never appears and nothing is ever redirected back, so no
+result arrives and there is nothing for you to collect.
 
 If they report "Something went wrong" **after signing in**, that is the signature of
 this. The fix is to reopen the *same* link in a proper browser (long-press → *Open in
@@ -50,19 +57,24 @@ update (casa's generic hand-back says this for every plugin that ships a setup t
 which this one does not. And do not ask the user whether to run setup: the call is argument-free,
 idempotent, needs no approval, and is the only thing that knows the answer.
 
-Call `setup_gmail` with **no arguments** and report *its* verdict. An `auth_url` gets the
-"open it in a real browser" and "Response received" wording above. Its other results are
-not links:
+Call `setup_gmail` with **no arguments** and report *its* verdict. A link handed over (a
+reference in `auth_url`) gets the delivery, "open it in a real browser" and "Response
+received" wording above. Its other results have `auth_url` `null` and are not links:
 
 - `status` of `already_connected` → Gmail is already connected as the named `account`
   and nothing was changed — including by the update, if that is what prompted the call.
   Say that plainly, and do not offer a link — it is not a new connection, so
   **do not report it as a new authorization**, and do not call it a restored one either.
-- `status` of `already_pending` → a valid authorization link was already sent and is
-  still good, so no second one was created. Point the user back to the earlier message
-  rather than asking for a new link; do not call the tool again to get one.
-- `status` of `reauthorization_needed` → the stored connection was found revoked. The
-  `auth_url` is a genuine link and reconnects Gmail; relay it as one.
+- `status` of `already_pending` → a link was already made and handed to casa and is
+  still outstanding, so no second one was created. If the user has casa's link message,
+  they should use it; do not call the tool again to get one. If it never arrived, it
+  expires 30 minutes after it was made and `setup_gmail` then makes a fresh one.
+- `status` of `reauthorization_needed` → the stored connection was found revoked, and the
+  link handed to casa reconnects Gmail; treat it as a real link, with the delivery wording
+  above.
+- `status` of `link_not_handed_over` → a link was made but casa did not accept it, so
+  none reached the user. Relay the `instructions` — they name the code and say how long
+  until `setup_gmail` can make a fresh one — and do not describe a link as sent.
 - `status` of `configuration_error` → Google rejected the plugin's OAuth **client**
   credentials, not the user's authorization. The stored connection is intact and needs
   no re-authorizing — and a new link could not work anyway, which is why none was
@@ -88,7 +100,7 @@ replayed link, so **chat is the only place the user learns the real outcome**:
 - Wrong Google account → report it as a failure, and say the existing connection is
   untouched.
 - `redirect_uri_mismatch` from Google → give them the `redirect_uri` value that `setup_gmail`
-  returned beside the `auth_url` and say it must be registered on the OAuth client exactly.
+  returned and say it must be registered on the OAuth client exactly.
 - `status: "retry_later"` → a transient problem; tell them you'll finish shortly and do
   not start a second authorization.
 

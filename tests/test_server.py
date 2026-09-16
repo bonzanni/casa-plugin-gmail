@@ -7,6 +7,44 @@ from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
 
+GOOGLE_URL = "https://accounts.google.com/o?state=s"
+_REF_RE = re.compile(r"^casa-cap-[0-9a-f]{32}$")
+
+
+class _Broker:
+    """Casa's deposit route as `server._deposit_link` reaches it: records
+    every deposit, answers with a reference of Casa's shape, or refuses with
+    `refuse`'s code exactly as `casa_broker.deposit_link` raises it."""
+
+    def __init__(self):
+        self.deposits = []
+        self.refuse = None
+
+    def __call__(self, slot, url, *, label, caption):
+        import casa_broker
+        if self.refuse is not None:
+            raise casa_broker.DepositFailed(self.refuse)
+        self.deposits.append((slot, url, label, caption))
+        return "casa-cap-%032x" % len(self.deposits)
+
+
+@pytest.fixture(autouse=True)
+def broker(monkeypatch):
+    import server
+    b = _Broker()
+    monkeypatch.setattr(server, "_deposit_link", b)
+    return b
+
+
+def _assert_handed_over(result):
+    """The link went to Casa intact; the result carries Casa's reference in
+    `auth_url` and not one byte of the URL."""
+    import server
+    broker = server._deposit_link
+    assert broker.deposits and broker.deposits[-1][:2] == ("auth_url", GOOGLE_URL)
+    assert _REF_RE.fullmatch(result["auth_url"])
+    assert "accounts.google.com" not in json.dumps(result)
+
 
 def _setup_authenticated(monkeypatch):
     import server
@@ -227,7 +265,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.7.0"
+    assert manifest["version"] == "0.8.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -255,15 +293,127 @@ def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
     declared = set(manifest["casa"]["resultContract"]["tools"])
     served = _registered_tool_names()
     assert manifest["casa"]["setupTool"] in served
-    assert declared == served - {manifest["casa"]["setupTool"]}
+    # Casa >= 0.318.0 admits the setup tool in the declaration as a capability
+    # that delivers every slot it provides; every other tool must be there too.
+    assert declared == served
 
 
-def test_manifest_result_contract_entries_are_all_safe():
-    """Every entry is exactly {"result": "safe"}: no tool deposits a
-    capability with Casa's broker, so none may claim to. The only tool that
-    returns an authorization link is setup_gmail, which is exempt."""
+def test_manifest_result_contract_entries_are_safe_except_the_sign_in_link():
+    """Every entry but setup_gmail's is exactly {"result": "safe"}. setup_gmail
+    is the one tool that makes a link, and Casa delivers it (ha-casa-app#1015):
+    a capability providing exactly `auth_url`, delivered as an operator link,
+    consuming nothing -- the only capability shape Casa accepts on a setup tool."""
     tools = _manifest()["casa"]["resultContract"]["tools"]
-    assert all(entry == {"result": "safe"} for entry in tools.values())
+    assert tools["setup_gmail"] == {
+        "result": "capability", "provides": ["auth_url"],
+        "delivers": {"auth_url": "operator_link"}}
+    import server
+    assert server.AUTH_SLOT == "auth_url"
+    assert all(entry == {"result": "safe"}
+               for name, entry in tools.items() if name != "setup_gmail")
+
+
+# Casa's acceptance rules for a delivered link's label and caption
+# (result_broker `_text_ok`, `_caption_ok`, `_label_ok`, Casa 0.318.0).
+def _casa_accepts(value, limit, *, label):
+    ok = (isinstance(value, str) and 0 < len(value) <= limit and value.isprintable()
+          and "://" not in value.lower() and "www." not in value.lower())
+    return ok and not (label and re.search(r"\.[A-Za-z]", value))
+
+
+def test_the_link_label_and_caption_are_the_designed_ones_and_casa_accepts_them():
+    import server
+    assert server.LINK_LABEL == "Sign in with Google"
+    assert server.LINK_CAPTION == (
+        "Open in a real browser, not the chat app's \u2014 Google refuses "
+        "sign-in there. Casa is told when you finish.")
+    assert _casa_accepts(server.LINK_LABEL, 40, label=True)
+    assert _casa_accepts(server.LINK_CAPTION, 200, label=False)
+    # Controls: the predicate refuses what Casa refuses.
+    assert not _casa_accepts("Sign in at google.com", 40, label=True)
+    assert not _casa_accepts("x" * 201, 200, label=False)
+    assert not _casa_accepts("see www.x", 200, label=False)
+
+
+def test_a_minted_link_is_deposited_with_the_label_and_caption(monkeypatch, broker):
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch)
+    monkeypatch.setattr(server, "_flow_start", _minting_start([]))
+    result = json.loads(server.setup_gmail())
+    assert broker.deposits == [("auth_url", GOOGLE_URL, server.LINK_LABEL,
+                                server.LINK_CAPTION)]
+    _assert_handed_over(result)
+    assert sorted(result) == ["auth_url", "instructions", "redirect_uri"]
+
+
+def test_a_refused_deposit_is_a_no_link_result_that_says_so(monkeypatch, broker):
+    """No reference, so `auth_url` is null (Casa >= 0.319.0 passes that on);
+    the state stays outstanding in Casa's spool, and the instructions say the
+    link never left rather than pointing at an earlier message."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch)
+    monkeypatch.setattr(server, "_flow_start", _minting_start([]))
+    broker.refuse = "bad_link"
+    result = json.loads(server.setup_gmail())
+    assert result["auth_url"] is None
+    assert result["status"] == "link_not_handed_over"
+    assert "bad_link" in result["instructions"]
+    assert "put no link in front of the user" in result["instructions"]
+    assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
+    assert "accounts.google.com" not in json.dumps(result)
+
+
+def test_a_refused_deposit_on_a_revoked_connection_still_says_it_needs_authorizing(
+        monkeypatch, broker):
+    import server
+    from auth import RefreshTerminal
+    _connected_auth(monkeypatch, RefreshTerminal("invalid_grant: revoked"))
+    _spool(monkeypatch)
+    monkeypatch.setattr(server, "_flow_start", _minting_start([]))
+    broker.refuse = "no_identity"
+    result = json.loads(server.setup_gmail())
+    assert result["auth_url"] is None
+    assert result["status"] == "link_not_handed_over"
+    assert "invalid_grant" in result["instructions"]
+    assert "no_identity" in result["instructions"]
+
+
+@pytest.mark.parametrize("scenario", ["mint", "reauthorize", "already_pending"])
+def test_the_link_text_never_claims_the_link_arrived(monkeypatch, scenario):
+    """Casa's receipt (`casa_delivery`) is the only claim that a link reached
+    the user; setup_gmail cannot know, so its words claim nothing."""
+    import server
+    from auth import RefreshTerminal
+    if scenario == "reauthorize":
+        _connected_auth(monkeypatch, RefreshTerminal("invalid_grant: revoked"))
+    else:
+        monkeypatch.setattr(server, "_authenticated", False)
+    if scenario == "already_pending":
+        _spool(monkeypatch, pending=[time.time() - 30])
+    else:
+        _spool(monkeypatch)
+        monkeypatch.setattr(server, "_flow_start", lambda auth, cb: {
+            "auth_url": GOOGLE_URL,
+            "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
+            "instructions": _REAL_START_INSTRUCTIONS()})
+    text = json.loads(server.setup_gmail())["instructions"].lower()
+    assert "handed to casa" in text
+    for claim in ("was sent", "been sent", "sent to", "was delivered",
+                  "been delivered", "in your chat", "posted", "below",
+                  "earlier message", "here is"):
+        assert claim not in text, (scenario, claim)
+
+
+def _REAL_START_INSTRUCTIONS():
+    """The instructions `auth_flow.start` really produces."""
+    import auth_flow
+    cb = MagicMock()
+    cb.resolve.return_value = MagicMock(redirect_uri="https://casa.example.com/cb")
+    auth = MagicMock()
+    auth.build_auth_url.return_value = GOOGLE_URL
+    return auth_flow.start(auth, cb)["instructions"]
 
 
 def test_every_protected_tool_is_a_served_tool():
@@ -340,7 +490,7 @@ def _awaiting(minted_ts, state_hash="b" * 64):
 def _minting_start(calls):
     def fake_start(auth, cb):
         calls.append((auth, cb))
-        return {"auth_url": "https://accounts.google.com/o?state=s",
+        return {"auth_url": GOOGLE_URL,
                 "redirect_uri": "https://casa.example.com/callback/plg-gmail--oauth",
                 "instructions": "open it"}
     return fake_start
@@ -356,7 +506,7 @@ def test_setup_gmail_mints_a_flow_when_not_connected(monkeypatch):
     result = json.loads(server.setup_gmail())
 
     assert len(calls) == 1                      # the flow really was minted
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
     assert result["redirect_uri"].endswith("/callback/plg-gmail--oauth")
 
 
@@ -392,9 +542,10 @@ def test_setup_gmail_does_not_mint_twice_while_disconnected(monkeypatch):
 
     assert cb.attempts.return_value == [], "the double invented an attempt record"
     assert len(calls) == 1, "a re-dispatch minted a second authorization"
-    assert first["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(first)
     assert second["status"] == "already_pending"
-    assert "auth_url" not in second, "a second link was handed out"
+    assert second["auth_url"] is None, "a second link was handed out"
+    assert len(server._deposit_link.deposits) == 1
 
 
 def test_setup_gmail_defers_to_a_pending_state_with_no_attempt_record_yet(monkeypatch):
@@ -426,7 +577,7 @@ def test_setup_gmail_mints_when_the_pending_state_is_past_casas_ttl(monkeypatch)
     result = json.loads(server.setup_gmail())
 
     assert len(calls) == 1, "deferred to a pending state casa would refuse to claim"
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
 
 
 def test_setup_gmail_mints_when_a_pending_mint_clock_is_beyond_casas_skew(monkeypatch):
@@ -456,7 +607,9 @@ def test_setup_gmail_reports_an_outstanding_attempt_instead_of_minting(monkeypat
     result = json.loads(server.setup_gmail())
 
     assert result["status"] == "already_pending"
-    assert "already sent" in result["instructions"]
+    assert result["auth_url"] is None
+    assert "handed to Casa" in result["instructions"]
+    assert "sent" not in result["instructions"]
 
 
 def test_setup_gmail_mints_when_the_outstanding_attempt_is_past_casas_ttl(monkeypatch):
@@ -473,7 +626,7 @@ def test_setup_gmail_mints_when_the_outstanding_attempt_is_past_casas_ttl(monkey
     result = json.loads(server.setup_gmail())
 
     assert len(calls) == 1, "deferred to an attempt casa would refuse to claim"
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
 
 
 def test_setup_gmail_mints_when_the_outstanding_attempt_has_no_mint_clock(monkeypatch):
@@ -535,6 +688,7 @@ def test_setup_gmail_is_idempotent_when_already_connected(monkeypatch):
     result = json.loads(server.setup_gmail())
 
     assert result["status"] == "already_connected"
+    assert result["auth_url"] is None           # no link: Casa passes it unchanged
     assert result["account"] == "user@example.com"
     # The claim is checked, not assumed: a live connection is one that refreshes.
     mock_auth.probe_refresh.assert_called_once_with("rt")
@@ -579,7 +733,7 @@ def test_setup_gmail_mints_a_recovery_link_when_the_stored_token_is_revoked(monk
 
     assert result.get("status") != "already_connected"
     assert len(calls) == 1, "a revoked credential produced no recovery link"
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
     assert result["status"] == "reauthorization_needed"
     assert "invalid_grant" in result["instructions"]
     # Never destroy a credential here — reaping is load_active's job.
@@ -603,6 +757,7 @@ def test_setup_gmail_does_not_mint_on_a_transient_refresh_failure(monkeypatch):
     result = json.loads(server.setup_gmail())
 
     assert result["status"] == "retry_later"
+    assert result["auth_url"] is None
     assert result["account"] == "user@example.com"
     assert "temporarily_unavailable" in result["instructions"]
     mock_auth.store.remove_active.assert_not_called()
@@ -628,7 +783,7 @@ def test_setup_gmail_reports_a_rejected_client_as_configuration_not_revocation(
     result = json.loads(server.setup_gmail())
 
     assert result["status"] == "configuration_error"
-    assert "auth_url" not in result
+    assert result["auth_url"] is None
     assert result["status"] != "reauthorization_needed"
     assert "invalid_client" in result["instructions"]
     assert "GMAIL_CLIENT_SECRET" in result["instructions"]
@@ -705,7 +860,7 @@ def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeyp
         "instructions": "open it"})
 
     result = json.loads(server.setup_gmail())
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
     assert "status" not in result
 
 
@@ -771,7 +926,7 @@ def test_setup_gmail_reports_configuration_error_after_a_restart(monkeypatch):
     assert mock_auth.probe_refresh.call_count == 1, "never probed the stored token"
     assert "invalid_client" in result["instructions"]
     assert "GMAIL_CLIENT_SECRET" in result["instructions"]
-    assert "auth_url" not in result
+    assert result["auth_url"] is None
     mock_auth.store.remove_active.assert_not_called()
 
 
@@ -794,7 +949,7 @@ def test_setup_gmail_mints_a_recovery_link_after_a_restart_when_revoked(monkeypa
     assert result["status"] == "reauthorization_needed"
     assert len(calls) == 1, "a revoked credential produced no recovery link"
     assert mock_auth.probe_refresh.call_count == 1
-    assert result["auth_url"].startswith("https://accounts.google.com/")
+    _assert_handed_over(result)
     assert "invalid_grant" in result["instructions"]
     mock_auth.store.remove_active.assert_not_called()
 
@@ -870,7 +1025,7 @@ def test_setup_gmail_does_not_claim_connected_when_activation_fails(monkeypatch)
     assert len(calls) == 0, "a failed runtime rebuild minted a needless link"
     assert mock_auth.probe_refresh.call_count == 1
     assert "no space left on device" in result["instructions"]
-    assert "auth_url" not in result
+    assert result["auth_url"] is None
     mock_auth.store.remove_active.assert_not_called()
 
 
@@ -889,6 +1044,7 @@ def test_setup_gmail_surfaces_callback_unavailable_instead_of_raising(monkeypatc
     monkeypatch.setattr(server, "_flow_start", boom)
 
     result = json.loads(server.setup_gmail())          # must not raise
+    assert result["auth_url"] is None
     assert result["status"] == "unavailable"
     assert "callback_no_target" in result["instructions"]
 
