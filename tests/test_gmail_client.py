@@ -497,14 +497,14 @@ def test_send_email_sets_from_header_no_attachments():
 def test_send_email_sets_from_header_with_attachments(tmp_path):
     client = make_client()
     client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "sent3"}
-    attachment = tmp_path / "file.txt"
-    attachment.write_text("content")
-    client.send_email("to@b.com", "Hello", "Body", attachment_paths=[str(attachment)], from_address="alias@workspace.example.com")
+    client.send_email("to@b.com", "Hello", "Body", attachments=[("file.txt", b"content")], from_address="alias@workspace.example.com")
     send_call = client._service.users.return_value.messages.return_value.send.call_args
     raw = send_call.kwargs["body"]["raw"]
     import base64
     decoded = base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4)).decode("utf-8", errors="replace")
     assert "From: alias@workspace.example.com" in decoded
+    assert 'filename="file.txt"' in decoded
+    assert base64.b64encode(b"content").decode() in decoded
 
 
 # --- reply_to_thread with from_address ---

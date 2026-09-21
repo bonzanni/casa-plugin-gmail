@@ -1,4 +1,5 @@
 import inspect
+import os
 import json
 import re
 import time
@@ -265,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.8.0"
+    assert manifest["version"] == "0.9.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -1081,3 +1082,66 @@ def test_already_connected_says_an_update_does_not_change_the_authorization(monk
         "the operator is not told an update left this authorization alone"
     for event in ("reload", "restart"):
         assert event in instructions, f"{event} is not covered"
+
+
+# --- #486: downloads go to Casa's handoff folder; attachments are read once ---
+
+@pytest.fixture
+def handoff(tmp_path, monkeypatch):
+    import casa_handoff
+    root = tmp_path / "handoff"
+    root.mkdir(mode=0o770)
+    monkeypatch.setenv(casa_handoff.HANDOFF_ENV, str(root))
+    return str(root)
+
+
+def _att_client(monkeypatch, tmp_path, *, size, data):
+    import server
+    from attachments import AttachmentManager
+    mock_client = MagicMock()
+    mock_client.get_email.return_value = {"attachments": [
+        {"attachment_id": "a1", "filename": "invoice Q3.pdf",
+         "mime_type": "application/pdf", "size_bytes": size}]}
+    mock_client.get_attachment_data.return_value = data
+    monkeypatch.setattr(server, "_client", mock_client)
+    monkeypatch.setattr(server, "_att", AttachmentManager(str(tmp_path / "data")))
+    _setup_authenticated(monkeypatch)
+    return mock_client
+
+
+def test_download_publishes_to_the_handoff_folder_only(monkeypatch, tmp_path, handoff):
+    import casa_handoff
+    import server
+    _att_client(monkeypatch, tmp_path, size=3, data=b"PDF")
+    out = json.loads(server.download_attachment("m1", "a1"))
+    assert out["path"].startswith(handoff + "/gmail/")
+    assert casa_handoff.capture(out["path"]) == ("invoice Q3.pdf", b"PDF")
+    assert os.listdir(server._att._cache_dir) == []
+
+
+def test_download_refuses_over_25_mb_even_with_the_limit_disabled(monkeypatch, tmp_path, handoff):
+    import casa_handoff
+    import server
+    mc = _att_client(monkeypatch, tmp_path, size=casa_handoff.MAX_FILE_BYTES + 1, data=b"x")
+    with pytest.raises(ValueError, match="handoff limit"):
+        server.download_attachment("m1", "a1", max_bytes=0)
+    mc.get_attachment_data.assert_not_called()
+
+
+def test_send_email_attaches_handoff_bytes_and_refuses_the_token_store(monkeypatch, tmp_path, handoff):
+    import casa_handoff
+    import server
+    mc = _att_client(monkeypatch, tmp_path, size=0, data=b"")
+    mc.send_email.return_value = "sent"
+    monkeypatch.setattr(server, "_log", MagicMock(check=MagicMock(return_value=None)))
+    zip_path = casa_handoff.publish("accounting", "q3.zip", data=b"PK")["path"]
+    server.send_email(to="a@b.c", subject="s", body="b", attachment_paths=[zip_path])
+    assert mc.send_email.call_args.args[3] == [("q3.zip", b"PK")]
+
+    token = tmp_path / "data" / "gmail_token.json"
+    token.write_bytes(b"secret")
+    mc.send_email.reset_mock()
+    with pytest.raises(ValueError):
+        server.send_email(to="a@b.c", subject="s", body="b",
+                          attachment_paths=[zip_path, str(token)])
+    mc.send_email.assert_not_called()

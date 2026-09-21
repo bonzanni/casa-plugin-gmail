@@ -308,14 +308,14 @@ class GmailClient:
         to: str,
         subject: str,
         body: str,
-        attachment_paths: list[str] | None = None,
+        attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
     ) -> str:
         msg = self._build_message(
             to=to,
             subject=subject,
             body=body,
-            attachment_paths=attachment_paths or [],
+            attachments=attachments or [],
             from_address=from_address,
         )
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
@@ -329,7 +329,7 @@ class GmailClient:
         self,
         thread_id: str,
         body: str,
-        attachment_paths: list[str] | None = None,
+        attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
     ) -> str:
         try:
@@ -354,7 +354,7 @@ class GmailClient:
             to=reply_to,
             subject=subject,
             body=body,
-            attachment_paths=attachment_paths or [],
+            attachments=attachments or [],
             from_address=from_address,
         )
         msg["In-Reply-To"] = msg_id_header
@@ -371,7 +371,7 @@ class GmailClient:
     def _build_message(
         self,
         body: str,
-        attachment_paths: list[str],
+        attachments: list[tuple[str, bytes]],
         to: str = "",
         subject: str = "",
         from_address: str = "",
@@ -381,7 +381,7 @@ class GmailClient:
         from email.mime.base import MIMEBase
         from email import encoders
         import mimetypes
-        if attachment_paths:
+        if attachments:
             msg = MIMEMultipart()
             if to:
                 msg["To"] = to
@@ -389,15 +389,16 @@ class GmailClient:
             if from_address:
                 msg["From"] = from_address
             msg.attach(MIMEText(body, "plain"))
-            for path in attachment_paths:
-                mime_type, _ = mimetypes.guess_type(path)
+            # (filename, bytes) pairs, already read through a guarded
+            # descriptor by the caller — never a path to open here.
+            for filename, data in attachments:
+                mime_type, _ = mimetypes.guess_type(filename)
                 maintype, subtype = (mime_type or "application/octet-stream").split("/", 1)
-                with open(path, "rb") as f:
-                    part = MIMEBase(maintype, subtype)
-                    part.set_payload(f.read())
-                    encoders.encode_base64(part)
-                    part.add_header("Content-Disposition", "attachment", filename=os.path.basename(path))
-                    msg.attach(part)
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(data)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", "attachment", filename=filename)
+                msg.attach(part)
         else:
             msg = MIMEText(body, "plain")
             if to:

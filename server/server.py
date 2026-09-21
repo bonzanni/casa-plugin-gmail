@@ -14,6 +14,7 @@ from auth_flow import start as _flow_start
 from auth_flow import startup_recover as _flow_startup
 from casa_callback import CallbackUnavailable, CasaCallback
 import casa_broker
+import casa_handoff
 
 PLUGIN_DATA = os.environ.get("CLAUDE_PLUGIN_DATA", "/tmp/gmail-plugin-data")
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(
@@ -88,14 +89,10 @@ def _require_auth() -> None:
         )
 
 
-def _validate_paths(paths: list[str]) -> None:
-    real_data = os.path.realpath(PLUGIN_DATA)
-    for path in paths:
-        if not os.path.isabs(path) or not os.path.exists(path):
-            raise ValueError(f"Attachment path {path} is invalid or outside plugin data directory.")
-        real_path = os.path.realpath(path)
-        if not (real_path == real_data or real_path.startswith(real_data + os.sep)):
-            raise ValueError(f"Attachment path {path} is invalid or outside plugin data directory.")
+def _read_attachments(paths: list[str]) -> list[tuple[str, bytes]]:
+    """Every attachment as ``(filename, bytes)``, or ValueError for the whole
+    call — no partial send. See ``AttachmentManager.read_source``."""
+    return [_att.read_source(p) for p in paths]
 
 
 def _ok(data) -> str:
@@ -511,7 +508,7 @@ def list_attachments(message_id: str) -> str:
 
 @mcp.tool()
 def download_attachment(message_id: str, attachment_id: str, max_bytes: int = 10485760) -> str:
-    """Download an email attachment to the plugin cache. Returns path (ephemeral, 7-day TTL)."""
+    """Download an email attachment into Casa's handoff folder and return its path, under the attachment's own filename. Other plugins can take the file from that path (e.g. to store an invoice), and send_email can attach it. Kept 7 days. Files over 25 MB are refused whatever max_bytes says."""
     _require_auth()
     email_data = _client.get_email(message_id)
     att_meta = next(
@@ -522,21 +519,28 @@ def download_attachment(message_id: str, attachment_id: str, max_bytes: int = 10
     size = att_meta["size_bytes"]
     if max_bytes > 0 and size > max_bytes:
         raise ValueError(f"Attachment exceeds size limit of {max_bytes} bytes. Pass max_bytes=0 to disable the limit.")
+    if size > casa_handoff.MAX_FILE_BYTES:
+        raise ValueError(f"Attachment is larger than {casa_handoff.MAX_FILE_BYTES} bytes, the handoff limit.")
     data = _client.get_attachment_data(message_id, attachment_id)
-    sanitized = _att.sanitize_filename(att_meta["filename"], attachment_id)
-    path = _att.save_to_cache(message_id, sanitized, data)
+    fallback = f"attachment_{attachment_id}"[:100]
+    try:
+        out = casa_handoff.publish(
+            "gmail", casa_handoff.clean_filename(att_meta["filename"], fallback), data=data)
+    except casa_handoff.HandoffError as exc:
+        raise ValueError(str(exc)) from None
     return _ok({
-        "path": path,
+        "path": out["path"],
         "filename": att_meta["filename"],
-        "sanitized_filename": sanitized,
+        "saved_as": out["filename"],
         "mime_type": att_meta["mime_type"],
-        "size_bytes": size,
+        "size_bytes": out["size_bytes"],
+        "expires_at": out["expires_at"],
     })
 
 
 @mcp.tool()
 def save_attachment(cached_path: str, destination: str, overwrite: bool = False) -> str:
-    """Permanently save a cached attachment. destination is a relative path under saved/."""
+    """Permanently save a downloaded attachment: cached_path is the path download_attachment returned. destination is a relative path under saved/."""
     _require_auth()
     path = _att.save_attachment(cached_path, destination, overwrite)
     return _ok({"path": path})
@@ -563,12 +567,12 @@ def send_email(
 ) -> str:
     """Send a plain-text email. from_address: optional SendAs alias (defaults to subject's primary address). Protected: requires the user's tap-approval."""
     _require_auth()
-    _validate_paths(attachment_paths or [])
+    attachments = _read_attachments(attachment_paths or [])
     if request_id:
         existing = _log.check(request_id, to, subject)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
-    msg_id = _client.send_email(to, subject, body, attachment_paths or [], from_address=from_address)
+    msg_id = _client.send_email(to, subject, body, attachments, from_address=from_address)
     if request_id:
         _log.record(request_id, msg_id, to, subject)
     return _ok({"message_id": msg_id, "already_sent": False})
@@ -585,12 +589,12 @@ def reply_to_thread(
 ) -> str:
     """Reply to an email thread. display_subject is for the approval prompt only. from_address: optional SendAs alias. Protected: requires the user's tap-approval."""
     _require_auth()
-    _validate_paths(attachment_paths or [])
+    attachments = _read_attachments(attachment_paths or [])
     if request_id:
         existing = _log.check(request_id, thread_id, display_subject)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
-    msg_id = _client.reply_to_thread(thread_id, body, attachment_paths or [], from_address=from_address)
+    msg_id = _client.reply_to_thread(thread_id, body, attachments, from_address=from_address)
     if request_id:
         _log.record(request_id, msg_id, thread_id, display_subject)
     return _ok({"message_id": msg_id, "already_sent": False})
