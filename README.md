@@ -121,7 +121,8 @@ Casa's update hand-back nonetheless says the integration is **not live** until t
 | `GMAIL_CLIENT_ID` | Yes | OAuth 2.0 client ID (Web application type) |
 | `GMAIL_CLIENT_SECRET` | Yes | OAuth 2.0 client secret |
 | `GMAIL_USER_EMAIL` | Yes | the user's Gmail address |
-| `CLAUDE_PLUGIN_DATA` | Provided by Casa | Plugin-writable data directory (token + attachments) |
+| `CLAUDE_PLUGIN_DATA` | Provided by Casa | Plugin-writable data directory (token + saved attachments) |
+| `CASA_HANDOFF_DIR` | Casa (default `/data/handoff`) | Casa's shared file handoff folder: downloads land here, and attachments may come from here |
 
 ## Troubleshooting
 
@@ -185,8 +186,8 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 | `get_thread` | Read full email thread |
 | `manage_email` | Archive, trash, label, mark read/unread |
 | `list_attachments` | List attachments on an email |
-| `download_attachment` | Download attachment to 7-day cache |
-| `save_attachment` | Permanently save a cached attachment |
+| `download_attachment` | Download an attachment into Casa's handoff folder (kept 7 days), where other plugins can take it |
+| `save_attachment` | Permanently save a downloaded attachment under `saved/` |
 | `list_send_as` | List available SendAs aliases (includes verification status) |
 | `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user's approval) |
 | `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user's approval) |

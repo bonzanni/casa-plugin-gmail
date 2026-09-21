@@ -114,6 +114,8 @@ Use these tools when the user asks to check, search, or read email; send or repl
 - **Acting on a link in a message** (sign-in, confirmation, unsubscribe): take the URL from the `links` field (`{text, href}` pairs from the HTML part) returned by `get_email`/`get_thread` — the plain-text `body` often shows only the link's anchor text, not its target
 - **Before `reply_to_thread`:** always call `get_thread` to read full context; if `truncated: true`, retry with a higher `max_messages` value to load more history before replying; if still truncated, tell the user how many messages are loaded vs. total
 - **Before `download_attachment`:** always call `list_attachments` first to identify the specific file
+- **Attachments to send:** `attachment_paths` accepts a path in Casa's handoff folder — what `download_attachment` returns, a file another plugin produced for you, or a file the user sent the assistant, once shared with `share_inbound_file` — or a file under this plugin's `saved/`. Any other path is refused.
+- **Passing a downloaded file on:** the `path` from `download_attachment` can be handed straight to another plugin's tool that takes files (e.g. to file an invoice); it is kept 7 days.
 - **Before any send/reply:** summarise to the user (recipient, subject/display_subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows
 - Prefer human-readable descriptions (subject, sender, date) in responses — avoid exposing raw message_id or thread_id as the primary reference
 
@@ -156,7 +158,7 @@ These tools are composable for task managers and scheduled agents.
    b. For each attachment with mime_type in [application/pdf, image/jpeg, image/png]:
       - download_attachment(message_id, attachment_id)
       - dest = f"invoices/{YYYY-MM}/{sender}-{sanitized_filename}"
-      - save_attachment(cached_path, destination=dest)
+      - save_attachment(path, destination=dest)   # path from download_attachment
         # If "Destination already exists" → file already processed in prior run, skip
    c. On error: log and continue to next attachment/email
 3. Report: N invoices saved, M skipped, K errors
