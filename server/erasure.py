@@ -13,7 +13,9 @@ Two kinds, one walk over the data directory:
   Google, then deletes everything in ``CLAUDE_PLUGIN_DATA``. A grant whose
   revocation is not confirmed keeps its token file, so a second run can still
   revoke it — deleting it would leave the grant live at Google with no way to
-  reach it from Casa.
+  reach it from Casa. A credential file that cannot be read whole (a read
+  error, a write cut short) is kept the same way and never offered to Google:
+  a fragment's ``invalid_token`` would prove nothing about the real grant.
 * ``erase_data`` (``casa.eraseDataOnlyTool``) deletes everything EXCEPT the
   sign-in files (the token store and the collect lock), so a reinstall carries
   on without authorizing again.
@@ -109,8 +111,18 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
         keep = set(SIGN_IN_FILES) if keep_sign_in else set()
         lines = []
         failed = []
+        unreadable = []
         if not keep_sign_in:
-            tokens = store.stored_refresh_tokens()
+            tokens = {}
+            for name, token in store.credential_files().items():
+                if token is None:
+                    # Unreadable or cut short: whatever grant it holds cannot
+                    # be revoked from here, so it is neither deleted nor
+                    # counted as nothing.
+                    keep.add(name)
+                    unreadable.append(name)
+                else:
+                    tokens.setdefault(token, []).append(name)
             for token, names in tokens.items():
                 outcome, detail = revoke(token)
                 if outcome == "failed":
@@ -146,7 +158,14 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
             "Gmail's access could NOT be confirmed revoked ("
             + "; ".join(failed) + "), so its sign-in is kept to try again. "
             f"You can also remove access yourself at {PERMISSIONS_PAGE}.")
+    if unreadable:
+        lines.append(
+            "Could not read " + ", ".join(sorted(unreadable)) + " as a Gmail "
+            "sign-in, so any access it holds cannot be revoked from here; it is "
+            f"kept. Remove Gmail's access at {PERMISSIONS_PAGE}, then uninstall "
+            "again choosing Keep data.")
     if errors or left:
         lines.append("Could not delete: " + ", ".join(errors or left) + ".")
     lines.append(_HANDOFF_NOTE)
-    return _result(not failed and not errors and not left, " ".join(lines))
+    return _result(not failed and not unreadable and not errors and not left,
+                   " ".join(lines))

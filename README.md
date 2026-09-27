@@ -122,7 +122,7 @@ When you uninstall the plugin, casa (>= 0.331.0) asks what to do with its data:
 - **Erase data, keep sign-ins** — `erase_gmail_data` deletes the sent log and saved attachments. The sign-in stays, so a reinstall is still connected.
 - **Erase everything** — `erase_gmail` asks Google to revoke the plugin's access, then deletes everything in the data directory. Reconnecting needs a new sign-in.
 
-Casa removes the plugin only when the eraser reports the erasure complete. If Google does not confirm the revocation (it cannot be reached, say), the eraser keeps the stored sign-in so a second run can still revoke it, reports the erasure incomplete, and the plugin stays installed. You can also remove the access yourself at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). Neither eraser touches your mail at Google, attachments already handed to casa's handoff folder (casa expires them within 7 days), or Home Assistant backups taken earlier.
+Casa removes the plugin only when the eraser reports the erasure complete. If Google does not confirm the revocation (it cannot be reached, say), the eraser keeps the stored sign-in so a second run can still revoke it, reports the erasure incomplete, and the plugin stays installed. A stored sign-in the eraser cannot read whole (damaged by an interrupted write, say) is kept for the same reason. You can always remove the access yourself at [myaccount.google.com/permissions](https://myaccount.google.com/permissions), then uninstall choosing **Keep data**. Neither eraser touches your mail at Google, attachments already handed to casa's handoff folder (casa expires them within 7 days), or Home Assistant backups taken earlier.
 
 ## Env vars
 
