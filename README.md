@@ -114,6 +114,16 @@ Updating the plugin on a working system does not disturb the connection, and doe
 
 Casa's update hand-back nonetheless says the integration is **not live** until the plugin's setup tool runs. That sentence is generic — it is written for a plugin that must re-publish a webhook URL and key to an external service, which this one does not — so do not read it as a statement about your Gmail authorization. `setup_gmail` is what actually knows: on a healthy install it answers `already_connected` with the connected account and mints nothing. Ask the agent to run it if you want the update confirmed; it is argument-free and changes nothing when there is nothing to change.
 
+### Uninstalling
+
+When you uninstall the plugin, casa (>= 0.331.0) asks what to do with its data:
+
+- **Keep data** — the plugin is removed and its data directory stays, so a reinstall is still connected.
+- **Erase data, keep sign-ins** — `erase_gmail_data` deletes the sent log and saved attachments. The sign-in stays, so a reinstall is still connected.
+- **Erase everything** — `erase_gmail` asks Google to revoke the plugin's access, then deletes everything in the data directory. Reconnecting needs a new sign-in.
+
+Casa removes the plugin only when the eraser reports the erasure complete. If Google does not confirm the revocation (it cannot be reached, say), the eraser keeps the stored sign-in so a second run can still revoke it, reports the erasure incomplete, and the plugin stays installed. A stored sign-in the eraser cannot read whole (damaged by an interrupted write, say) is kept for the same reason. You can always remove the access yourself at [myaccount.google.com/permissions](https://myaccount.google.com/permissions), then uninstall choosing **Keep data**. An erase covers what exists when it runs: a send or attachment save already running in another casa session at that moment can still record its result afterwards. Neither eraser touches your mail at Google, attachments already handed to casa's handoff folder (casa expires them within 7 days), or Home Assistant backups taken earlier.
+
 ## Env vars
 
 | Variable | Required | Description |
@@ -191,6 +201,8 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 | `list_send_as` | List available SendAs aliases (includes verification status) |
 | `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user's approval) |
 | `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user's approval) |
+| `erase_gmail` ⚠️ | Casa's `casa.eraseTool`: revokes Gmail's access at Google, then deletes everything in the plugin's data directory. Run by casa at uninstall when you choose **Erase everything** |
+| `erase_gmail_data` ⚠️ | Casa's `casa.eraseDataOnlyTool`: deletes the sent log and saved attachments but keeps the sign-in. Run by casa at uninstall when you choose **Erase data, keep sign-ins** |
 
 Every tool except `setup_gmail` is declared `{"result": "safe"}` in `casa.resultContract`
 (Casa >= 0.290.0): Casa refuses, before it runs, any tool missing from that declaration, so

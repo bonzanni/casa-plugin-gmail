@@ -37,6 +37,7 @@ class SentLog:
     def check(self, request_id: str, to: str, subject: str) -> str | None:
         """Return message_id if this exact (request_id, to, subject) was already sent, else None."""
         with self._lock:
+            self._data = self._load()
             entry = self._data.get(request_id)
             if entry and entry.get("to") == to and entry.get("subject") == subject:
                 return entry["message_id"]
@@ -44,6 +45,10 @@ class SentLog:
 
     def record(self, request_id: str, message_id: str, to: str, subject: str):
         with self._lock:
+            # The file is the record, not this process's copy: another server
+            # process, or an erase, may have changed it since this one read it,
+            # and writing a stale copy back would restore what was erased.
+            self._data = self._load()
             existing = self._data.get(request_id)
             if existing and (existing.get("to") != to or existing.get("subject") != subject):
                 print(f"WARNING: request_id '{request_id}' collision — proceeding with new send.", flush=True)
@@ -55,9 +60,20 @@ class SentLog:
             }
             self._save()
 
+    def forget(self):
+        """Drop every record, in memory and on disk. Holding the lock keeps a
+        concurrent record() or cleanup() from writing the old entries back."""
+        with self._lock:
+            self._data = {}
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+
     def cleanup(self):
         cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
         with self._lock:
+            self._data = self._load()
             before = len(self._data)
             self._data = {
                 k: v for k, v in self._data.items()

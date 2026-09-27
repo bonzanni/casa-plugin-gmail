@@ -15,6 +15,7 @@ from auth_flow import startup_recover as _flow_startup
 from casa_callback import CallbackUnavailable, CasaCallback
 import casa_broker
 import casa_handoff
+import erasure
 
 PLUGIN_DATA = os.environ.get("CLAUDE_PLUGIN_DATA", "/tmp/gmail-plugin-data")
 PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT") or str(
@@ -598,6 +599,38 @@ def reply_to_thread(
     if request_id:
         _log.record(request_id, msg_id, thread_id, display_subject)
     return _ok({"message_id": msg_id, "already_sent": False})
+
+
+# ── Erasure at uninstall (Casa >= 0.331.0) ─────────────────────────────────
+#
+# Declared as casa.eraseTool and casa.eraseDataOnlyTool: Casa runs one of them
+# when the operator uninstalls with an erase choice, and removes the plugin
+# only on {"erasure": "complete"}. Both are argument-free, protected, and
+# declared safe. See erasure.py for what each keeps.
+
+def _erase(keep_sign_in: bool) -> str:
+    global _client, _authenticated
+    # The sent log lives in memory too; forgetting it as the walk starts means
+    # neither a send nor its daily cleanup can write the old entries back.
+    result = erasure.erase(_auth.store, keep_sign_in=keep_sign_in,
+                           before_delete=_log.forget if _log is not None else None)
+    if not keep_sign_in and _auth.store.load_active() is None:
+        _auth._credentials = None
+        _client = None
+        _authenticated = False
+    return _ok(result)
+
+
+@mcp.tool()
+def erase_gmail() -> str:
+    """Erase everything this plugin holds: revokes Gmail's access at Google and deletes the stored sign-in, the sent log and saved attachments. Run by Casa at uninstall; takes no arguments."""
+    return _erase(keep_sign_in=False)
+
+
+@mcp.tool()
+def erase_gmail_data() -> str:
+    """Erase this plugin's data (sent log, saved attachments) but keep the Gmail sign-in, so a reinstall stays connected. Run by Casa at uninstall; takes no arguments."""
+    return _erase(keep_sign_in=True)
 
 
 if __name__ == "__main__":

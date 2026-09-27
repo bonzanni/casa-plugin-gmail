@@ -42,12 +42,18 @@ class Credential:
     account: str | None
 
 
+def _tmp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.tmp")
+
+
 def _durable_write(path: Path, payload: dict) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = _tmp_path(path)
     data = json.dumps(payload).encode("utf-8")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -92,6 +98,34 @@ class TokenStore:
     @property
     def dir(self) -> Path:
         return self._dir
+
+    def credential_files(self) -> dict[str, str | None]:
+        """Every credential file on disk -> its refresh token, or None when the
+        file is there but is not a readable credential.
+
+        Covers the active and staged slots AND their write temporaries: a write
+        interrupted between fsync and rename leaves a whole token there. None
+        is deliberately not "no token": a file that cannot be read, or cut
+        short, may hold a live grant or part of one, and nothing in it can
+        prove otherwise. Only a missing file is absent.
+        """
+        found: dict[str, str | None] = {}
+        for slot in (self._active, self._staged):
+            for path in (slot, _tmp_path(slot)):
+                try:
+                    raw = path.read_bytes()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    found[path.name] = None
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except ValueError:
+                    parsed = None
+                token = parsed.get("refresh_token") if isinstance(parsed, dict) else None
+                found[path.name] = token if isinstance(token, str) and token else None
+        return found
 
     def load_active(self) -> Credential | None:
         return _read(self._active)
