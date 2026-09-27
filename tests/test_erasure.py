@@ -355,3 +355,25 @@ def test_erasing_data_forgets_the_sent_log_in_memory_too(monkeypatch, tmp_path):
     log.record("r2", "m2", "b@example.com", "later")
     assert set(json.loads((tmp_path / "sent_log.json").read_text())) == {"r2"}
     assert log.check("r1", "a@example.com", "hello") is None
+
+
+def test_a_second_server_process_cannot_write_erased_history_back(tmp_path):
+    """Diff r4 (Astra): a send in flight in another server process recorded
+    its whole stale in-memory log after the erase. The file is now the record:
+    that process adds its own entry and nothing it remembered."""
+    from sent_log import SentLog
+    import threading
+    path = str(tmp_path / "sent_log.json")
+
+    def process():
+        log = SentLog.__new__(SentLog)          # no cleanup timer thread
+        log._path, log._lock = path, threading.Lock()
+        log._data = log._load()
+        return log
+
+    a, b = process(), process()
+    a.record("r1", "m1", "a@example.com", "erased subject")
+    b.check("r1", "a@example.com", "erased subject")   # b now remembers r1
+    a.forget()
+    b.record("r2", "m2", "b@example.com", "after")
+    assert set(json.loads((tmp_path / "sent_log.json").read_text())) == {"r2"}
