@@ -81,6 +81,35 @@ def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
     assert _names(tmp_path) == []
 
 
+@pytest.mark.parametrize("slot", ["oauth_token.json", "oauth_token.staged.json"])
+def test_a_token_left_by_an_interrupted_write_is_revoked_first(tmp_path, monkeypatch, slot):
+    """A crash between the temp file's fsync and its rename leaves a complete
+    token in `.<slot>.tmp` (diff r1, Astra): it must be revoked, and kept when
+    the revocation is not confirmed, like any stored token."""
+    import token_store
+    store = TokenStore(str(tmp_path))
+
+    def crash(src, dst):
+        raise OSError("crash before rename")
+
+    monkeypatch.setattr(token_store.os, "replace", crash)
+    with pytest.raises(OSError):
+        if slot == "oauth_token.json":
+            store.write_active(Credential("rt-tmp", "f", 1.0, "user@example.com"))
+        else:
+            store.stage("rt-tmp", "f", 1.0)
+    monkeypatch.undo()
+    assert _names(tmp_path) == [f".{slot}.tmp"]
+    google = _Google(("failed", "Google answered 503"))
+    result = erasure.erase(store, keep_sign_in=False, revoke=google)
+    assert google.asked == ["rt-tmp"]
+    assert result["erasure"] == "incomplete"
+    assert _names(tmp_path) == sorted([LOCK_NAME, f".{slot}.tmp"])
+    result = erasure.erase(store, keep_sign_in=False, revoke=_Google())
+    assert result["erasure"] == "complete"
+    assert _names(tmp_path) == []
+
+
 def test_one_token_in_both_slots_is_revoked_once(tmp_path):
     store = TokenStore(str(tmp_path))
     store.write_active(Credential("rt", "f1", 1.0, "user@example.com"))

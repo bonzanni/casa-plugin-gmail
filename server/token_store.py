@@ -42,8 +42,12 @@ class Credential:
     account: str | None
 
 
+def _tmp_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.tmp")
+
+
 def _durable_write(path: Path, payload: dict) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = _tmp_path(path)
     data = json.dumps(payload).encode("utf-8")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
@@ -92,6 +96,19 @@ class TokenStore:
     @property
     def dir(self) -> Path:
         return self._dir
+
+    def stored_refresh_tokens(self) -> dict[str, list[str]]:
+        """Every refresh token on disk -> the file names holding it: the active
+        and staged slots, AND their write temporaries — a write interrupted
+        between fsync and rename leaves a complete token there (an eraser that
+        missed it would delete a live grant unrevoked)."""
+        tokens: dict[str, list[str]] = {}
+        for slot in (self._active, self._staged):
+            for path in (slot, _tmp_path(slot)):
+                cred = _read(path)
+                if cred is not None:
+                    tokens.setdefault(cred.refresh_token, []).append(path.name)
+        return tokens
 
     def load_active(self) -> Credential | None:
         return _read(self._active)

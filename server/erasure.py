@@ -110,11 +110,7 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
         lines = []
         failed = []
         if not keep_sign_in:
-            tokens = {}
-            for name, cred in ((ACTIVE_NAME, store.load_active()),
-                               (STAGED_NAME, store.load_staged())):
-                if cred is not None:
-                    tokens.setdefault(cred.refresh_token, []).append(name)
+            tokens = store.stored_refresh_tokens()
             for token, names in tokens.items():
                 outcome, detail = revoke(token)
                 if outcome == "failed":
