@@ -55,6 +55,16 @@ class SentLog:
             }
             self._save()
 
+    def forget(self):
+        """Drop every record, in memory and on disk. Holding the lock keeps a
+        concurrent record() or cleanup() from writing the old entries back."""
+        with self._lock:
+            self._data = {}
+            try:
+                os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+
     def cleanup(self):
         cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
         with self._lock:

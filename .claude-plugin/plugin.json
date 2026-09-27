@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -10,9 +10,13 @@
   "casa": {
     "callbacks": [{"name": "oauth"}],
     "setupTool": "setup_gmail",
+    "eraseTool": "erase_gmail",
+    "eraseDataOnlyTool": "erase_gmail_data",
     "protectedTools": [
       {"name": "send_email", "summary": "Send email to {to}: {subject}"},
-      {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"}
+      {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"},
+      {"name": "erase_gmail", "summary": "Revokes Gmail's access at Google and deletes the stored sign-in, the sent log and saved attachments. Reconnecting needs a new sign-in."},
+      {"name": "erase_gmail_data", "summary": "Deletes the sent log and saved attachments; keeps the Gmail sign-in, so a reinstall stays connected."}
     ],
     "resultContract": {
       "version": 1,
@@ -29,7 +33,9 @@
         "save_attachment": {"result": "safe"},
         "list_send_as": {"result": "safe"},
         "send_email": {"result": "safe"},
-        "reply_to_thread": {"result": "safe"}
+        "reply_to_thread": {"result": "safe"},
+        "erase_gmail": {"result": "safe"},
+        "erase_gmail_data": {"result": "safe"}
       }
     }
   }

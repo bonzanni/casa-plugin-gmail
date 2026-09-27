@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.9.0"
+    assert manifest["version"] == "0.10.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -447,10 +447,11 @@ def test_manifest_declares_the_setup_tool_casa_auto_runs():
 def test_the_setup_tool_is_not_protected():
     """Casa dispatches it unprompted, so a tap-approval prompt would deadlock
     the episode — the same reason gmail_auth_collect stays unprotected. The two
-    real protected tools must be untouched."""
+    sending tools must be untouched; the erasers are protected so only the
+    operator's Erase tap at uninstall can run them (Casa >= 0.329.0)."""
     names = [t["name"] for t in _manifest()["casa"]["protectedTools"]]
     assert "setup_gmail" not in names
-    assert names == ["send_email", "reply_to_thread"]
+    assert names == ["send_email", "reply_to_thread", "erase_gmail", "erase_gmail_data"]
 
 
 def test_the_setup_tool_exists_and_is_argument_free():
