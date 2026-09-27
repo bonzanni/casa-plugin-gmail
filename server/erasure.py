@@ -130,13 +130,11 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
                 removed.append(entry.name)
             except OSError as exc:
                 errors.append(f"{entry.name} ({exc.strerror or exc})")
+        # The lock file itself stays: it is empty, and unlinking it while held
+        # would let another process lock a fresh inode while this one still
+        # believes it holds the lock.
         left = sorted(e.name for e in data_dir.iterdir()
                       if e.name != LOCK_NAME and e.name not in keep)
-        if not keep_sign_in and not failed and not left:
-            try:
-                (data_dir / LOCK_NAME).unlink()
-            except FileNotFoundError:
-                pass
     if removed:
         lines.append("Deleted " + ", ".join(removed) + ".")
     else:

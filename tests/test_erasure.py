@@ -52,7 +52,7 @@ def test_everything_revokes_every_grant_then_leaves_nothing(tmp_path):
     result = erasure.erase(store, keep_sign_in=False, revoke=google)
     assert result["erasure"] == "complete"
     assert sorted(google.asked) == ["rt-active", "rt-staged"]
-    assert _names(tmp_path) == []
+    assert _names(tmp_path) == [LOCK_NAME]
     assert "Revoked" in result["report"]
 
 
@@ -61,7 +61,7 @@ def test_a_token_google_already_invalidated_counts_as_revoked(tmp_path):
     result = erasure.erase(store, keep_sign_in=False,
                            revoke=_Google(("already_invalid", "")))
     assert result["erasure"] == "complete"
-    assert _names(tmp_path) == []
+    assert _names(tmp_path) == [LOCK_NAME]
 
 
 def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
@@ -78,7 +78,7 @@ def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
     # A second run with Google reachable finishes the job.
     again = erasure.erase(store, keep_sign_in=False, revoke=_Google())
     assert again["erasure"] == "complete"
-    assert _names(tmp_path) == []
+    assert _names(tmp_path) == [LOCK_NAME]
 
 
 @pytest.mark.parametrize("slot", ["oauth_token.json", "oauth_token.staged.json"])
@@ -107,7 +107,34 @@ def test_a_token_left_by_an_interrupted_write_is_revoked_first(tmp_path, monkeyp
     assert _names(tmp_path) == sorted([LOCK_NAME, f".{slot}.tmp"])
     result = erasure.erase(store, keep_sign_in=False, revoke=_Google())
     assert result["erasure"] == "complete"
-    assert _names(tmp_path) == []
+    assert _names(tmp_path) == [LOCK_NAME]
+
+
+@pytest.mark.parametrize("name", ["oauth_token.json", ".oauth_token.staged.json.tmp"])
+@pytest.mark.parametrize("cut", ['"rt-cut"', '"rt-cut', '"rt-cut", "flow"'])
+def test_a_token_in_a_file_cut_short_is_still_revoked(tmp_path, name, cut):
+    """A short write leaves a token in a file that is not JSON (diff r2, both
+    reviewers): it is found without parsing, revoked, and kept on failure."""
+    (tmp_path / name).write_text('{"v": 2, "refresh_token": ' + cut)
+    store = TokenStore(str(tmp_path))
+    result = erasure.erase(store, keep_sign_in=False,
+                           revoke=_Google(("failed", "Google answered 503")))
+    assert result["erasure"] == "incomplete"
+    assert name in _names(tmp_path)
+    google = _Google()
+    assert erasure.erase(store, keep_sign_in=False, revoke=google)["erasure"] == "complete"
+    assert google.asked == ["rt-cut"]
+    assert _names(tmp_path) == [LOCK_NAME]
+
+
+def test_a_short_os_write_still_writes_the_whole_credential(tmp_path, monkeypatch):
+    import token_store
+    real = token_store.os.write
+    monkeypatch.setattr(token_store.os, "write", lambda fd, b: real(fd, bytes(b[:5])))
+    store = TokenStore(str(tmp_path))
+    store.stage("rt-long-enough-to-need-several-writes", "f", 1.0)
+    monkeypatch.undo()
+    assert store.load_staged().refresh_token == "rt-long-enough-to-need-several-writes"
 
 
 def test_one_token_in_both_slots_is_revoked_once(tmp_path):
@@ -119,13 +146,13 @@ def test_one_token_in_both_slots_is_revoked_once(tmp_path):
     assert google.asked == ["rt"]
 
 
-def test_an_unreadable_token_file_is_deleted_without_asking_google(tmp_path):
+def test_a_token_file_holding_no_token_is_deleted_without_asking_google(tmp_path):
     (tmp_path / "oauth_token.json").write_text("not json")
     google = _Google()
     result = erasure.erase(TokenStore(str(tmp_path)), keep_sign_in=False, revoke=google)
     assert result["erasure"] == "complete"
     assert google.asked == []
-    assert _names(tmp_path) == []
+    assert _names(tmp_path) == [LOCK_NAME]
 
 
 def test_data_only_keeps_exactly_the_sign_in_and_asks_google_nothing(tmp_path):

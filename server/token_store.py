@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,13 @@ SCHEMA_VERSION = 2
 # a collect within one process AND a restart or two, without letting a sentence
 # repeat forever. Not configurable: there is nothing here worth tuning.
 NOTICE_OFFER_LIMIT = 3
+
+
+# A refresh token as it appears in a credential file, found without parsing the
+# file: a write cut short (a full disk, a size limit) can leave the whole token
+# in a file that is no longer JSON. Up to the closing quote, or to the end of a
+# file cut inside the token — then that fragment is all there is to revoke.
+_LOOSE_TOKEN_RE = re.compile(r'"refresh_token"\s*:\s*"([^"\\]+)')
 
 
 class StagedFlowMismatch(RuntimeError):
@@ -51,7 +59,9 @@ def _durable_write(path: Path, payload: dict) -> None:
     data = json.dumps(payload).encode("utf-8")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -100,14 +110,23 @@ class TokenStore:
     def stored_refresh_tokens(self) -> dict[str, list[str]]:
         """Every refresh token on disk -> the file names holding it: the active
         and staged slots, AND their write temporaries — a write interrupted
-        between fsync and rename leaves a complete token there (an eraser that
-        missed it would delete a live grant unrevoked)."""
+        between fsync and rename leaves a complete token there. A file that is
+        not a readable credential is still searched for one (see
+        _LOOSE_TOKEN_RE): an eraser must never delete a token it did not find."""
         tokens: dict[str, list[str]] = {}
         for slot in (self._active, self._staged):
             for path in (slot, _tmp_path(slot)):
                 cred = _read(path)
                 if cred is not None:
-                    tokens.setdefault(cred.refresh_token, []).append(path.name)
+                    found = [cred.refresh_token]
+                else:
+                    try:
+                        text = path.read_bytes().decode("utf-8", "replace")
+                    except OSError:
+                        continue
+                    found = _LOOSE_TOKEN_RE.findall(text)
+                for token in found:
+                    tokens.setdefault(token, []).append(path.name)
         return tokens
 
     def load_active(self) -> Credential | None:
