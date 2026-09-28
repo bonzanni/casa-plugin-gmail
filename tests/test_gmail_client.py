@@ -553,3 +553,108 @@ def test_get_profile_email_missing_address_returns_empty_string():
         "messagesTotal": 100,
     }
     assert client.get_profile_email() == ""
+
+
+# --- #6: attachment ids survive a refetch ---
+# Gmail's attachmentId is only good for the messages.get response it came
+# from (no stability is documented; live, the listed id was never found on
+# the refetch, 6/6). partId is "the immutable ID of the message part".
+
+def _rotating_attachment_service(client):
+    """messages.get hands out a fresh attachmentId on every call, as Gmail may."""
+    fetches = []
+
+    def _get(**kwargs):
+        n = len(fetches)
+        fetches.append(kwargs)
+        resp = MagicMock()
+        resp.execute.return_value = {
+            "id": "msg1", "threadId": "thr1",
+            "payload": {
+                "partId": "", "mimeType": "multipart/mixed", "headers": [],
+                "parts": [
+                    {"partId": "0", "mimeType": "text/plain",
+                     "body": {"data": _b64("See attached.")}},
+                    {"partId": "1", "mimeType": "application/pdf", "filename": "invoice.pdf",
+                     "body": {"attachmentId": f"ANGjdJ-fetch{n}-inv", "size": 1234}},
+                    {"partId": "2", "mimeType": "image/png", "filename": "logo.png",
+                     "body": {"attachmentId": f"ANGjdJ-fetch{n}-logo", "size": 99}},
+                ],
+            },
+        }
+        return resp
+
+    client._service.users.return_value.messages.return_value.get.side_effect = _get
+    return fetches
+
+
+def test_listed_attachment_id_is_found_on_a_later_fetch():
+    client = make_client()
+    fetches = _rotating_attachment_service(client)
+    listed = client.get_email("msg1")["attachments"]
+    assert [a["filename"] for a in listed] == ["invoice.pdf", "logo.png"]
+    found = client.find_attachment("msg1", listed[0]["attachment_id"])
+    assert len(fetches) == 2, "find_attachment must refetch the message"
+    assert found["filename"] == "invoice.pdf"
+    assert found["size_bytes"] == 1234
+    # ... and downloads with the id from ITS OWN fetch, not the listed one.
+    assert found["gmail_attachment_id"] == "ANGjdJ-fetch1-inv"
+
+
+def test_listed_attachment_ids_are_stable_and_distinct():
+    client = make_client()
+    _rotating_attachment_service(client)
+    first = [a["attachment_id"] for a in client.get_email("msg1")["attachments"]]
+    second = [a["attachment_id"] for a in client.get_email("msg1")["attachments"]]
+    assert first == second
+    assert len(set(first)) == 2
+
+
+def test_find_attachment_accepts_the_current_gmail_id():
+    # A caller holding a Gmail attachmentId from the same response still works.
+    client = make_client()
+    _rotating_attachment_service(client)
+    found = client.find_attachment("msg1", "ANGjdJ-fetch0-logo")
+    assert found["filename"] == "logo.png"
+    assert found["gmail_attachment_id"] == "ANGjdJ-fetch0-logo"
+
+
+def test_find_attachment_unknown_id_raises():
+    client = make_client()
+    _rotating_attachment_service(client)
+    with pytest.raises(ValueError, match="not found on message msg1"):
+        client.find_attachment("msg1", "7")
+
+
+def test_attachment_on_the_root_part_gets_a_usable_id():
+    # A single-part message whose payload IS the attachment: Gmail gives the
+    # root part the empty partId, which is no id to hand a caller.
+    client = make_client()
+    fetches = []
+
+    def _get(**kwargs):
+        fetches.append(kwargs)
+        resp = MagicMock()
+        resp.execute.return_value = {
+            "id": "msg1", "threadId": "thr1",
+            "payload": {"partId": "", "mimeType": "application/pdf", "filename": "scan.pdf",
+                        "headers": [],
+                        "body": {"attachmentId": f"ANGjdJ-root{len(fetches)}", "size": 5}},
+        }
+        return resp
+
+    client._service.users.return_value.messages.return_value.get.side_effect = _get
+    [att] = client.get_email("msg1")["attachments"]
+    assert att["attachment_id"]
+    assert client.find_attachment("msg1", att["attachment_id"])["gmail_attachment_id"] == "ANGjdJ-root2"
+
+
+def test_thread_messages_carry_the_same_stable_ids():
+    client = make_client()
+    _rotating_attachment_service(client)
+    from_email = [a["attachment_id"] for a in client.get_email("msg1")["attachments"]]
+    msg = client._service.users.return_value.messages.return_value.get(userId="me", id="msg1").execute()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+        "messages": [msg]}
+    from_thread = [a["attachment_id"] for a in client.get_thread("thr1")["messages"][0]["attachments"]]
+    assert from_thread == from_email

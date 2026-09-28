@@ -112,19 +112,36 @@ def _body_and_links(payload: dict) -> dict:
     return {"body": body, "links": _extract_links(html) if html else []}
 
 
-def _extract_attachments(payload: dict) -> list[dict]:
-    attachments = []
+def _attachment_parts(payload: dict, root: bool = True) -> list[tuple[str, dict]]:
+    """Every downloadable attachment part as ``(attachment_id, part)`` (issue #6).
+
+    The attachment_id handed to callers is the part's partId, which Gmail
+    documents as immutable. Gmail's own body.attachmentId is not: it is only
+    good for the messages.get response it came from, so a listed one is not
+    found on the refetch download_attachment does. The root part's partId is
+    "", which is no id to hand a caller, so it is called "root".
+    """
+    found = []
     body = payload.get("body", {})
     if payload.get("filename") and body.get("attachmentId"):
-        attachments.append({
-            "attachment_id": body["attachmentId"],
-            "filename": payload["filename"],
-            "mime_type": payload.get("mimeType", "application/octet-stream"),
-            "size_bytes": body.get("size", 0),
-        })
+        key = payload.get("partId") or ("root" if root else body["attachmentId"])
+        found.append((key, payload))
     for part in payload.get("parts", []):
-        attachments.extend(_extract_attachments(part))
-    return attachments
+        found.extend(_attachment_parts(part, root=False))
+    return found
+
+
+def _attachment_meta(key: str, part: dict) -> dict:
+    return {
+        "attachment_id": key,
+        "filename": part["filename"],
+        "mime_type": part.get("mimeType", "application/octet-stream"),
+        "size_bytes": part.get("body", {}).get("size", 0),
+    }
+
+
+def _extract_attachments(payload: dict) -> list[dict]:
+    return [_attachment_meta(key, part) for key, part in _attachment_parts(payload)]
 
 
 def _translate_error(e: HttpError) -> ValueError:
@@ -182,15 +199,29 @@ class GmailClient:
             })
         return results
 
-    def get_email(self, message_id: str) -> dict:
+    def _get_message(self, message_id: str) -> dict:
         try:
-            detail = self._service.users().messages().get(
+            return self._service.users().messages().get(
                 userId="me", id=message_id, format="full"
             ).execute()
         except HttpError as exc:
             if exc.resp.status == 404:
                 raise ValueError(f"Message {message_id} not found or no longer accessible.")
             raise _translate_error(exc)
+
+    def find_attachment(self, message_id: str, attachment_id: str) -> dict:
+        """The listed attachment's metadata from a fresh fetch, plus the
+        gmail_attachment_id that fetch gives it — the one to download with.
+        A Gmail attachmentId from that same response is accepted too."""
+        parts = _attachment_parts(self._get_message(message_id).get("payload", {}))
+        for key, part in parts:
+            if attachment_id in (key, part["body"]["attachmentId"]):
+                return {**_attachment_meta(key, part),
+                        "gmail_attachment_id": part["body"]["attachmentId"]}
+        raise ValueError(f"Attachment {attachment_id} not found on message {message_id}.")
+
+    def get_email(self, message_id: str) -> dict:
+        detail = self._get_message(message_id)
         headers = detail.get("payload", {}).get("headers", [])
         return {
             "message_id": detail["id"],

@@ -501,7 +501,7 @@ def manage_email(message_id: str, action: str, label: str = "") -> str:
 
 @mcp.tool()
 def list_attachments(message_id: str) -> str:
-    """List all attachments on an email (name, MIME type, size)."""
+    """List all attachments on an email (attachment_id, name, MIME type, size). Pass attachment_id to download_attachment."""
     _require_auth()
     email = _client.get_email(message_id)
     return _ok(email["attachments"])
@@ -511,18 +511,13 @@ def list_attachments(message_id: str) -> str:
 def download_attachment(message_id: str, attachment_id: str, max_bytes: int = 10485760) -> str:
     """Download an email attachment into Casa's handoff folder and return its path, under the attachment's own filename. Other plugins can take the file from that path (e.g. to store an invoice), and send_email can attach it. Kept 7 days. Files over 25 MB are refused whatever max_bytes says."""
     _require_auth()
-    email_data = _client.get_email(message_id)
-    att_meta = next(
-        (a for a in email_data["attachments"] if a["attachment_id"] == attachment_id), None
-    )
-    if att_meta is None:
-        raise ValueError(f"Attachment {attachment_id} not found on message {message_id}.")
+    att_meta = _client.find_attachment(message_id, attachment_id)
     size = att_meta["size_bytes"]
     if max_bytes > 0 and size > max_bytes:
         raise ValueError(f"Attachment exceeds size limit of {max_bytes} bytes. Pass max_bytes=0 to disable the limit.")
     if size > casa_handoff.MAX_FILE_BYTES:
         raise ValueError(f"Attachment is larger than {casa_handoff.MAX_FILE_BYTES} bytes, the handoff limit.")
-    data = _client.get_attachment_data(message_id, attachment_id)
+    data = _client.get_attachment_data(message_id, att_meta["gmail_attachment_id"])
     fallback = f"attachment_{attachment_id}"[:100]
     try:
         out = casa_handoff.publish(

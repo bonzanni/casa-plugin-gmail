@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.10.0"
+    assert manifest["version"] == "0.10.1"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -1100,9 +1100,10 @@ def _att_client(monkeypatch, tmp_path, *, size, data):
     import server
     from attachments import AttachmentManager
     mock_client = MagicMock()
-    mock_client.get_email.return_value = {"attachments": [
-        {"attachment_id": "a1", "filename": "invoice Q3.pdf",
-         "mime_type": "application/pdf", "size_bytes": size}]}
+    mock_client.find_attachment.return_value = {
+        "attachment_id": "a1", "filename": "invoice Q3.pdf",
+        "mime_type": "application/pdf", "size_bytes": size,
+        "gmail_attachment_id": "g1"}
     mock_client.get_attachment_data.return_value = data
     monkeypatch.setattr(server, "_client", mock_client)
     monkeypatch.setattr(server, "_att", AttachmentManager(str(tmp_path / "data")))
@@ -1118,6 +1119,28 @@ def test_download_publishes_to_the_handoff_folder_only(monkeypatch, tmp_path, ha
     assert out["path"].startswith(handoff + "/gmail/")
     assert casa_handoff.capture(out["path"]) == ("invoice Q3.pdf", b"PDF")
     assert os.listdir(server._att._cache_dir) == []
+
+
+def test_download_takes_the_id_list_attachments_returned(monkeypatch, tmp_path, handoff):
+    # #6: Gmail hands out a new attachmentId on each messages.get; the id
+    # list_attachments returned must still download the file.
+    import casa_handoff
+    import server
+    from attachments import AttachmentManager
+    from test_gmail_client import _rotating_attachment_service, make_client
+    client = make_client()
+    fetches = _rotating_attachment_service(client)
+    atts = client._service.users.return_value.messages.return_value.attachments.return_value
+    atts.get.return_value.execute.return_value = {"data": "UERG", "size": 3}
+    monkeypatch.setattr(server, "_client", client)
+    monkeypatch.setattr(server, "_att", AttachmentManager(str(tmp_path / "data")))
+    _setup_authenticated(monkeypatch)
+
+    [invoice, _logo] = json.loads(server.list_attachments("msg1"))
+    out = json.loads(server.download_attachment("msg1", invoice["attachment_id"]))
+    assert casa_handoff.capture(out["path"]) == ("invoice.pdf", b"PDF")
+    assert len(fetches) == 2
+    atts.get.assert_called_once_with(userId="me", messageId="msg1", id="ANGjdJ-fetch1-inv")
 
 
 def test_download_refuses_over_25_mb_even_with_the_limit_disabled(monkeypatch, tmp_path, handoff):
