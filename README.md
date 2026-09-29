@@ -225,6 +225,8 @@ The MIT license covers this plugin's own code (`server/*.py`, `skills/`, `tests/
 
 **Platform constraint:** `server/vendor/` contains compiled extension modules built for **CPython 3.11 on linux x86_64** (`_cffi_backend`, `pydantic_core`, `charset_normalizer`, `cryptography`). The vendored tree will not import on another Python version or architecture, so a deployment or fork targeting anything else must re-vendor it from `server/requirements.txt`.
 
+**Local patch:** `server/vendor/mcp/server/fastmcp/utilities/func_metadata.py` carries a one-line backport from mcp 1.30. Without it, mcp 1.3.0 JSON-decodes every string tool argument, so an attachment id `"1"` reaches the tool as the integer `1` and is rejected (#9). A re-vendor at 1.3.0 must re-apply that patch. `tests/test_server.py` fails if it is missing.
+
 ## Disclaimer
 
 Not affiliated with, endorsed by, or sponsored by Google. "Gmail" is a trademark of Google LLC.

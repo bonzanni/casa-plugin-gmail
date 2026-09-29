@@ -83,7 +83,9 @@ class FuncMetadata(BaseModel):
         for field_name, field_info in self.arg_model.model_fields.items():
             if field_name not in data.keys():
                 continue
-            if isinstance(data[field_name], str):
+            # casa-plugin-gmail patch (#9), backported from mcp 1.30: a
+            # str-annotated argument is never JSON-decoded, so "1" stays "1".
+            if isinstance(data[field_name], str) and field_info.annotation is not str:
                 try:
                     pre_parsed = json.loads(data[field_name])
                 except json.JSONDecodeError:
