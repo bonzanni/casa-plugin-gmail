@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.10.1"
+    assert manifest["version"] == "0.10.2"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -1169,3 +1169,62 @@ def test_send_email_attaches_handoff_bytes_and_refuses_the_token_store(monkeypat
         server.send_email(to="a@b.c", subject="s", body="b",
                           attachment_paths=[zip_path, str(token)])
     mc.send_email.assert_not_called()
+
+
+# ── String arguments reach the tools verbatim through FastMCP (#9) ─────────
+
+# Strings that are valid JSON but not JSON strings. mcp 1.3.0's pre-parse
+# json.loads()-ed every string argument, turning "1" into the int 1 (rejected
+# by the str field) and '"1"' into... the raw value with its quotes.
+_JSON_SHAPED = ["1", "2", "1.2", "1e5", "1234567890", "true", "false", "null",
+                "[]", "{}", '["a"]', '{"a": 1}', '"1"']
+
+
+def _call(name, arguments):
+    import asyncio
+    import server
+    return asyncio.run(server.mcp.call_tool(name, arguments))
+
+
+@pytest.mark.parametrize("attachment_id", _JSON_SHAPED + ["root", "0.1.2"])
+def test_download_attachment_receives_list_attachments_ids_verbatim(
+        monkeypatch, attachment_id):
+    """The part id list_attachments returns goes through FastMCP's argument
+    handling and reaches gmail_client unchanged — "1" stays the str "1"."""
+    import server
+    _setup_authenticated(monkeypatch)
+    seen = []
+
+    class _Stop(Exception):
+        pass
+
+    client = MagicMock()
+
+    def find_attachment(message_id, att_id):
+        seen.append((message_id, att_id))
+        raise _Stop()
+
+    client.find_attachment.side_effect = find_attachment
+    monkeypatch.setattr(server, "_client", client)
+    with pytest.raises(Exception):
+        _call("download_attachment", {"message_id": "1234567890", "attachment_id": attachment_id})
+    assert seen == [("1234567890", attachment_id)]
+    assert type(seen[0][1]) is str
+
+
+def test_every_str_parameter_of_every_tool_keeps_json_shaped_values():
+    """No str parameter on this server is JSON-decoded before validation."""
+    import server
+    checked = 0
+    for tool in server.mcp._tool_manager.list_tools():
+        meta = tool.fn_metadata
+        for field, info in meta.arg_model.model_fields.items():
+            if info.annotation is not str:
+                continue
+            for value in _JSON_SHAPED:
+                parsed = meta.arg_model.model_validate(meta.pre_parse_json({field: value}) | {
+                    f: "x" for f, i in meta.arg_model.model_fields.items()
+                    if f != field and i.is_required()})
+                assert getattr(parsed, field) == value, (tool.name, field, value)
+                checked += 1
+    assert checked >= 15 * len(_JSON_SHAPED)
