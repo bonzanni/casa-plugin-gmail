@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -10,6 +10,25 @@
   "casa": {
     "callbacks": [{"name": "oauth"}],
     "setupTool": "setup_gmail",
+    "provides_tools": [
+      "mcp__plugin_gmail_gmail__setup_gmail",
+      "mcp__plugin_gmail_gmail__gmail_auth_collect",
+      "mcp__plugin_gmail_gmail__search_emails",
+      "mcp__plugin_gmail_gmail__get_email",
+      "mcp__plugin_gmail_gmail__get_thread",
+      "mcp__plugin_gmail_gmail__manage_email",
+      "mcp__plugin_gmail_gmail__list_attachments",
+      "mcp__plugin_gmail_gmail__download_attachment",
+      "mcp__plugin_gmail_gmail__save_attachment",
+      "mcp__plugin_gmail_gmail__list_send_as",
+      "mcp__plugin_gmail_gmail__send_email",
+      "mcp__plugin_gmail_gmail__reply_to_thread",
+      "mcp__plugin_gmail_gmail__erase_gmail",
+      "mcp__plugin_gmail_gmail__erase_gmail_data"
+    ],
+    "profiles": {
+      "read": ["search_emails", "get_email", "get_thread", "list_attachments", "download_attachment", "list_send_as"]
+    },
     "eraseTool": "erase_gmail",
     "eraseDataOnlyTool": "erase_gmail_data",
     "protectedTools": [

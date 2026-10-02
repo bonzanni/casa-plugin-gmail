@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.10.2"
+    assert manifest["version"] == "0.11.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -297,6 +297,60 @@ def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
     # Casa >= 0.318.0 admits the setup tool in the declaration as a capability
     # that delivers every slot it provides; every other tool must be there too.
     assert declared == served
+
+
+# ── v0.11.0: casa.profiles — Casa >= 0.338.0 ──
+# A profile is a named subset of the tools, written as bare names; Casa
+# refuses a profiles declaration unless casa.provides_tools lists every
+# fully qualified tool. A tool left out of provides_tools also drops out of
+# the deny list Casa builds from (provides_tools - profile), so it lists all.
+
+_READ_TOOLS = ["search_emails", "get_email", "get_thread", "list_attachments",
+               "download_attachment", "list_send_as"]
+
+
+def _qualified(tool):
+    servers = json.loads(
+        (Path(__file__).parent.parent / ".mcp.json").read_text())["mcpServers"]
+    return {"mcp__plugin_%s_%s__%s" % (_manifest()["name"], s, tool)
+            for s in servers}
+
+
+def test_manifest_provides_every_served_tool_fully_qualified():
+    declared = _manifest()["casa"]["provides_tools"]
+    assert len(declared) == len(set(declared))
+    expected = set()
+    for tool in _registered_tool_names():
+        expected |= _qualified(tool)
+    assert set(declared) == expected
+    assert len(declared) == 14
+
+
+def test_manifest_read_profile_is_exactly_the_tools_that_only_read():
+    profiles = _manifest()["casa"]["profiles"]
+    assert profiles == {"read": _READ_TOOLS}
+    served = _registered_tool_names()
+    assert set(_READ_TOOLS) <= served
+    # Everything else sends, changes, saves or erases mail, or signs in.
+    assert served - set(_READ_TOOLS) == {
+        "send_email", "reply_to_thread", "manage_email", "save_attachment",
+        "erase_gmail", "erase_gmail_data", "setup_gmail", "gmail_auth_collect"}
+
+
+def test_manifest_profiles_pass_casas_shape_rules():
+    # plugin_store.manifest_profiles and plugin_registry.PROFILE_NAME_RE,
+    # Casa 0.338.0: names are not "full", tools are bare and unique, and each
+    # expansion is declared in provides_tools.
+    import re
+    casa = _manifest()["casa"]
+    for name, tools in casa["profiles"].items():
+        assert name != "full"
+        assert re.fullmatch(r"[a-z][a-z0-9_-]{0,23}", name)
+        assert tools and len(tools) == len(set(tools))
+        for t in tools:
+            assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", t)
+            assert "__" not in t and not t.startswith("mcp__")
+            assert _qualified(t) <= set(casa["provides_tools"])
 
 
 def test_manifest_result_contract_entries_are_safe_except_the_sign_in_link():
