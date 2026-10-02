@@ -216,8 +216,8 @@ direct-request minting tool.
 The manifest declares one access profile, `read` (Casa >= 0.338.0): `search_emails`,
 `get_email`, `get_thread`, `list_attachments`, `download_attachment` and `list_send_as`.
 An agent assigned Gmail with that profile can search and read mail and download
-attachments, and Casa denies it the other eight tools: sending, replying, archiving, trashing, marking or labelling
-trashing, saving attachments, the erasers, and sign-in setup. An assignment without a
+attachments, and Casa denies it the other eight tools: sending, replying, archiving, trashing, marking
+or labelling mail, saving attachments, the erasers, and sign-in setup. An assignment without a
 profile gets every tool, as before. Casa sets a profile only on a new assignment, so
 narrowing an existing one means unassigning and assigning again with `profile="read"`.
 `casa.provides_tools` lists all fourteen tools by their full names, which Casa requires
