@@ -213,6 +213,16 @@ whether it arrived. So the link never passes through the agent, and never lands 
 Only `setup_gmail` mints an authorization link, which is why 0.7.0 removed the separate
 direct-request minting tool.
 
+The manifest declares one access profile, `read` (Casa >= 0.338.0): `search_emails`,
+`get_email`, `get_thread`, `list_attachments`, `download_attachment` and `list_send_as`.
+An agent assigned Gmail with that profile can search and read mail and download
+attachments, and Casa denies it the other eight tools: sending, replying, archiving, trashing, marking or labelling
+trashing, saving attachments, the erasers, and sign-in setup. An assignment without a
+profile gets every tool, as before. Casa sets a profile only on a new assignment, so
+narrowing an existing one means unassigning and assigning again with `profile="read"`.
+`casa.provides_tools` lists all fourteen tools by their full names, which Casa requires
+when a profile is declared. An older Casa ignores both keys.
+
 ⚠️ Protected tools — require tap-approval from the user before execution.
 
 > **SendAs note:** Only aliases with `verification_status: accepted` can be used as `from_address`. Unverified aliases will be rejected by Gmail.
