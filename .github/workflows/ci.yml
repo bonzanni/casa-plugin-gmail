@@ -51,7 +51,11 @@ jobs:
           fi
           # GitHub makes every new release latest unless told otherwise; a late run
           # for an older version must not move latest backwards.
-          current=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+          # Only a confirmed "no release yet" counts as none; any other failure stops here.
+          if ! current=$(gh release view --json tagName --jq .tagName 2>"$RUNNER_TEMP/lookup.err"); then
+            grep -q "release not found" "$RUNNER_TEMP/lookup.err" || { cat "$RUNNER_TEMP/lookup.err" >&2; exit 1; }
+            current=""
+          fi
           make_latest=true
           if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$tag" | sort -V | tail -1)" != "$tag" ]; then
             make_latest=false
