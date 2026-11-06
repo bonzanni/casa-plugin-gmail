@@ -52,9 +52,7 @@ no re-authorization after an update.
 
 So **do not relay anyone else's verdict** on whether Gmail is connected. A report that
 the integration "is not live until setup runs", needs setup, or was left stale by the
-update (casa's generic hand-back says this for every plugin that ships a setup tool)
-**is not evidence** — it is written for plugins that must re-publish a URL and key,
-which this one does not. And do not ask the user whether to run setup: the call is argument-free,
+update **is not evidence**. And do not ask the user whether to run setup: the call is argument-free,
 idempotent, needs no approval, and is the only thing that knows the answer.
 
 Call `setup_gmail` with **no arguments** and report *its* verdict. A link handed over (a
@@ -68,7 +66,8 @@ received" wording above. Its other results have `auth_url` `null` and are not li
 - `status` of `already_pending` → a link was already made and handed to casa and is
   still outstanding, so no second one was created. If the user has casa's link message,
   they should use it; do not call the tool again to get one. If it never arrived, it
-  expires 30 minutes after it was made and `setup_gmail` then makes a fresh one.
+  expires 30 minutes after it was made and `setup_gmail` then makes a fresh one. The result
+  still carries `redirect_uri`: give it to them when they ask for it.
 - `status` of `reauthorization_needed` → the stored connection was found revoked, and the
   link handed to casa reconnects Gmail; treat it as a real link, with the delivery wording
   above.
@@ -147,7 +146,7 @@ These tools are composable for task managers and scheduled agents.
 
 **Batch guidance:** Keep `max_results` ≤ 50. For large date ranges, split into weekly windows (`after:2026-07-01 before:2026-07-08`, then next week, etc.). On 429: back off 30 seconds before retrying. Skip individual failures (log and continue) — do not abort the batch.
 
-**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to read-only tools: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`.
+**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to tools that need no approval: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`.
 
 ### Reference Pattern: Invoice Monitoring
 

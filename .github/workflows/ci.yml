@@ -1,0 +1,64 @@
+# Runs the tests on every pull request and every push to main.
+#
+# On a push to main that passes, publishes v<plugin.json version> as the latest
+# GitHub release, creating the tag at that commit. Bumping the version and merging
+# it to main is the whole release procedure; an unchanged version does nothing.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11" # server/vendor is built for CPython 3.11
+      - run: pip install -r server/requirements-dev.txt
+      - run: python -m pytest tests -q
+
+  release:
+    needs: test
+    if: github.event_name == 'push'
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish v<version> unless it is already released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "plugin.json version '$version' is not MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released"
+            exit 0
+          fi
+          # GitHub makes every new release latest unless told otherwise; a late run
+          # for an older version must not move latest backwards.
+          # Only a confirmed "no release yet" counts as none; any other failure stops here.
+          if ! current=$(gh release view --json tagName --jq .tagName 2>"$RUNNER_TEMP/lookup.err"); then
+            grep -q "release not found" "$RUNNER_TEMP/lookup.err" || { cat "$RUNNER_TEMP/lookup.err" >&2; exit 1; }
+            current=""
+          fi
+          make_latest=true
+          if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$tag" | sort -V | tail -1)" != "$tag" ]; then
+            make_latest=false
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --latest="$make_latest" \
+            --notes "$(git log -1 --format=%s)"

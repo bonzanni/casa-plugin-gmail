@@ -84,7 +84,7 @@ def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
 @pytest.mark.parametrize("slot", ["oauth_token.json", "oauth_token.staged.json"])
 def test_a_token_left_by_an_interrupted_write_is_revoked_first(tmp_path, monkeypatch, slot):
     """A crash between the temp file's fsync and its rename leaves a complete
-    token in `.<slot>.tmp` (diff r1, Astra): it must be revoked, and kept when
+    token in `.<slot>.tmp`: it must be revoked, and kept when
     the revocation is not confirmed, like any stored token."""
     import token_store
     store = TokenStore(str(tmp_path))
@@ -121,7 +121,7 @@ CREDENTIAL_FILES = ["oauth_token.json", "oauth_token.staged.json",
     'not json', '', '{"refresh_token": ""}', '[]',
 ])
 def test_a_credential_file_that_is_not_readable_is_kept_and_incomplete(tmp_path, name, content):
-    """Diff rounds r1-r3 found a token escaping discovery three times (a write
+    """A token escaped discovery in three different ways (a write
     temporary, a short write, a cut token prefix / a read error). The rule that
     replaced them: only a credential read whole and revoked with Google's
     confirmation is deleted. Anything else in a credential slot may hold a live
@@ -358,7 +358,7 @@ def test_erasing_data_forgets_the_sent_log_in_memory_too(monkeypatch, tmp_path):
 
 
 def test_a_second_server_process_cannot_write_erased_history_back(tmp_path):
-    """Diff r4 (Astra): a send in flight in another server process recorded
+    """A send in flight in another server process recorded
     its whole stale in-memory log after the erase. The file is now the record:
     that process adds its own entry and nothing it remembered."""
     from sent_log import SentLog

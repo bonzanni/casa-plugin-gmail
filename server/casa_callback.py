@@ -146,9 +146,9 @@ class CasaCallback:
         `attempts/` is materialized later, by the `callback_spool_recovery` job
         casa runs every five minutes (casa_core.py). So for minutes after a
         mint, `attempts()` is empty while a live authorization link is
-        outstanding — a blind window observed in production at ~3 minutes
-        (mint 10:54:54Z, attempt record 10:57). Anything that must not mint a
-        SECOND live link has to read this directory, not only `attempts/`.
+        outstanding — a blind window measured at about 3 minutes on a real
+        install. Anything that must not mint a SECOND live link has to read
+        this directory, not only `attempts/`.
 
         The clock is the file's MTIME, because the protocol has no other one:
         the payload casa writes is the envelope `{"v": 2, "meta": <meta>}` —
