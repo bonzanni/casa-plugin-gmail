@@ -1,7 +1,7 @@
 """Hand the Google sign-in link to Casa, which posts it in the user's chat.
 
 Casa >= 0.318.0's result contract lets a `capability` tool declare that a slot
-it provides is `delivers`-ed as an `operator_link` (ha-casa-app#1015). The tool
+it provides is `delivers`-ed as an `operator_link`. The tool
 does not return the URL. During the call it DEPOSITS the URL with Casa's
 broker, over the internal Unix socket named by `$CASA_BROKER_SOCKET`, as the
 client named by `$CASA_BROKER_CLIENT` (Casa puts both in this server's

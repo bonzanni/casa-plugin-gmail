@@ -104,7 +104,7 @@ def _ok(data) -> str:
 #
 # `setup_gmail` is declared in casa.resultContract as a capability that
 # provides `auth_url` and `delivers` it as an `operator_link` (Casa >=
-# 0.318.0, ha-casa-app#1015). The link is deposited with Casa's broker and the
+# 0.318.0). The link is deposited with Casa's broker and the
 # result carries only Casa's reference in `auth_url`; Casa posts the link in
 # the user's chat itself, labelled and captioned as below, and replaces the
 # result with a receipt when it arrived. A result that made no link carries
@@ -127,8 +127,8 @@ def _no_link(**fields) -> str:
 def _stored_credential():
     """The DURABLE credential for the configured subject, or None.
 
-    Deliberately does NOT consult `_authenticated`. Three review rounds found
-    the same bug in three disguises, and the common cause was that setup_gmail
+    Deliberately does NOT consult `_authenticated`. The same bug turned up in
+    three disguises, and the common cause was that setup_gmail
     decided from in-memory runtime state: `_authenticated` records whether
     startup happened to succeed, which is a fact about this process, not about
     the credential. The two diverge exactly when it matters — `load_active`
@@ -166,7 +166,7 @@ def _bring_into_service(cred) -> str | None:
     the store and false of the tools — every Gmail call still raises "Gmail is
     not authenticated" until the process is restarted. Reporting a connection
     the operator cannot use is the same class of lie as vouching for a revoked
-    one, which is the bug fixed the round before this. `activate()` exists for
+    one. `activate()` exists for
     exactly this, its `on_activate` hook rebuilds the runtime, and both are
     idempotent (see `_rebuild_runtime`). It writes no credential and removes
     none: activation is a runtime operation, and the store is untouched — which
