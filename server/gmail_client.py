@@ -45,25 +45,26 @@ def _decode_part_data(data: str) -> str:
     return base64.urlsafe_b64decode(data + "=" * missing).decode("utf-8", errors="replace")
 
 
-def _extract_part(payload: dict, mime_type: str) -> str:
+def _extract_parts(payload: dict, mime_type: str) -> list[str]:
+    """The message's parts of a type. Where it offers alternative versions,
+    the first with content; any other multipart's parts are pieces of it."""
     if payload.get("filename"):
         # Gmail's contract: filename is present only on attachment parts
         # (attachmentId absent just means the content is inline). Never the body.
-        return ""
+        return []
     # Strip Content-Type parameters ("text/html; charset=utf-8") before matching.
     mime = payload.get("mimeType", "").split(";", 1)[0].strip().lower()
     if mime == mime_type:
-        return _decode_part_data(payload.get("body", {}).get("data", ""))
+        text = _decode_part_data(payload.get("body", {}).get("data", ""))
+        return [text] if text.strip() else []
+    found: list[str] = []
     if mime.startswith("multipart/"):
         for part in payload.get("parts", []):
-            body = _extract_part(part, mime_type)
-            if body:
-                return body
-    return ""
-
-
-def _extract_body(payload: dict) -> str:
-    return _extract_part(payload, "text/plain")
+            pieces = _extract_parts(part, mime_type)
+            if pieces and mime == "multipart/alternative":
+                return pieces
+            found.extend(pieces)
+    return found
 
 
 class _LinkParser(HTMLParser):
@@ -99,17 +100,21 @@ def _extract_links(html: str) -> list[dict]:
     return parser.links
 
 
-def _body_and_links(payload: dict) -> dict:
-    """Body plus link targets from the HTML part (issue #1).
+def _body_and_links(payload: dict, include_html: bool) -> dict:
+    """Body and link targets (issue #1), and the HTML part for the agent to read.
 
-    Plain text stays the body; HTML-only mail falls back to the raw HTML
-    so the body is never empty when content exists.
+    Whether a plain part says all the HTML does is the agent's to judge: some
+    are a stub, or a placeholder the sender's template left behind. Mail with
+    no plain text has its HTML as its body, under include_html or not.
     """
-    body = _extract_body(payload)
-    html = _extract_part(payload, "text/html")
-    if not body and html:
-        body = html
-    return {"body": body, "links": _extract_links(html) if html else []}
+    html_parts = _extract_parts(payload, "text/html")
+    plain = "\n\n".join(_extract_parts(payload, "text/plain"))
+    html = "\n\n".join(html_parts)
+    links = [link for part in html_parts for link in _extract_links(part)]
+    result = {"body": plain or html, "links": links}
+    if plain and html and include_html:
+        result["html"] = html
+    return result
 
 
 def _attachment_parts(payload: dict, root: bool = True) -> list[tuple[str, dict]]:
@@ -233,11 +238,11 @@ class GmailClient:
                 "date": _parse_date(_get_header(headers, "Date")),
                 "subject": _get_header(headers, "Subject") or "(no subject)",
             },
-            **_body_and_links(detail.get("payload", {})),
+            **_body_and_links(detail.get("payload", {}), include_html=True),
             "attachments": _extract_attachments(detail.get("payload", {})),
         }
 
-    def get_thread(self, thread_id: str, max_messages: int = 20) -> dict:
+    def get_thread(self, thread_id: str, max_messages: int = 20, include_html: bool = False) -> dict:
         max_messages = min(max_messages, 50)
         try:
             resp = self._service.users().threads().get(
@@ -265,7 +270,7 @@ class GmailClient:
                     "date": _parse_date(_get_header(headers, "Date")),
                     "subject": _get_header(headers, "Subject") or "(no subject)",
                 },
-                **_body_and_links(msg.get("payload", {})),
+                **_body_and_links(msg.get("payload", {}), include_html),
                 "attachments": _extract_attachments(msg.get("payload", {})),
             })
         return {"messages": messages, "truncated": truncated, "total_messages": total}

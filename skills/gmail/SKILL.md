@@ -112,6 +112,7 @@ Use these tools when the user asks to check, search, or read email; send or repl
 
 - **Before `get_email`:** always call `search_emails` first — never construct a message_id
 - **Acting on a link in a message** (sign-in, confirmation, unsubscribe): take the URL from the `links` field (`{text, href}` pairs from the HTML part) returned by `get_email`/`get_thread` — the plain-text `body` often shows only the link's anchor text, not its target
+- **Reading a message:** a plain-text `body` can be only a stub or a placeholder. `get_email` also returns the HTML part as `html`; read it when the body may not be the whole message. In a thread, open such a message with `get_email`
 - **Before `reply_to_thread`:** always call `get_thread` to read full context; if `truncated: true`, retry with a higher `max_messages` value to load more history before replying; if still truncated, tell the user how many messages are loaded vs. total
 - **Before `download_attachment`:** always call `list_attachments` first to identify the specific file
 - **Attachments to send:** `attachment_paths` accepts a path in Casa's handoff folder — what `download_attachment` returns, a file another plugin produced for you, or a file the user sent the assistant, once shared with `share_inbound_file` — or a file under this plugin's `saved/`. Any other path is refused.
