@@ -355,7 +355,7 @@ def test_manifest_profiles_pass_casas_shape_rules():
 
 def test_manifest_result_contract_entries_are_safe_except_the_sign_in_link():
     """Every entry but setup_gmail's is exactly {"result": "safe"}. setup_gmail
-    is the one tool that makes a link, and Casa delivers it (ha-casa-app#1015):
+    is the one tool that makes a link, and Casa delivers it:
     a capability providing exactly `auth_url`, delivered as an operator link,
     consuming nothing -- the only capability shape Casa accepts on a setup tool."""
     tools = _manifest()["casa"]["resultContract"]["tools"]
@@ -581,7 +581,7 @@ def test_setup_gmail_does_not_mint_twice_while_disconnected(monkeypatch):
     The double models what casa's `mint()` ACTUALLY leaves behind: a file in
     `pending/` and NOTHING in `attempts/`. The attempt record is materialized
     by casa's `callback_spool_recovery` job, which runs every five minutes
-    (casa_core.py) — observed at ~3 minutes on the live host. An earlier
+    (casa_core.py) — measured at about 3 minutes on a real install. An earlier
     version of this test fabricated the attempt record at mint time, which is
     why a check that read only `attempts/` looked like it worked.
     """
@@ -952,7 +952,7 @@ def test_setup_gmail_mints_when_the_active_credential_is_another_account(monkeyp
 # state — credential on disk, runtime inactive — one per probe verdict.
 
 def _restart_auth(monkeypatch, probe_error=None, activate_error=None):
-    """Sol's reproduction: a retained credential, an INACTIVE runtime.
+    """A retained credential, an INACTIVE runtime.
 
     Nothing here is exotic — it is exactly what a restart leaves behind after
     `load_active` retains the token and returns False.
@@ -1125,7 +1125,7 @@ def test_already_connected_says_an_update_does_not_change_the_authorization(monk
     """The one copy of the invariant a caller is guaranteed to see.
 
     SKILL.md's body is loaded only when its description matches the turn, and
-    the N150 transcripts show it absent even on turns that called this tool —
+    it has been seen absent even on turns that called this tool —
     but a tool RESULT is always in context. So the statement that an update
     left the authorization alone has to travel in `instructions`, not only in
     the skill: this is what answers a hand-back claiming the integration is
@@ -1155,7 +1155,7 @@ def test_already_connected_says_an_update_does_not_change_the_authorization(monk
         assert event in instructions, f"{event} is not covered"
 
 
-# --- #486: downloads go to Casa's handoff folder; attachments are read once ---
+# --- Downloads go to Casa's handoff folder; attachments are read once ---
 
 @pytest.fixture
 def handoff(tmp_path, monkeypatch):

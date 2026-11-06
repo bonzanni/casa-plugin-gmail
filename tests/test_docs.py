@@ -44,7 +44,7 @@ def _step_number(marker):
     return hits[0]
 
 
-# ── Fix D: the OAuth client type a personal account can actually create ────
+# ── The OAuth client type a personal account can actually create ───────
 
 def test_readme_does_not_prescribe_an_internal_only_client():
     """"Internal" is selectable only inside a Workspace organization. Requiring
@@ -62,7 +62,7 @@ def test_readme_explains_both_consent_screen_user_types():
     assert "must still be **Web application**" in text
 
 
-# ── Fix E: the redirect URI must be discoverable, not guessed ──────────────
+# ── The redirect URI must be discoverable, not guessed ─────────────────
 
 def test_readme_gives_a_concrete_way_to_obtain_the_redirect_uri():
     """The old text said to read `/data/callbacks/<plugin-name>/ready.json`
@@ -74,7 +74,7 @@ def test_readme_gives_a_concrete_way_to_obtain_the_redirect_uri():
     assert "the tool returns a `redirect_uri` field" in text
 
 
-# ── Fix F: every quoted diagnostic must be a string the code emits ─────────
+# ── Every quoted diagnostic must be a string the code emits ────────────
 
 def test_readme_no_longer_quotes_the_obsolete_token_diagnostic():
     assert "stored token invalid or expired" not in _read(README)
@@ -100,7 +100,7 @@ def test_every_quoted_diagnostic_matches_its_source():
         assert readme_fragment in readme, f"{readme_fragment!r} missing from README"
 
 
-# ── Round 2: a step cannot depend on configuration a later step performs ───
+# ── A step cannot depend on configuration a later step performs ────────
 
 def test_the_env_vars_are_configured_before_the_tool_that_needs_them():
     """The redirect URI is discovered by calling `setup_gmail`, and the
@@ -196,11 +196,11 @@ def test_every_step_3_pointer_names_the_step_it_means():
         assert 1 <= int(ref) <= numbered, f"Step 3.{ref} does not exist"
 
 
-# ── Round 2: External + Testing expires the connection weekly ──────────────
+# ── External + Testing expires the connection weekly ───────────────────
 
 def test_readme_documents_the_testing_status_refresh_token_expiry():
-    """Round 1 told personal-account readers to use External and leave the app
-    unpublished. Google expires refresh tokens issued by an External app in
+    """An earlier README told personal-account readers to use External and leave
+    the app unpublished. Google expires refresh tokens issued by an External app in
     Testing after 7 days, so that advice breaks the connection weekly."""
     text = _read(README)
     assert "7 days" in text
@@ -221,7 +221,7 @@ def test_readme_is_honest_about_what_production_entails():
     assert "does **not** require passing Google verification first" in text
 
 
-# ── Fix C's companion: the skill must relay an empty result honestly ───────
+# ── The skill must relay an empty result honestly ──────────────────────
 
 def test_skill_tells_the_agent_an_empty_collect_is_not_a_success():
     text = _read("skills", "gmail", "SKILL.md")
@@ -279,7 +279,7 @@ def test_the_skill_tells_the_agent_to_send_the_operator_to_a_real_browser():
 
 
 def test_the_skill_says_casa_posts_the_link_and_the_receipt_is_the_only_claim():
-    """ha-casa-app#1015: the agent no longer composes the link message — casa
+    """The agent no longer composes the link message — casa
     posts it (with the browser note as its caption) and replaces the result
     with a receipt. So the old "put the warning before the link" placement
     rule has nothing to place; what must hold instead is that the agent never
@@ -353,7 +353,7 @@ def test_the_skill_covers_every_status_the_setup_tool_can_return():
             f"server.py returns {status!r} but SKILL.md never mentions it"
 
 
-# ── Sol round 2: the README must not promise what the code cannot keep ────
+# ── The README must not promise what the code cannot keep ──────────────
 
 def test_the_readme_no_longer_calls_re_running_setup_always_safe():
     """The old sentence promised re-running `setup_gmail` was "always safe"
@@ -616,17 +616,17 @@ _MUST_BE_CAUGHT = [
     # The same promise relocated into a different runtime string.
     ("relocated",
      "run setup_gmail again in the same session and it will work."),
-    # Terra: an unrelated negation ("do not WAIT") in the same sentence used
-    # to disarm a sentence-wide denial exemption.
-    ("terra-unrelated-negation",
+    # An unrelated negation ("do not WAIT") in the same sentence used to
+    # disarm a sentence-wide denial exemption.
+    ("unrelated-negation-do-not-wait",
      "Do not wait for an administrator: correct your OAuth client settings, "
      "then run setup_gmail again immediately."),
-    # Sol: the same trick, and the promise made twice over — "in the same
+    # The same trick, and the promise made twice over — "in the same
     # session" AND "it will recover".
-    ("sol-unrelated-negation",
+    ("unrelated-negation-do-not-start",
      "Do not start a new authorization, but run setup_gmail again in the "
      "same session and it will recover Gmail."),
-    # Terra: the instruction and the immediate-effect claim split across a
+    # The instruction and the immediate-effect claim split across a
     # full stop, so that neither sentence carries the promise alone.
     ("split-across-sentences",
      "Correct `GMAIL_CLIENT_SECRET` in casa's plugin environment, then run "
@@ -659,7 +659,7 @@ _MUST_NOT_BE_CAUGHT = [
                          ids=[i for i, _ in _MUST_BE_CAUGHT])
 def test_the_detector_catches_every_wording_that_has_beaten_it(passage):
     """Each of these promises a same-session recovery. Two of them were
-    written by reviewers specifically to slip past this detector, by putting a
+    written specifically to slip past this detector, by putting a
     negation that denies something else into the sentence; a third splits the
     promise over two sentences. If one of them stops failing here, the guard
     has a hole of exactly the kind it exists to close."""
@@ -709,16 +709,16 @@ def test_advice_to_fix_a_startup_cached_env_var_names_the_session_requirement():
     assert checked, "the guard matched nothing — it has stopped guarding"
 
 
-# ── 2026-08-07: an update must acknowledge the authorization it did not touch
+# ── An update must acknowledge the authorization it did not touch ──────
 #
-# Observed on the N150 (session 6e80ce7f, 07:59Z): the configurator handed back
+# Observed on a real install: the configurator handed back
 # "The integration is not live until `setup_gmail` runs", the resident relayed
 # it as fact and asked the operator whether to run setup — while Gmail was
 # connected and serving. One minute later `search_emails` returned the inbox.
 #
-# The deadness claim is casa's generic doctrine (recipes/plugin/update.md,
-# written for a webhook-repointing plugin that must re-publish its URL and
-# key). It is not a fact about this plugin: the refresh token lives in
+# The deadness claim came from generic update guidance, written for a
+# webhook-repointing plugin that must re-publish its URL and key. It is not
+# a fact about this plugin: the refresh token lives in
 # CLAUDE_PLUGIN_DATA, outside the versioned artifact, and this plugin declares
 # a callback and no triggers, so an update re-mints no secret that could reach
 # the stored grant. Only the store knows, and `setup_gmail` is what asks it.
@@ -738,8 +738,8 @@ def _setup_block():
 
 def test_the_skill_description_triggers_on_a_plugin_update_report():
     """The load-bearing half of the fix. Casa runs `skills="all"` — ordinary
-    description-gated loading — and grepping both N150 transcripts for a
-    `Skill` invocation naming `gmail` returns nothing: the body was not in
+    description-gated loading — and the failure above involved no `Skill`
+    invocation naming `gmail`: the body was not in
     context on the turn that relayed the false claim, nor even on the turn that
     called `setup_gmail`. A description covering only reading, searching,
     sending and managing email never matches a turn that reports a DEPLOYMENT,
@@ -766,7 +766,7 @@ def test_the_skill_tells_the_agent_an_update_cannot_revoke_the_authorization():
 
 def test_the_skill_forbids_relaying_someone_elses_verdict_on_the_connection():
     """The observed failure in one assertion. Stated as a class, not as casa's
-    sentence: the issue filed against casa asks it to reword that sentence, and
+    sentence: casa may reword that sentence, and
     an instruction pinned to the old wording would stop matching what the agent
     sees."""
     block = _setup_block()
