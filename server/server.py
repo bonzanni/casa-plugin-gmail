@@ -478,16 +478,16 @@ def search_emails(query: str, max_results: int = 20) -> str:
 
 @mcp.tool()
 def get_email(message_id: str) -> str:
-    """Get full email content including headers, body, links, and attachment list. links is the list of {text, href} pairs from the HTML part — use href when asked to act on a link (sign-in, confirmation, unsubscribe); the plain-text body often omits the target URL."""
+    """Get full email content including headers, body, html, links, and attachment list. body is the plain-text part; html is the HTML part as sent, present when the mail has both. Plain parts are often a stub, a summary or a template placeholder, so read html when there is one and it may say more. Mail with no plain text has its HTML as body. links is the list of {text, href} pairs from the HTML part — use href when asked to act on a link (sign-in, confirmation, unsubscribe); the plain-text body often omits the target URL."""
     _require_auth()
     return _ok(_client.get_email(message_id))
 
 
 @mcp.tool()
-def get_thread(thread_id: str, max_messages: int = 20) -> str:
-    """Get all messages in an email thread (oldest first). Includes truncated/total_messages fields; each message carries a links list of {text, href} pairs from its HTML part."""
+def get_thread(thread_id: str, max_messages: int = 20, include_html: bool = False) -> str:
+    """Get all messages in an email thread (oldest first). Includes truncated/total_messages fields; each message carries a links list of {text, href} pairs from its HTML part. Each body is the plain-text part, or the HTML when a message has no plain text. If a body looks like a stub or placeholder, read that message with get_email; include_html=true adds every message's HTML, which can be very large."""
     _require_auth()
-    return _ok(_client.get_thread(thread_id, max_messages))
+    return _ok(_client.get_thread(thread_id, max_messages, include_html))
 
 
 # ── Manage ─────────────────────────────────────────────────────────────────

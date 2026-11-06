@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.11.1"
+    assert manifest["version"] == "0.12.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──

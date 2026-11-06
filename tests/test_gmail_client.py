@@ -658,3 +658,122 @@ def test_thread_messages_carry_the_same_stable_ids():
         "messages": [msg]}
     from_thread = [a["attachment_id"] for a in client.get_thread("thr1")["messages"][0]["attachments"]]
     assert from_thread == from_email
+
+
+# --- The HTML part goes to the agent as it is ---
+
+def _html_part(html: str) -> dict:
+    return {"mimeType": "text/html", "body": {"data": _b64(html)}}
+
+
+def _plain_part(text: str) -> dict:
+    return {"mimeType": "text/plain", "body": {"data": _b64(text)}}
+
+
+def _read(payload: dict) -> dict:
+    client = make_client()
+    client._service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "id": "msg1", "threadId": "thr1", "payload": payload,
+    }
+    return client.get_email("msg1")
+
+
+def _read_thread_message(payload: dict, **kwargs) -> dict:
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+        "messages": [{"id": "msg1", "threadId": "thr1", "labelIds": [], "payload": payload}],
+    }
+    return client.get_thread("thr1", **kwargs)["messages"][0]
+
+
+def test_placeholder_plain_part_comes_with_the_html():
+    # The shape of a real booking reminder: a placeholder left in the sender's
+    # template as the plain part, the whole message only in the HTML part.
+    html = '<table><tr><td><p>Cancelling costs EUR 24.95.</p><a href="https://x.example/b">Booking</a></td></tr></table>'
+    result = _read(_alternative_payload("Example text content", html))
+    assert result["body"] == "Example text content"
+    assert result["html"] == html
+    assert result["links"] == [{"text": "Booking", "href": "https://x.example/b"}]
+
+
+def test_plain_only_mail_has_no_html_field():
+    assert "html" not in _read({**_plain_part("just text"), "headers": []})
+
+
+def test_html_only_mail_is_the_body_once():
+    result = _read({**_html_part("<p>only html</p>"), "headers": []})
+    assert result["body"] == "<p>only html</p>"
+    assert "html" not in result
+
+
+def test_blank_plain_part_does_not_count_as_a_body():
+    result = _read(_alternative_payload(" \r\n ", "<p>real</p>"))
+    assert result["body"] == "<p>real</p>"
+    assert "html" not in result
+
+
+def test_html_reaches_the_agent_exactly_as_sent():
+    html = ('<html><head><style>.a{color:red}</style></head><body><!-- note -->'
+            '<div title="<!--">Pay EUR 120</div><!-- footer --><script>var a;</script></body></html>')
+    assert _read(_alternative_payload("stub", html))["html"] == html
+
+
+def test_mixed_message_keeps_every_text_part():
+    result = _read({"mimeType": "multipart/mixed", "headers": [], "parts": [
+        _plain_part("Before the photo."),
+        {"mimeType": "image/png", "filename": "a.png", "body": {"attachmentId": "a", "size": 1}},
+        _plain_part("After the photo."),
+    ]})
+    assert result["body"] == "Before the photo.\n\nAfter the photo."
+
+
+def test_html_followed_by_a_plain_footer_keeps_both():
+    result = _read({"mimeType": "multipart/mixed", "headers": [], "parts": [
+        _html_part("<p>Transfer EUR 120 today.</p>"), _plain_part("Confidential."),
+    ]})
+    assert result["body"] == "Confidential."
+    assert result["html"] == "<p>Transfer EUR 120 today.</p>"
+
+
+def test_every_html_piece_comes_along():
+    result = _read({"mimeType": "multipart/alternative", "headers": [], "parts": [
+        _plain_part("Hi"),
+        {"mimeType": "multipart/mixed", "parts": [
+            _html_part("<p>first</p>"),
+            {"mimeType": "application/pdf", "filename": "a.pdf", "body": {"attachmentId": "a", "size": 1}},
+            _html_part("<p>second</p>"),
+        ]},
+    ]})
+    assert result["html"] == "<p>first</p>\n\n<p>second</p>"
+
+
+def test_alternative_takes_one_version_only():
+    result = _read({"mimeType": "multipart/alternative", "headers": [], "parts": [
+        _plain_part(""), _plain_part("first version"), _plain_part("second version"),
+    ]})
+    assert result["body"] == "first version"
+
+
+def test_malformed_html_piece_does_not_swallow_the_next_pieces_links():
+    result = _read({"mimeType": "multipart/mixed", "headers": [], "parts": [
+        _html_part("<p>Forwarded</p><!-- footer"),
+        _html_part('<a href="https://x.example/c">Confirm</a>'),
+    ]})
+    assert result["links"] == [{"text": "Confirm", "href": "https://x.example/c"}]
+
+
+def test_thread_leaves_html_out_unless_asked():
+    payload = _alternative_payload("stub", "<p>real</p>")
+    assert "html" not in _read_thread_message(payload)
+    assert _read_thread_message(payload, include_html=True)["html"] == "<p>real</p>"
+
+
+def test_thread_html_only_message_is_still_its_body():
+    assert _read_thread_message({**_html_part("<p>only</p>"), "headers": []})["body"] == "<p>only</p>"
+
+
+def test_mime_nesting_that_survives_json_parsing_does_not_crash():
+    payload = _plain_part("deep")
+    for _ in range(490):
+        payload = {"mimeType": "multipart/mixed", "parts": [payload]}
+    assert _read(payload)["body"] == "deep"
