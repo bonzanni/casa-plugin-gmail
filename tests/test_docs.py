@@ -130,22 +130,17 @@ def test_the_host_side_route_is_the_one_that_needs_no_running_server():
     assert "without a running server" in step
 
 
-def test_consent_is_approved_only_after_the_environment_is_configured():
-    """Approving the consent DM is precisely what makes casa dispatch
-    `setup_gmail`, and casa dispatches it ONCE: it treats an accepted agent turn
-    as dispatched without correlating whether the tool executed, so there is no
-    retry. With the three variables still unset the server exits in
-    `read_env()`, the dispatched call fails, and the setup episode is spent —
-    the promised automatic link never arrives. This is not hypothetical: on the
-    live host the callback-consent ack is timestamped 10:53:27Z and the
-    variables were wired at 10:54:21Z."""
-    env_step = _step_number("GMAIL_CLIENT_SECRET")
-    consent_step = _step_number("callback-consent DM")
-    assert env_step < consent_step, (
-        "the README has the operator approve consent — which triggers the "
-        "one-shot setup dispatch — before configuring the environment that "
-        "dispatch depends on"
-    )
+def test_the_readme_says_casa_holds_setup_until_the_variables_resolve():
+    """Casa withholds a plugin whose required variables are unresolved and holds
+    its setup run until they resolve, so approving consent first loses nothing.
+    An expired consent DM reads as declined, so the README must not tell the
+    reader to sit on it."""
+    step = _casa_steps()[_step_number("callback-consent DM") - 1]
+    assert "in whichever order" in step
+    assert "dispatches it **once**" not in step
+    assert "no automatic retry" not in _read(README)
+    env_step = _casa_steps()[_step_number("GMAIL_CLIENT_SECRET") - 1]
+    assert "Casa withholds the plugin" in env_step
 
 
 def test_redirect_uri_registration_follows_consent_because_casa_forces_it():
@@ -167,9 +162,7 @@ def test_redirect_uri_registration_follows_consent_because_casa_forces_it():
 def test_the_consent_step_warns_that_approval_is_what_dispatches_setup():
     """The reader has to know WHY the order matters, or they will reorder it."""
     step = _casa_steps()[_step_number("callback-consent DM") - 1]
-    assert "MCP server is healthy" in step
-    assert "no automatic retry" in step
-    assert "dispatches it **once**" in step
+    assert "releases the setup run" in step
     # ...and that the link it produces must not be opened before 3.5.
     assert "finish Step 3.5 before opening it" in step
 
@@ -384,6 +377,7 @@ def test_the_redirect_uri_step_says_a_second_ask_does_not_mint_another():
     step = _casa_steps()[_step_number(_DISCOVERY_ROUTE) - 1]
     assert "already_pending" in step
     assert "always mints a fresh link" not in step
+    assert "still gives you the `redirect_uri`" in step
 
 
 def test_no_artifact_still_names_the_removed_direct_minter():
@@ -816,8 +810,6 @@ def test_the_readme_tells_a_working_operator_an_update_changes_nothing():
     assert "no triggers" in section, \
         "the section does not say why no secret an update re-mints can reach the grant"
     assert "already_connected" in section
-    # The claim being contradicted, named once so the operator recognises it.
-    assert "not live" in section
 
 
 def test_the_readme_update_section_sits_outside_troubleshooting():
