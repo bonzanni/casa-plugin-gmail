@@ -266,7 +266,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.11.0"
+    assert manifest["version"] == "0.11.1"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -515,6 +515,9 @@ def test_the_setup_tool_exists_and_is_argument_free():
     assert inspect.signature(server.setup_gmail).parameters == {}
 
 
+REDIRECT_URI = "https://casa.example.com/callback/plg-gmail--oauth"
+
+
 def _spool(monkeypatch, *attempts, pending=()):
     """Install a stub casa spool exposing `attempts` and `pending_mint_times`.
 
@@ -531,6 +534,7 @@ def _spool(monkeypatch, *attempts, pending=()):
     cb = MagicMock()
     cb.attempts.return_value = list(attempts)
     cb.pending_mint_times.return_value = list(pending)
+    cb.resolve.return_value = MagicMock(redirect_uri=REDIRECT_URI)
     monkeypatch.setattr(server, "_cb", cb)
     return cb
 
@@ -618,6 +622,18 @@ def test_setup_gmail_defers_to_a_pending_state_with_no_attempt_record_yet(monkey
 
     result = json.loads(server.setup_gmail())
     assert result["status"] == "already_pending"
+
+
+def test_already_pending_still_names_the_redirect_uri(monkeypatch):
+    """The dispatched run reports in one short line and may leave the URI out,
+    so asking again is how the reader gets it for Step 3.5."""
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+    _spool(monkeypatch, pending=[time.time() - 30])
+    result = json.loads(server.setup_gmail())
+    assert result["status"] == "already_pending"
+    assert result["auth_url"] is None
+    assert result["redirect_uri"] == REDIRECT_URI
 
 
 def test_setup_gmail_mints_when_the_pending_state_is_past_casas_ttl(monkeypatch):

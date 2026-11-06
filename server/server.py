@@ -405,6 +405,7 @@ def setup_gmail() -> str:
         if _outstanding_authorization():
             return _no_link(**{
                 "status": "already_pending",
+                "redirect_uri": _cb.resolve().redirect_uri,
                 "instructions": (
                     "An authorization link for Gmail was already created and "
                     "handed to Casa, and it is still outstanding — no new link "
@@ -413,7 +414,8 @@ def setup_gmail() -> str:
                     "should use it. If they never received it or no longer "
                     "have it, run setup_gmail again once it expires (30 "
                     "minutes after it was created) and a fresh one will be "
-                    "made."
+                    "made. If Google reports redirect_uri_mismatch, register "
+                    "the redirect_uri above with the OAuth client."
                 ),
             })
         result = _flow_start(_auth, _cb)
