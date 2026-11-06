@@ -218,7 +218,7 @@ def test_peeking_removes_nothing(tmp_path):
 
 
 def test_a_notice_is_not_removed_by_a_later_pass(tmp_path):
-    """P1. A completed pass is NOT evidence that its response reached anyone,
+    """A completed pass is NOT evidence that its response reached anyone,
     so the pass after it must not purge what the first one merely returned.
     Only exhausting the offer budget removes a notice."""
     from token_store import NOTICE_OFFER_LIMIT
@@ -235,7 +235,7 @@ def test_a_notice_is_not_removed_by_a_later_pass(tmp_path):
 
 
 def test_a_notice_is_offered_at_most_the_limit_then_never_again(tmp_path):
-    """P2. At-least-once must not become forever. The count is durable, so a
+    """At-least-once must not become forever. The count is durable, so a
     fresh TokenStore — which is all a restart is, now that no process identity
     survives anywhere — resumes the budget instead of resetting it."""
     from token_store import NOTICE_OFFER_LIMIT
@@ -254,7 +254,7 @@ def test_a_notice_is_offered_at_most_the_limit_then_never_again(tmp_path):
 
 
 def test_requeueing_an_offered_notice_neither_duplicates_it_nor_resets_it(tmp_path):
-    """P3. A settlement whose ack failed is settled again by the next startup,
+    """A settlement whose ack failed is settled again by the next startup,
     which re-queues the identical flow:disposition. That must stay a no-op —
     not a second copy, and not a fresh offer budget for the first."""
     from token_store import NOTICE_OFFER_LIMIT

@@ -1,4 +1,4 @@
-"""The plugin file handoff contract (#486) — publish and capture.
+"""The plugin file handoff contract — publish and capture.
 
 Casa owns one folder, ``/data/handoff`` (``CASA_HANDOFF_DIR``), through which a
 file moves from one plugin to another, or from Casa to a plugin. A producer

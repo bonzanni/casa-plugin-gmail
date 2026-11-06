@@ -272,7 +272,7 @@ def _auth_with_real_refresh(tmp_path, monkeypatch, refresh_side_effect):
 
 
 def test_reconcile_retains_a_stage_when_google_is_transiently_down(tmp_path, monkeypatch):
-    """BLOCKER regression. google-auth raises RefreshError(retryable=True) for a
+    """Regression. google-auth raises RefreshError(retryable=True) for a
     transient Google 5xx, after its own retries are spent. Settling that would
     ack and unlink a perfectly valid freshly-granted credential."""
     from google.auth.exceptions import RefreshError
@@ -559,7 +559,7 @@ def test_the_notice_is_written_before_the_ack(tmp_path):
 # keeps "at least once" from becoming "forever".
 
 def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
-    """Sol's case: the notice is read, then cb.attempts() blows up — the tool
+    """The notice is read, then cb.attempts() blows up — the tool
     errors out and the sentence must still be waiting for the retry."""
     from auth_flow import collect_pass, startup_recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
@@ -576,7 +576,7 @@ def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
 
 
 def test_a_notice_survives_a_retried_collect_in_the_same_process(tmp_path):
-    """P1, and Terra's MAJOR. Casa's nudge carries a six-dispatch budget, so a
+    """Casa's nudge carries a six-dispatch budget, so a
     second gmail_auth_collect in the same process is ordinary — it is NOT
     evidence that the first response reached the agent. If the second pass
     purges what the first returned, the user is told nothing was waiting when
@@ -596,7 +596,7 @@ def test_a_notice_survives_a_retried_collect_in_the_same_process(tmp_path):
 
 
 def test_a_pass_that_raises_does_not_consume_an_offer(tmp_path):
-    """P4. The offer is counted only on a normal return, so a pass that blew up
+    """The offer is counted only on a normal return, so a pass that blew up
     after peeking leaves the whole budget intact."""
     from token_store import NOTICE_OFFER_LIMIT
     from auth_flow import collect_pass, startup_recover
@@ -617,7 +617,7 @@ def test_a_pass_that_raises_does_not_consume_an_offer(tmp_path):
 
 
 def test_a_notice_is_offered_a_bounded_number_of_times_then_never_again(tmp_path):
-    """P2. The other half: at-least-once must not become forever, and a restart
+    """The other half: at-least-once must not become forever, and a restart
     must neither reset the budget nor exempt a notice from it — the count is on
     disk, and no process identity is involved anywhere."""
     from token_store import NOTICE_OFFER_LIMIT, TokenStore
@@ -800,8 +800,8 @@ def test_claimed_attempt_resumes_from_the_held_journal(tmp_path):
 
 def test_terminal_exchange_falls_through_to_an_older_flow(tmp_path):
     """Regression pin for the configuration split. A genuinely dead
-    authorization code (`invalid_grant`) must keep the settled behaviour it has
-    had since round 3: ack THAT attempt, then move on to the next one. Counts,
+    authorization code (`invalid_grant`) must keep its settled behaviour:
+    ack THAT attempt, then move on to the next one. Counts,
     not just statuses — a status-only assertion cannot tell "acked and moved
     on" apart from "acked and stopped"."""
     from unittest.mock import call
@@ -888,7 +888,7 @@ def test_retain_from_step0_ends_the_pass_before_any_attempt(tmp_path):
 
 
 def test_a_settled_dead_stage_lets_a_later_flow_succeed(tmp_path):
-    """Regression for the round-4 deadlock: the slot must not wedge."""
+    """Regression for a deadlock: the slot must not wedge."""
     from auth import RefreshTerminal
     from auth_flow import collect_pass
     auth, cb, store = wire(tmp_path, [attempt(NEW)], staged=("rt-dead", "c" * 64, 5.0))

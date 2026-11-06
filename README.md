@@ -6,8 +6,9 @@ Gives the agent (casa's resident assistant) full Gmail access on the user's beha
 
 - Google Cloud project with Gmail API enabled
 - An OAuth 2.0 client of type **Web application** — not Desktop app (see below). The consent screen's **user type** depends on your account, and only one of the two is ever selectable: see Step 2.
-- A casa deployment with `public_url` set to a public `https://` origin, and the plugin assigned a reachable role
-- **Casa 0.319.0 or later.** Casa posts the sign-in link in your chat itself (a delivered link, Casa 0.318.0), and passes on `setup_gmail`'s answer when it made no link (Casa 0.319.0). An older Casa refuses this plugin's manifest at install.
+- A casa deployment with `public_url` set to a public `https://` origin, and the plugin assigned to an agent that can reach it (Step 3)
+- **Casa 0.338.0 or later.** An older Casa either refuses this plugin's manifest or lacks the sign-in link delivery, the two-choice erase at uninstall or the `read` profile described below.
+- **An `amd64` Home Assistant host.** `server/vendor/` holds compiled modules for CPython 3.11 on linux x86_64 only, so on `aarch64` the plugin's server cannot start (see License).
 
 ### Why the OAuth client must be a Web application client
 
@@ -15,7 +16,7 @@ Casa's callback facility publishes a real, public `https://` redirect URI for th
 
 ## Setup
 
-Setup spans two systems: the Google Cloud project (OAuth client) and the casa deployment (public URL, plugin role, consent, env vars). Both are required — skipping either leaves authorization stuck, usually without an obvious error.
+Setup spans two systems: the Google Cloud project (OAuth client) and the casa deployment (public URL, plugin install, consent, env vars). Both are required — skipping either leaves authorization stuck.
 
 ### 1. Enable Gmail API
 
@@ -56,23 +57,20 @@ Refresh tokens can still be invalidated for the ordinary reasons in any publishi
 
 ### 3. Configure the casa deployment
 
-This is where most setup failures happen — each prerequisite below fails silently or with a generic-looking error if skipped. Do these in order.
+This is where most setup failures happen. You do most of it by asking the assistant in chat; it opens a configurator task that does the installing and reports back.
 
-1. **Set casa's `public_url`** to a clean `https://` origin: scheme + host only — no path, no trailing slash, no IP literal, no userinfo (e.g. `https://<your-casa-public-url>`, not `https://<your-casa-public-url>/`, not `https://1.2.3.4`, not `https://user@<your-casa-public-url>`). Casa needs this to construct a real, reachable redirect URI for the plugin.
-2. **Give the plugin a reachable assigned role** *before* installing it. Casa uses this to know where to deliver the callback result.
-3. **Install the plugin, then set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_USER_EMAIL`** in casa's plugin environment configuration for this plugin (not in a secret manager directly — casa is what passes these through to the plugin's server process). `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`). Without all three the plugin's server **exits at startup**, so none of its tools can answer — including the one that reports the redirect URI, and the setup tool casa dispatches in Step 3.4.
-4. **Approve casa's callback-consent DM — but only once Step 3.3 is done and the plugin's MCP server is healthy.** Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed.
+1. **Set casa's `public_url`** to a clean `https://` origin: scheme + host only — no path, no trailing slash, no IP literal, no userinfo (e.g. `https://<your-casa-public-url>`, not `https://<your-casa-public-url>/`, not `https://1.2.3.4`, not `https://user@<your-casa-public-url>`). Casa needs this to construct a real, reachable redirect URI for the plugin. That origin must also forward `/callback/` to Casa's external API port (`18065/tcp`), which is not published by default: see *Plugin authorization callbacks* in Casa's documentation.
+2. **Ask the assistant to install the plugin,** for example: *"Install the Gmail plugin from bonzanni/casa-plugin-gmail for the assistant."* The configurator installs the latest release and gives the plugin its assigned role, which is what tells Casa where to deliver the callback result. Assign it with full access here; the `read` profile (see Tools) cannot run sign-in setup.
+3. **Give the plugin `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` and `GMAIL_USER_EMAIL`.** `GMAIL_USER_EMAIL` is the user's Gmail address (e.g. `user@workspace.example.com`). The easy way: before Step 3.2, create a 1Password item in Casa's default vault with `gmail` in its title and fields labelled `client id`, `client secret` and `email`. The configurator finds it during the install and wires the three variables. It does not ask you for a secret's value in chat: anything it cannot find stays unwired and it tells you which, and you can then point it at the 1Password reference, or tell it you want a literal value set. Until all three resolve, Casa withholds the plugin, so no agent has its tools, and the setup run waits.
+4. **Approve casa's callback-consent DM.** It arrives during the install and stays answerable for ten minutes; if you miss it, ask the assistant to send it again. Casa asks for explicit consent before it will spool authorization results for this plugin; until approved, the callback route stays closed.
 
-   **Order matters here more than anywhere else in this document.** Approving is what makes casa dispatch the setup tool: the plugin declares `setup_gmail`, and casa hands it to the agent automatically the moment consent settles. Casa dispatches it **once** — it treats an accepted agent turn as dispatched and does not correlate whether the tool actually ran, so there is **no automatic retry**. If the three environment variables are still missing, the server exits at startup, the dispatched call fails, and the setup episode is spent: the promised automatic link never arrives. That is not hypothetical — it is exactly how a live install failed, with consent approved about a minute before the variables were wired. Recovery is manual (ask the agent to connect Gmail — see Step 4) and entirely avoidable by configuring the environment first.
-
-   Approving also publishes casa's redirect URI, which is what makes Step 3.5 possible. Casa will post the sign-in link in your chat with the agent within a minute or two — **finish Step 3.5 before opening it**, or Google will answer `redirect_uri_mismatch`. The link stays valid for 30 minutes, which is ample.
+   Approving also releases the setup run: the plugin declares `setup_gmail`, and casa runs it itself once the consent is approved and the three variables from Step 3.3 resolve, in whichever order those happen. Approving publishes casa's redirect URI as well, which is what makes Step 3.5 possible. Casa will post the sign-in link in your chat with the agent shortly after — **finish Step 3.5 before opening it**, or Google will answer `redirect_uri_mismatch`. The link stays valid for 30 minutes, which is ample.
 5. **Register casa's authoritative redirect URI** — the *exact* string — in the OAuth client's **Authorized redirect URIs** (the field you left empty in Step 2). This step comes after consent because it has to: casa publishes a plugin's redirect URI only once its callback is *routed*, and an unapproved callback is never routed — before Step 3.4 the value does not exist to be read. Never construct it yourself from the plugin's name either: a scoped install has a different effective name than the plugin's base name, and Google matches the redirect URI byte-for-byte. Read it from one of these instead:
-   - **Preferred:** ask the agent to connect Gmail (it calls `setup_gmail`) — the tool returns a `redirect_uri` field. The plugin reads that straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the sign-in link it hands to casa will report `redirect_uri_mismatch` until you finish this step, which is expected. `setup_gmail` never mints a second link while one is outstanding: if approving consent has already put a link in chat, asking again reports `already_pending` and repeats nothing — the earlier message carries the same `redirect_uri`, so use that one, or use the host-side command below.
-   - **From the host,** without a running server and without having to know the effective name:
+   - **Preferred:** ask the agent to connect Gmail and tell you the redirect URI (it calls `setup_gmail`) — the tool returns a `redirect_uri` field. Ask for it by name: the automatic run reports in one short line that may leave it out. The plugin reads that value straight out of casa's callback index, so it is the same value casa will actually use. Requires the three variables from Step 3.3 to be set and the plugin's server to be running; the sign-in link it hands to casa will report `redirect_uri_mismatch` until you finish this step, which is expected. `setup_gmail` never mints a second link while one is outstanding: if approving consent has already put a link in chat, asking again reports `already_pending`, repeats no link and still gives you the `redirect_uri`.
+   - **From a shell inside Casa's container,** without a running server and without having to know the effective name:
      ```
      grep -o '"redirect_uri":[^,}]*' /data/callbacks/*/ready.json
      ```
-   *Optional, rollback only:* if you are upgrading from v0.4.x, also keep (or add) `http://localhost:8080` as a second entry in **Authorized redirect URIs** — v0.4.1 used that loopback flow, so leaving it registered means a downgrade needs no Google console round-trip. It is unused by v0.5.0 and can be removed once the callback flow is confirmed working.
 
 #### What breaks if a step above is skipped
 
@@ -83,20 +81,20 @@ Casa closes an authorization-callback route for exactly five reasons. The plugin
 | `callback_base_url_invalid` | `public_url` (Step 3.1) missing or not a clean `https://` origin | The callback route never becomes usable; the redirect URI in `ready.json` is missing or unusable |
 | `callback_no_target` | Plugin has no reachable assigned role (Step 3.2) | The callback stays dark and **no consent DM is ever sent** — indistinguishable from casa simply not having gotten to it yet; if you've waited and there's still no DM, check the plugin's role assignment |
 | `callback_pending_ack` | Consent DM not approved (Step 3.4) | Authorization result cannot be delivered until you approve the DM |
-| `callback_invalid` | Malformed or stale callback state | Re-run `setup_gmail` for a fresh authorization attempt once the earlier link has expired |
-| `callback_spool_error` | Casa-side failure writing the spooled result | Transient; re-run `setup_gmail` |
+| `callback_invalid` | Nothing you skipped: the plugin's `casa.callbacks` declaration could not be read | The route stays closed; update the plugin, and report it if the latest release shows this |
+| `callback_spool_error` | Casa-side failure writing the spooled result | Transient; run `setup_gmail` again |
 
 ### 4. Run the authorization flow
 
-1. **Wait for the link — you should not have to ask for it.** Once the consent DM in Step 3.4 is approved, casa dispatches `setup_gmail` automatically, and casa posts the sign-in link in your chat with the agent without being asked — a "Sign in with Google" link naming its real destination, never inside a task topic. The agent never sees or writes the link itself. This is the normal path; the plugin declares the tool for exactly this purpose.
+1. **Wait for the link — you should not have to ask for it.** Once the consent DM in Step 3.4 is approved and the variables resolve, casa dispatches `setup_gmail` automatically, and casa posts the sign-in link in your chat with the agent without being asked — a "Sign in with Google" link naming its real destination, never inside a task topic. The agent never sees or writes the link itself. This is the normal path; the plugin declares the tool for exactly this purpose.
 2. **Open the link in a real browser — do not tap it inside the chat client.** Tapping a link in a chat app usually opens it in that app's built-in (embedded) browser, and **Google refuses to run OAuth sign-in in an embedded browser**. When that happens Google shows a generic "Something went wrong" page *after* you sign in, never reaches the consent screen, and never redirects — so casa sees nothing at all and the flow just stops. Long-press the link and choose *Open in Chrome* / *Open in Safari* (or copy it into a browser). This is Google's policy and the plugin cannot see which browser is used, so it cannot detect or work around it — opening the link correctly is the only fix.
 3. Sign in as the Gmail account being connected and grant access. The browser then shows "Response received" — nothing more happens there, and nothing needs to be copied back.
 4. Casa delivers the result to the agent, which calls `gmail_auth_collect` and reports the outcome in chat. Success, denial, and a stale/replayed link all show the same neutral browser page, so **chat is the only place you learn whether it actually worked** — read what the agent reports, don't assume from the browser page alone.
 
-**If no link arrives within about two minutes of approving the consent DM,** ask the agent to connect Gmail and it will call `setup_gmail` itself — the manual fallback, and the route to use for any later re-authorization. If the dispatched call never minted (the usual case, see the causes below) this hands a fresh link to casa, which posts it; if it did mint and only the message went missing, it reports `already_pending` instead, and the only remedy is to wait for that link to expire (30 minutes from minting) and ask again. Casa dispatches the setup tool only once, so waiting longer for the automatic path does not help; nothing will retry on its own. Three causes account for nearly all missing links:
+**If no link arrives within about two minutes of completing Steps 3.3 and 3.4,** ask the assistant why the Gmail plugin is not working: it can read what the plugin is waiting for. Once the plugin's tools are available, ask the agent to connect Gmail and it will call `setup_gmail` itself — the manual fallback, and the route to use for any later re-authorization. If no link was minted this hands a fresh link to casa, which posts it; if one was minted and only the message went missing, it reports `already_pending` instead, and the only remedy is to wait for that link to expire (30 minutes from minting) and ask again. A setup run that never reached the tool is retried a few times, then casa tells you to run it by hand. Three causes account for nearly all missing links:
 
-- **The plugin's MCP server is not running or not healthy** — most often the three environment variables (Step 3.3) were still missing when the consent DM was approved, so the server exited at startup and the dispatched call failed. Check the plugin's health in casa and its server log.
-- **The consent DM was never approved** (`callback_pending_ack`).
+- **The plugin's MCP server is not running or not healthy** — most often a variable from Step 3.3 is still unwired, so casa is withholding the plugin. Check the plugin's health in casa and its server log.
+- **The consent DM was never approved** (`callback_pending_ack`). An expired DM counts as declined until it is sent again.
 - **The plugin has no reachable assigned role** (`callback_no_target`) — in which case no consent DM is ever sent either.
 
 See the reason-code table in Step 3. Re-running `setup_gmail` will not leave you with two live links: if Gmail is already connected it reports the account and mints nothing, and if a link it minted is still outstanding it says so rather than issuing a second one. It checks casa's spool for that — both the `pending/` entry a mint publishes immediately and the `attempts/` record casa materializes a few minutes later — so a link minted seconds ago already counts. There is **no force-a-fresh-link path**: `setup_gmail` is the only tool that mints (a non-setup tool cannot hand a link to the operator under casa's result contract), so while a minted link is outstanding it reports `already_pending` and you wait for that link to expire (casa's pending window, 30 minutes from minting) before a new one can be issued.
@@ -112,11 +110,11 @@ If `setup_gmail` returns a `redirect_uri` that doesn't match what's registered o
 
 Updating the plugin on a working system does not disturb the connection, and does not need a re-authorization. The refresh token is kept in `CLAUDE_PLUGIN_DATA`, which is casa's persistent plugin-data directory for a role-assigned plugin — the update replaces the plugin artifact, and the credential is not in it. This plugin also declares a callback and **no triggers**, so an update re-mints no per-trigger secret that could reach the stored grant (a callback declaration carries no secret at all, and its consent ack survives an update that leaves `casa.callbacks` unchanged).
 
-Casa's update hand-back nonetheless says the integration is **not live** until the plugin's setup tool runs. That sentence is generic — it is written for a plugin that must re-publish a webhook URL and key to an external service, which this one does not — so do not read it as a statement about your Gmail authorization. `setup_gmail` is what actually knows: on a healthy install it answers `already_connected` with the connected account and mints nothing. Ask the agent to run it if you want the update confirmed; it is argument-free and changes nothing when there is nothing to change.
+Casa also runs `setup_gmail` after an update. On a healthy install it answers `already_connected` with the connected account and mints nothing, so that line is your confirmation. You can ask the agent to run it at any time; it is argument-free and changes nothing when there is nothing to change.
 
 ### Uninstalling
 
-When you uninstall the plugin, casa (>= 0.331.0) asks what to do with its data:
+When you uninstall the plugin, casa asks what to do with its data:
 
 - **Keep data** — the plugin is removed and its data directory stays, so a reinstall is still connected.
 - **Erase data, keep sign-ins** — `erase_gmail_data` deletes the sent log and saved attachments. The sign-in stays, so a reinstall is still connected.
@@ -172,19 +170,6 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 **`That authorization was granted by <address>, but this plugin is configured for <address>`** (from `gmail_auth_collect`)
 → The wrong Google account was used. The existing stored connection (if any) is left untouched. Run `setup_gmail` again and sign in as the correct account.
 
-## No workstation fallback
-
-Earlier versions shipped `bootstrap/get_credentials.py` for completing OAuth outside chat. It has been removed: it requested the redirect URIs `urn:ietf:wg:oauth:2.0:oob` and `http://localhost`, neither of which a **Web application** OAuth client accepts (see Prerequisites above). The in-chat flow (Setup, Step 4) is the only supported path.
-
-## Dismantling the old service-account / DWD setup
-
-The previous auth approach (v0.2.x) used ADC + a service account with domain-wide delegation. That infrastructure can now be removed:
-
-- **Service account:** delete `casa-gmail-agent` (or whichever SA was used) in GCP IAM
-- **DWD entry:** remove the entry from Workspace Admin → Security → API Controls → Domain-wide delegation
-- **IAM binding:** remove the `roles/iam.serviceAccountTokenCreator` binding that was granted to your user account
-- **gcloud ADC:** if you ran `gcloud auth application-default login` solely for this plugin, you can revoke it: `gcloud auth application-default revoke`
-
 ## Tools
 
 | Tool | Description |
@@ -204,16 +189,14 @@ The previous auth approach (v0.2.x) used ADC + a service account with domain-wid
 | `erase_gmail` ⚠️ | Casa's `casa.eraseTool`: revokes Gmail's access at Google, then deletes everything in the plugin's data directory. Run by casa at uninstall when you choose **Erase everything** |
 | `erase_gmail_data` ⚠️ | Casa's `casa.eraseDataOnlyTool`: deletes the sent log and saved attachments but keeps the sign-in. Run by casa at uninstall when you choose **Erase data, keep sign-ins** |
 
-Every tool except `setup_gmail` is declared `{"result": "safe"}` in `casa.resultContract`
-(Casa >= 0.290.0): Casa refuses, before it runs, any tool missing from that declaration, so
-a new tool must be added there too. `setup_gmail` is declared a `capability` that provides
-`auth_url` and `delivers` it as an `operator_link` (Casa >= 0.318.0): it deposits the sign-in
-link with casa's broker, and casa posts it in the chat you asked from and tells the agent
-whether it arrived. So the link never passes through the agent, and never lands in a task topic.
-Only `setup_gmail` mints an authorization link, which is why 0.7.0 removed the separate
-direct-request minting tool.
+Every tool except `setup_gmail` is declared `{"result": "safe"}` in `casa.resultContract`:
+Casa refuses, before it runs, any tool missing from that declaration, so a new tool must be
+added there too. `setup_gmail` is declared a `capability` that provides `auth_url` and
+`delivers` it as an `operator_link`: it deposits the sign-in link with casa's broker, and casa
+posts it in the chat you asked from and tells the agent whether it arrived. So the link never
+passes through the agent, and never lands in a task topic.
 
-The manifest declares one access profile, `read` (Casa >= 0.338.0): `search_emails`,
+The manifest declares one access profile, `read`: `search_emails`,
 `get_email`, `get_thread`, `list_attachments`, `download_attachment` and `list_send_as`.
 An agent assigned Gmail with that profile can search and read mail and download
 attachments, and Casa denies it the other eight tools: sending, replying, archiving, trashing, marking
@@ -224,8 +207,7 @@ narrowing an existing one means unassigning and assigning again with `profile="r
 once a profile is declared and checks that it names every tool the profile lists, but it
 does not check that the list is complete. The completeness matters, though: the tools Casa
 hides from a read-profiled agent are the ones in this list and not in the profile, and the
-plugin's own tests pin all fourteen. An older Casa ignores `casa.profiles`; it reads
-`casa.provides_tools` only to check an agent role's `requires.tools` against it.
+plugin's own tests pin all fourteen.
 
 ⚠️ Protected tools — require tap-approval from the user before execution.
 
