@@ -146,7 +146,7 @@ These tools are composable for task managers and scheduled agents.
 
 **Batch guidance:** Keep `max_results` ≤ 50. For large date ranges, split into weekly windows (`after:2026-07-01 before:2026-07-08`, then next week, etc.). On 429: back off 30 seconds before retrying. Skip individual failures (log and continue) — do not abort the batch.
 
-**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to read-only tools: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`.
+**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to tools that need no approval: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`.
 
 ### Reference Pattern: Invoice Monitoring
 
