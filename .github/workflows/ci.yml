@@ -27,6 +27,9 @@ jobs:
   release:
     needs: test
     if: github.event_name == 'push'
+    concurrency:
+      group: release
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the tag and the release
@@ -46,5 +49,12 @@ jobs:
             echo "$tag is already released"
             exit 0
           fi
-          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --latest \
+          # GitHub makes every new release latest unless told otherwise; a late run
+          # for an older version must not move latest backwards.
+          current=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+          make_latest=true
+          if [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$tag" | sort -V | tail -1)" != "$tag" ]; then
+            make_latest=false
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --latest="$make_latest" \
             --notes "$(git log -1 --format=%s)"
