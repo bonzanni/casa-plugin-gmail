@@ -1,0 +1,50 @@
+# Runs the tests on every pull request and every push to main.
+#
+# On a push to main that passes, publishes v<plugin.json version> as the latest
+# GitHub release, creating the tag at that commit. Bumping the version and merging
+# it to main is the whole release procedure; an unchanged version does nothing.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11" # server/vendor is built for CPython 3.11
+      - run: pip install -r server/requirements-dev.txt
+      - run: python -m pytest tests -q
+
+  release:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish v<version> unless it is already released
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "plugin.json version '$version' is not MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released"
+            exit 0
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --latest \
+            --notes "$(git log -1 --format=%s)"
