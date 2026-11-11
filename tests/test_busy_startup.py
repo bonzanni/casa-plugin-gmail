@@ -140,8 +140,8 @@ def test_start_up_does_no_credential_work(world):
 
     assert world.refresh.calls == 0
     assert world.server._authenticated is False
-    with lock_held_by_another_process(world.dir):
-        pass                                   # the lock was free to take
+    # collect_lock creates its file on first use: start-up never touched it.
+    assert not (world.dir / "collect.lock").exists()
 
 
 def test_start_up_still_refuses_a_missing_setting(world, monkeypatch):
