@@ -30,6 +30,18 @@ class _Broker:
 
 
 @pytest.fixture(autouse=True)
+def no_credential_recovery(monkeypatch):
+    """These tests drive the tools and setup_gmail's decisions with the
+    process state each one sets up; credential recovery itself, which runs
+    first when the process is not in service, and the staged-slot check that
+    holds minting back are exercised against a real store and a real second
+    process in test_busy_startup.py."""
+    import server
+    monkeypatch.setattr(server, "_flow_recover", lambda auth, cb, wait=0.0: "none")
+    monkeypatch.setattr(server, "_sign_in_waiting", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def broker(monkeypatch):
     import server
     b = _Broker()
@@ -176,21 +188,21 @@ def test_gmail_auth_collect_reports_and_rebuilds_clients(monkeypatch):
     assert server.AttachmentManager.call_count == 1
 
 
-def test_startup_recover_double_activation_builds_attachment_manager_once(monkeypatch, tmp_path):
-    """One startup_recover call can activate() twice: load_active() activates
+def test_recover_double_activation_builds_attachment_manager_once(monkeypatch, tmp_path):
+    """One recover call can activate() twice: load_active() activates
     an on-disk active credential, then reconcile_stage()'s promote() activates
     a pending stage in the same pass. AttachmentManager/SentLog are
     credential-independent and must be built exactly once; GmailClient is
     credential-derived and must be rebuilt on every activation.
 
     Driven through a REAL double activation — a real GmailAuth, a real
-    TokenStore on disk, and the real auth_flow.startup_recover — not a mocked
+    TokenStore on disk, and the real auth_flow.recover — not a mocked
     activate() call. Only the two network-touching methods (_refresh,
     refresh_and_verify) are stubbed, since they'd otherwise hit Google.
     """
     import server
     from auth import GmailAuth
-    from auth_flow import startup_recover
+    from auth_flow import recover
     from token_store import Credential
 
     monkeypatch.setattr(server, "_client", None)
@@ -222,7 +234,7 @@ def test_startup_recover_double_activation_builds_attachment_manager_once(monkey
     monkeypatch.setattr(auth, "_refresh", lambda rt: MagicMock())
     monkeypatch.setattr(auth, "refresh_and_verify", lambda rt: "user@example.com")
 
-    outcome = startup_recover(auth, MagicMock())
+    outcome = recover(auth, MagicMock())
 
     assert outcome == "promoted"                        # both activations ran
     assert mock_client_cls.call_count == 2               # rebuilt every time
@@ -232,15 +244,27 @@ def test_startup_recover_double_activation_builds_attachment_manager_once(monkey
     assert server._authenticated is True
 
 
-def test_startup_logs_the_recovery_outcome(monkeypatch, capsys, tmp_path):
-    """Silent startup recovery is how the lost-outcome bug went unnoticed."""
+def test_recovery_logs_its_outcome(monkeypatch, capsys):
+    """Silent recovery is how the lost-outcome bug went unnoticed."""
     import server
-    monkeypatch.setattr(server, "PLUGIN_DATA", str(tmp_path))
-    monkeypatch.setattr(server, "_flow_startup", lambda auth, cb: "settled")
+    monkeypatch.setattr(server, "_authenticated", False)
+    monkeypatch.setattr(server, "_flow_recover", lambda auth, cb, wait=0.0: "settled")
 
-    server._startup()
+    assert server._recover() == "settled"
 
     assert "settled" in capsys.readouterr().err
+
+
+def test_a_recovery_that_raises_is_logged_and_reported_as_an_error(monkeypatch, capsys):
+    import server
+    monkeypatch.setattr(server, "_authenticated", False)
+
+    def broken(auth, cb, wait=0.0):
+        raise OSError("read-only file system")
+    monkeypatch.setattr(server, "_flow_recover", broken)
+
+    assert server._recover() == "error"
+    assert "read-only file system" in capsys.readouterr().err
 
 
 def test_the_runtime_rebuild_is_wired_to_activation(monkeypatch):
@@ -266,7 +290,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.12.0"
+    assert manifest["version"] == "0.12.1"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──

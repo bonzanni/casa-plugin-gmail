@@ -27,9 +27,12 @@ class MalformedCallback(ValueError):
     """The provider's query is not a usable single code or single error."""
 
 
+_LOCK_POLL_S = 0.05
+
+
 @contextmanager
-def collect_lock(data_dir):
-    """Serialize the collect pass and startup recovery.
+def collect_lock(data_dir, wait: float = 0.0):
+    """Serialize the collect pass and credential recovery.
 
     Both touch the single staged slot, so they must not interleave. On the
     pinned mcp 1.3.0 a sync @mcp.tool() runs on the event loop thread, so two
@@ -38,18 +41,29 @@ def collect_lock(data_dir):
 
     Yields True when held, False when another holder has it. Contention is a
     no-op for the caller — never a second held-journal recovery.
+
+    `wait` > 0 keeps trying for that many seconds before giving up. A holder is
+    another process's recovery or collect pass, which ends after a token
+    refresh or two, so the caller that needs the credential can afford to wait
+    it out rather than fail.
     """
     directory = Path(data_dir)
     directory.mkdir(parents=True, exist_ok=True)
     fd = os.open(directory / LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
     acquired = False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_LOCK_POLL_S)
         yield acquired
     finally:
         if acquired:
@@ -135,7 +149,7 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
     Returns (outcome, message) with outcome in {none, promoted, settled, retain}.
 
     `notify` is the ROUTING decision for the message, and belongs here because
-    ordering does: when the caller has no live channel to the user (startup
+    ordering does: when the caller has no live channel to the user (credential
     recovery), every message that accompanies an ack is persisted BEFORE that
     ack, so a later collect can still say what happened. `collect_pass` relays
     its own return value, so it leaves notify False — that, and not any
@@ -145,7 +159,7 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
         """Persist the notice (if nobody is listening), THEN let the caller ack.
 
         Keyed by flow + disposition, and not by chance: an ack that fails
-        leaves the stage in place, so the next startup reaches this same
+        leaves the stage in place, so the next recovery reaches this same
         disposition for this same flow and would otherwise queue the identical
         sentence a second time.
         """
@@ -227,17 +241,21 @@ def reconcile_stage(auth, cb, notify: bool = False) -> tuple[str, str]:
     return "promoted", message
 
 
-def startup_recover(auth, cb) -> str:
+def recover(auth, cb, wait: float = 0.0) -> str:
     """Read env, load the active credential, then reconcile any stage — all
     under the lock, as ONE unit.
+
+    Run by the server when a tool needs the credential and the process is not
+    yet in service, never at start-up: start-up must answer the MCP handshake
+    without waiting on Google or on another process's lock.
 
     Active FIRST: a transient failure verifying a stage must never leave the
     process unauthenticated when a good active credential is on disk.
 
     `validate_and_init` can itself mutate the store (it removes a terminally
     dead active token), so it must be inside the lock, not before it. This is
-    the whole of the plugin's startup credential work — `server._startup` must
-    not call `validate_and_init` separately. A missing env var still exits the
+    the whole of the plugin's credential recovery — `server` must not call
+    `validate_and_init` separately. A missing env var still exits the
     process: SystemExit is a BaseException and is not caught by the caller.
 
     The env read is hoisted OUT of the lock. It touches no store state, so the
@@ -247,12 +265,13 @@ def startup_recover(auth, cb) -> str:
     `client_id=None` and gmail_auth_collect fail on the account comparison.
     """
     auth.read_env()
-    with collect_lock(auth.store.dir) as acquired:
+    with collect_lock(auth.store.dir, wait) as acquired:
         if not acquired:
             return "busy"
         auth.validate_and_init()
         try:
-            # notify=True: there is no live channel here. Whatever this
+            # notify=True: there is no live channel here — the tool that
+            # needed the credential does not relay these messages. Whatever this
             # resolves — a promote, a wrong-account rejection, a terminal
             # settle — is acked, and casa's ack tears the attempt down, so the
             # next collect_pass would find nothing left to report. The notice
@@ -260,7 +279,7 @@ def startup_recover(auth, cb) -> str:
             outcome, _message = reconcile_stage(auth, cb, notify=True)
         except Exception as exc:
             print(
-                f"Gmail plugin: credential startup recovery failed ({exc}).",
+                f"Gmail plugin: credential recovery failed ({exc}).",
                 file=sys.stderr,
             )
             return "error"
@@ -357,7 +376,7 @@ def _locked_pass(auth, cb) -> dict:
     """
     out = {"status": "ok", "messages": [], "promoted": False}
 
-    # Anything a previous startup recovery resolved with nobody listening.
+    # Anything a previous credential recovery resolved with nobody listening.
     # Peeked FIRST so it reads in the order it happened, and peeked here rather
     # than at the end because every early return below must still carry it.
     # Peek, not drain: the durable copy outlives this pass, and collect_pass

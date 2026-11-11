@@ -317,6 +317,12 @@ def _server_on(monkeypatch, tmp_path):
     import server
     from auth import GmailAuth
     from sent_log import SentLog
+    # A tool call on a signed-out server runs credential recovery, which reads
+    # the settings start-up already checked.
+    for key, val in {"GMAIL_CLIENT_ID": "client-id",
+                     "GMAIL_CLIENT_SECRET": "client-secret",
+                     "GMAIL_USER_EMAIL": "user@example.com"}.items():
+        monkeypatch.setenv(key, val)
     auth = GmailAuth(str(tmp_path))
     auth._credentials = object()
     monkeypatch.setattr(server, "_auth", auth)

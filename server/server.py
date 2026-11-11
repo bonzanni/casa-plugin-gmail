@@ -11,7 +11,7 @@ from attachments import AttachmentManager
 from sent_log import SentLog
 from auth_flow import collect_pass as _flow_collect
 from auth_flow import start as _flow_start
-from auth_flow import startup_recover as _flow_startup
+from auth_flow import recover as _flow_recover
 from casa_callback import CallbackUnavailable, CasaCallback
 import casa_broker
 import casa_handoff
@@ -48,7 +48,7 @@ def _rebuild_runtime() -> None:
     # _att/_log are credential-independent (no credential goes into their
     # constructors), so a surviving instance is functionally identical to a
     # fresh one — build each only once. This matters because a single
-    # startup_recover can activate twice in one call (an active credential
+    # recover can activate twice in one call (an active credential
     # AND a pending stage both on disk: load_active() activates, then
     # reconcile_stage()'s promote() activates again). Without the guard, the
     # second AttachmentManager() would start a second cleanup timer thread.
@@ -62,32 +62,103 @@ def _rebuild_runtime() -> None:
 _auth.on_activate = _rebuild_runtime
 
 
+# How long a tool that needs the credential waits for another Gmail process
+# to finish its own recovery or collect pass (a token refresh or two).
+RECOVERY_WAIT_S = 20.0
+
+
 def _startup():
+    """Settings only. No store, no lock, no Google.
+
+    Casa starts this server to list its tools as well as to use them, often at
+    the same moment as a session's own server. Credential work here delayed
+    the MCP handshake by a token refresh, and the loser of the lock race
+    stayed signed out for its whole life. It now happens in `_recover()`, when
+    a tool first needs the credential. A missing setting still exits here.
+    """
     os.makedirs(PLUGIN_DATA, exist_ok=True)
-    # startup_recover holds collect.lock across env validation, active-token
-    # loading AND staged recovery — all three can mutate the store, so they are
-    # one unit. Do NOT call _auth.validate_and_init() separately here.
-    # The runtime rebuild needs no call here either: activate() runs it.
+    _auth.read_env()
+
+
+def _recover() -> str | None:
+    """Bring the stored credential into service if this process has not yet.
+
+    None when the process is already in service; otherwise the outcome of
+    auth_flow.recover, which holds collect.lock across active-token loading
+    AND staged recovery — both can mutate the store, so they are one unit. Do
+    NOT call _auth.validate_and_init() separately. The runtime rebuild needs
+    no call here either: activate() runs it.
+
+    Runs again on every call that needs the credential until one succeeds, so
+    a busy lock, a Google 5xx or a stage that could not be verified yet heals
+    at a later call instead of lasting for the life of the process.
+    """
+    if _authenticated:
+        return None
     try:
-        # Log the outcome: silent startup recovery is how a whole class of
-        # lost-outcome bugs went unnoticed. Any user-facing detail is durably
-        # queued by startup_recover and drained by the next gmail_auth_collect;
-        # this line is the operator's copy.
-        outcome = _flow_startup(_auth, _cb)
-        print(f"Gmail plugin: credential startup recovery — {outcome}.",
+        outcome = _flow_recover(_auth, _cb, wait=RECOVERY_WAIT_S)
+    except Exception as exc:
+        outcome = "error"
+        print(f"Gmail plugin: credential recovery incomplete ({exc}).",
               file=sys.stderr)
-    except Exception as exc:       # never let recovery break startup
-        print(f"Gmail plugin: credential startup incomplete ({exc}).",
-              file=sys.stderr)
+    # Log the outcome: silent recovery is how a whole class of lost-outcome
+    # bugs went unnoticed. Any user-facing detail is durably queued by
+    # auth_flow.recover and relayed by the next gmail_auth_collect; this line
+    # is the operator's copy.
+    print(f"Gmail plugin: credential recovery — {outcome}.", file=sys.stderr)
+    return outcome
+
+
+_BUSY_TEXT = ("another Gmail process is finishing its sign-in work right now")
+_WAITING_TEXT = ("a completed Gmail authorization is waiting to be confirmed, "
+                 "and Google could not confirm it just now")
+
+
+def _sign_in_waiting() -> bool:
+    """True while a completed authorization sits in the staged slot.
+
+    Read from the store, not from what this call's recovery returned: a
+    process already in service runs no recovery, and the credential it is
+    using may be the revoked one the waiting sign-in replaces. Until the stage
+    is settled (recovery, or gmail_auth_collect, verifies it and promotes or
+    discards it) nothing shows that another sign-in is needed, so nothing may
+    mint one or ask for one. Post-promote residue (the stage is the active
+    flow) is already settled and does not count.
+    """
+    staged = _auth.store.load_staged()
+    if staged is None or not staged.flow:
+        return False
+    active = _auth.store.load_active()
+    return active is None or active.flow != staged.flow
 
 
 def _require_auth() -> None:
-    if not _authenticated:
+    outcome = _recover()
+    if _authenticated:
+        return
+    if outcome == "busy":
         raise ValueError(
-            "Gmail is not authenticated. Call setup_gmail to get an "
-            "authorization link; after you grant access I'll be notified and "
-            "will finish setup with gmail_auth_collect."
+            f"Gmail is still starting up: {_BUSY_TEXT}. Nothing is wrong with "
+            "the connection. Try again in a moment."
         )
+    if _sign_in_waiting():
+        raise ValueError(
+            f"Gmail is not connected yet: {_WAITING_TEXT}. Nothing new is "
+            "needed. Try again in a moment; gmail_auth_collect finishes it."
+        )
+    stored = _stored_credential()
+    if stored is not None:
+        raise ValueError(
+            f"Gmail's stored authorization for {stored.account} is in place, "
+            "but I could not confirm it with Google just now. Nothing needs "
+            "re-authorizing. Try again in a moment; if it persists, "
+            "setup_gmail reports why."
+        )
+    raise ValueError(
+        "Gmail is not authenticated. Call setup_gmail to get an "
+        "authorization link; after you grant access I'll be notified and "
+        "will finish setup with gmail_auth_collect."
+    )
 
 
 def _read_attachments(paths: list[str]) -> list[tuple[str, bytes]]:
@@ -321,6 +392,24 @@ def setup_gmail() -> str:
     #    That check reads casa's `pending/` directory as well as `attempts/`:
     #    minting publishes only the former, and the latter trails it by up to
     #    a reconciliation interval. See _outstanding_authorization.
+    outcome = _recover()
+    # Nothing shows that a new authorization is needed while the lock holder
+    # may be promoting a good one right now, while recovery failed before it
+    # could tell, or while a completed one waits in the staged slot. A link
+    # minted then would be a second live sign-in for the operator to complete.
+    if outcome in ("busy", "error") or _sign_in_waiting():
+        reason = {"busy": _BUSY_TEXT,
+                  "error": "I could not check the stored Gmail authorization "
+                           "just now (see the plugin log)"}.get(outcome, _WAITING_TEXT)
+        return _no_link(**{
+            "status": "retry_later",
+            "instructions": (
+                f"No authorization link was created: {reason}. Nothing new is "
+                "needed yet. Run setup_gmail again in a moment"
+                + ("; gmail_auth_collect finishes the waiting authorization."
+                   if reason == _WAITING_TEXT else ".")
+            ),
+        })
     dead_credential = None
     stored = _stored_credential()
     if stored is not None:
@@ -464,6 +553,10 @@ def gmail_auth_collect() -> str:
     """Collect any waiting Gmail authorization result and finish setup. Call this when casa reports an authorization result is waiting. Safe to call repeatedly."""
     # No rebuild here: activate() ran _rebuild_runtime before the flow was
     # acked, and a second call would start a second cleanup thread.
+    # Recovery first: a stage left by a crashed process is then settled with
+    # its outcome written down before the ack, as start-up used to do, and
+    # the pass below relays that notice.
+    _recover()
     return _ok(_flow_collect(_auth, _cb))
 
 

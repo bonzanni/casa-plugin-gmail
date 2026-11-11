@@ -172,7 +172,7 @@ class GmailAuth:
 
     def validate_and_init(self) -> bool:
         """Read env vars and load the ACTIVE credential. Staged recovery is the
-        caller's job (auth_flow.startup_recover), which holds the collect lock."""
+        caller's job (auth_flow.recover), which holds the collect lock."""
         self.read_env()
         return self.load_active()
 

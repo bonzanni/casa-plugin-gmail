@@ -88,6 +88,11 @@ def test_every_quoted_diagnostic_matches_its_source():
         ("server/auth.py", "the stored credential authorizes "),
         ("server/auth.py", "could not refresh right now "),
         ("server/server.py", "Gmail is not authenticated. Call setup_gmail"),
+        ("server/server.py", "Gmail is still starting up: "),
+        ("server/server.py", "a completed Gmail authorization is waiting to be confirmed"),
+        ("server/server.py", "Gmail is not connected yet: "),
+        ("server/server.py", "but I could not confirm it with Google just now"),
+        ("server/server.py", "another Gmail process is finishing its sign-in work"),
         ("server/auth_flow.py",
          "Authorization was not granted ({error}). Nothing has changed."),
         ("server/auth_flow.py", "That authorization was granted by "),
@@ -678,7 +683,7 @@ def test_the_detector_leaves_prose_that_denies_the_promise_alone(passage):
 
 def test_advice_to_fix_a_startup_cached_env_var_names_the_session_requirement():
     """`read_env()` copies these variables into process memory once — it is
-    reached only through `validate_and_init()`, which only `_startup()` calls —
+    reached at start-up and again by each credential recovery, all in one process —
     and every later probe uses `self._client_secret`, the cached copy. So
     correcting them in casa's plugin environment changes nothing for the
     running server, and any text that tells the operator to fix one AND to
