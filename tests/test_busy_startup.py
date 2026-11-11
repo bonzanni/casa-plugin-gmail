@@ -321,8 +321,98 @@ def test_setup_mints_nothing_while_a_newer_sign_in_waits_behind_a_revoked_one(wo
     monkeypatch.setattr(world.auth, "probe_refresh", revoked)
     world.server._startup()
 
+    first = json.loads(world.server.setup_gmail())
+    # The process is in service now, so a retry runs no recovery at all: the
+    # waiting sign-in must still hold minting back.
+    second = json.loads(world.server.setup_gmail())
+
+    assert world.server._authenticated is True
+    assert world.mints == []
+    assert [first["status"], second["status"]] == ["retry_later", "retry_later"]
+    assert "gmail_auth_collect" in second["instructions"]
+    assert world.auth.store.load_staged() is not None          # kept
+
+
+def test_a_tool_call_first_then_setup_still_mints_nothing_behind_a_waiting_sign_in(
+        world, monkeypatch):
+    from auth import RefreshRetryable, RefreshTerminal
+    _active(world)
+    world.auth.store.stage("rt-staged", "b" * 64, time.time())
+
+    def unverifiable(refresh_token):
+        raise RefreshRetryable("temporarily_unavailable")
+
+    def revoked(refresh_token):
+        raise RefreshTerminal("invalid_grant")
+    monkeypatch.setattr(world.auth, "refresh_and_verify", unverifiable)
+    monkeypatch.setattr(world.auth, "probe_refresh", revoked)
+    world.server._startup()
+
+    world.server.search_emails("from:me")
     result = json.loads(world.server.setup_gmail())
 
     assert world.mints == []
     assert result["status"] == "retry_later"
-    assert world.auth.store.load_staged() is not None          # kept
+
+
+def test_a_tool_call_behind_an_unconfirmed_sign_in_does_not_ask_for_a_new_one(
+        world, monkeypatch):
+    from auth import RefreshRetryable
+    world.auth.store.stage("rt-staged", FLOW, time.time())
+
+    def unverifiable(refresh_token):
+        raise RefreshRetryable("temporarily_unavailable")
+    monkeypatch.setattr(world.auth, "refresh_and_verify", unverifiable)
+    world.server._startup()
+
+    with pytest.raises(ValueError) as caught:
+        world.server.search_emails("from:me")
+
+    assert "authorization link" not in str(caught.value)
+    assert "waiting to be confirmed" in str(caught.value)
+    world.cb.ack.assert_not_called()
+    assert world.auth.store.load_staged() is not None
+
+
+def test_setup_mints_nothing_when_recovery_fails_before_it_can_tell(world, monkeypatch):
+    def broken(auth, cb, wait=0.0):
+        raise OSError("read-only file system")
+    monkeypatch.setattr(world.server, "_flow_recover", broken)
+    world.server._startup()
+
+    result = json.loads(world.server.setup_gmail())
+
+    assert world.mints == []
+    assert result["status"] == "retry_later"
+
+
+def test_a_settled_stage_left_beside_its_own_credential_blocks_nothing(world, monkeypatch):
+    """A stage whose flow is already the active credential's was promoted;
+    only its file is left. It is not a sign-in waiting for anything."""
+    from token_store import Credential
+    world.auth.store.stage("rt-active", FLOW, time.time())
+    world.auth.store.write_active(Credential(
+        refresh_token="rt-active", flow=FLOW, generation=1.0, account=SUBJECT))
+    monkeypatch.setattr(world.server, "_flow_recover", lambda a, c, wait=0.0: "none")
+    monkeypatch.setattr(world.auth, "probe_refresh", lambda rt: None)
+    world.server._startup()
+
+    result = json.loads(world.server.setup_gmail())
+
+    assert result["status"] == "already_connected"
+    assert world.mints == []
+
+
+def test_setup_mints_nothing_while_another_process_may_be_finishing_a_sign_in(
+        world, monkeypatch):
+    """Nothing on disk yet, but another process holds the lock: it may be
+    exchanging a code it collected and about to promote it. A link minted
+    now could be a second sign-in for the operator to complete."""
+    monkeypatch.setattr(world.server, "RECOVERY_WAIT_S", 0.3)
+    with lock_held_by_another_process(world.dir):
+        world.server._startup()
+        result = json.loads(world.server.setup_gmail())
+
+    assert world.mints == []
+    assert result["status"] == "retry_later"
+    assert "another Gmail process" in result["instructions"]

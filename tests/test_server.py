@@ -33,10 +33,12 @@ class _Broker:
 def no_credential_recovery(monkeypatch):
     """These tests drive the tools and setup_gmail's decisions with the
     process state each one sets up; credential recovery itself, which runs
-    first when the process is not in service, is exercised against a real
-    store and a real second process in test_busy_startup.py."""
+    first when the process is not in service, and the staged-slot check that
+    holds minting back are exercised against a real store and a real second
+    process in test_busy_startup.py."""
     import server
     monkeypatch.setattr(server, "_flow_recover", lambda auth, cb, wait=0.0: "none")
+    monkeypatch.setattr(server, "_sign_in_waiting", lambda: False)
 
 
 @pytest.fixture(autouse=True)

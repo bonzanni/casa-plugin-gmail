@@ -110,6 +110,26 @@ def _recover() -> str | None:
 
 
 _BUSY_TEXT = ("another Gmail process is finishing its sign-in work right now")
+_WAITING_TEXT = ("a completed Gmail authorization is waiting to be confirmed, "
+                 "and Google could not confirm it just now")
+
+
+def _sign_in_waiting() -> bool:
+    """True while a completed authorization sits in the staged slot.
+
+    Read from the store, not from what this call's recovery returned: a
+    process already in service runs no recovery, and the credential it is
+    using may be the revoked one the waiting sign-in replaces. Until the stage
+    is settled (recovery, or gmail_auth_collect, verifies it and promotes or
+    discards it) nothing shows that another sign-in is needed, so nothing may
+    mint one or ask for one. Post-promote residue (the stage is the active
+    flow) is already settled and does not count.
+    """
+    staged = _auth.store.load_staged()
+    if staged is None or not staged.flow:
+        return False
+    active = _auth.store.load_active()
+    return active is None or active.flow != staged.flow
 
 
 def _require_auth() -> None:
@@ -120,6 +140,11 @@ def _require_auth() -> None:
         raise ValueError(
             f"Gmail is still starting up: {_BUSY_TEXT}. Nothing is wrong with "
             "the connection. Try again in a moment."
+        )
+    if _sign_in_waiting():
+        raise ValueError(
+            f"Gmail is not connected yet: {_WAITING_TEXT}. Nothing new is "
+            "needed. Try again in a moment; gmail_auth_collect finishes it."
         )
     stored = _stored_credential()
     if stored is not None:
@@ -368,21 +393,21 @@ def setup_gmail() -> str:
     #    minting publishes only the former, and the latter trails it by up to
     #    a reconciliation interval. See _outstanding_authorization.
     outcome = _recover()
-    if outcome in ("busy", "retain", "error"):
-        # Nothing shows that a new authorization is needed: the lock holder
-        # may be promoting a good one right now, or a completed one is waiting
-        # in the staged slot and Google could not confirm it yet. A link minted
-        # now would be a second live sign-in for the operator to complete.
-        # Even when recovery put an older credential into service: that one
-        # may be the revoked credential the waiting sign-in replaces.
-        reason = (_BUSY_TEXT if outcome == "busy" else
-                  "a completed Gmail authorization is waiting to be confirmed, "
-                  "and Google could not confirm it just now")
+    # Nothing shows that a new authorization is needed while the lock holder
+    # may be promoting a good one right now, while recovery failed before it
+    # could tell, or while a completed one waits in the staged slot. A link
+    # minted then would be a second live sign-in for the operator to complete.
+    if outcome in ("busy", "error") or _sign_in_waiting():
+        reason = {"busy": _BUSY_TEXT,
+                  "error": "I could not check the stored Gmail authorization "
+                           "just now (see the plugin log)"}.get(outcome, _WAITING_TEXT)
         return _no_link(**{
             "status": "retry_later",
             "instructions": (
                 f"No authorization link was created: {reason}. Nothing new is "
-                "needed yet. Run setup_gmail again in a moment."
+                "needed yet. Run setup_gmail again in a moment"
+                + ("; gmail_auth_collect finishes the waiting authorization."
+                   if reason == _WAITING_TEXT else ".")
             ),
         })
     dead_credential = None

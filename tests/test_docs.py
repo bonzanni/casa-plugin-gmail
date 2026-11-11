@@ -89,6 +89,8 @@ def test_every_quoted_diagnostic_matches_its_source():
         ("server/auth.py", "could not refresh right now "),
         ("server/server.py", "Gmail is not authenticated. Call setup_gmail"),
         ("server/server.py", "Gmail is still starting up: "),
+        ("server/server.py", "a completed Gmail authorization is waiting to be confirmed"),
+        ("server/server.py", "Gmail is not connected yet: "),
         ("server/server.py", "but I could not confirm it with Google just now"),
         ("server/server.py", "another Gmail process is finishing its sign-in work"),
         ("server/auth_flow.py",

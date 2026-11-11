@@ -140,6 +140,9 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 **`Gmail is still starting up: another Gmail process is finishing its sign-in work …`** (tool error)
 → Casa can run more than one Gmail server at once (a session's own, and a short-lived one that lists the tools). The server loads the stored credential when a tool first needs it, under a lock shared with the others, and waits up to 20 seconds for another server to finish with it. Nothing is wrong with the connection; the next call retries. `setup_gmail` answers `retry_later` in the same situation and creates no link.
 
+**`Gmail is not connected yet: a completed Gmail authorization is waiting to be confirmed …`** (tool error)
+→ You finished signing in, but Google could not confirm the new authorization when the plugin checked it (a network or 5xx failure). It is kept, and nothing new is needed: the next call, or `gmail_auth_collect`, confirms it. Until then `setup_gmail` answers `retry_later` and creates no second link.
+
 **`Gmail's stored authorization for … is in place, but I could not confirm it with Google just now`** (tool error)
 → A credential is on disk but could not be refreshed on this call (see the server log for why). Nothing needs re-authorizing; the next call retries. If it persists, `setup_gmail` reports the cause (`retry_later` or `configuration_error`).
 
