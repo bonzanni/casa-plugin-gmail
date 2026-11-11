@@ -360,13 +360,13 @@ def test_reconcile_unlinks_post_promote_residue(tmp_path):
     auth.refresh_and_verify.assert_not_called()
 
 
-def test_startup_recover_returns_busy_when_lock_contended(tmp_path):
+def test_recover_returns_busy_when_lock_contended(tmp_path):
     """Contention is a no-op: no validate_and_init, no stage work."""
-    from auth_flow import collect_lock, startup_recover
+    from auth_flow import collect_lock, recover
     auth, cb, _ = build_env(tmp_path)
 
     with collect_lock(tmp_path):
-        result = startup_recover(auth, cb)
+        result = recover(auth, cb)
 
     assert result == "busy"
     auth.validate_and_init.assert_not_called()
@@ -386,35 +386,35 @@ def _real_auth(tmp_path, monkeypatch, **env):
     return GmailAuth(str(tmp_path))
 
 
-def test_startup_recover_reads_env_even_when_the_lock_is_contended(tmp_path, monkeypatch):
+def test_recover_reads_env_even_when_the_lock_is_contended(tmp_path, monkeypatch):
     """Two overlapping server processes are the only reason the lock exists. The
     loser must still be configured: without the env, setup_gmail emits
     client_id=None and gmail_auth_collect crashes on the account comparison."""
-    from auth_flow import collect_lock, startup_recover
+    from auth_flow import collect_lock, recover
     auth = _real_auth(tmp_path, monkeypatch)
 
     with collect_lock(tmp_path):
-        result = startup_recover(auth, MagicMock())
+        result = recover(auth, MagicMock())
 
     assert result == "busy"
     assert auth.subject_email == "user@example.com"
     assert "client_id=client-id" in auth.build_auth_url("https://casa/x", "s")
 
 
-def test_startup_recover_exits_on_missing_env_even_when_contended(tmp_path, monkeypatch):
+def test_recover_exits_on_missing_env_even_when_contended(tmp_path, monkeypatch):
     """The hoisted env read still exits the process: SystemExit is a
     BaseException and nothing here may catch it."""
-    from auth_flow import collect_lock, startup_recover
+    from auth_flow import collect_lock, recover
     auth = _real_auth(tmp_path, monkeypatch, GMAIL_CLIENT_ID=None)
 
     with collect_lock(tmp_path):
         with pytest.raises(SystemExit):
-            startup_recover(auth, MagicMock())
+            recover(auth, MagicMock())
 
 
-def test_startup_recover_loads_active_before_reconciling_stage(tmp_path):
+def test_recover_loads_active_before_reconciling_stage(tmp_path):
     """Ordering pin: validate_and_init runs before stage verification."""
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     order = []
     auth.validate_and_init.side_effect = lambda: order.append("validate_and_init")
@@ -424,20 +424,20 @@ def test_startup_recover_loads_active_before_reconciling_stage(tmp_path):
         return "user@example.com"
     auth.refresh_and_verify.side_effect = verify
 
-    startup_recover(auth, cb)
+    recover(auth, cb)
 
     assert order == ["validate_and_init", "refresh_and_verify"]
 
 
-def test_startup_recover_holds_the_lock_through_reconcile_stage(tmp_path):
+def test_recover_holds_the_lock_through_reconcile_stage(tmp_path):
     """Both validate_and_init and reconcile_stage run under ONE acquisition.
 
     Proof: from inside refresh_and_verify (called by reconcile_stage), a
-    re-entrant startup_recover call can only see "busy" if the outer call's
+    re-entrant recover call can only see "busy" if the outer call's
     lock is still held at that point — i.e. reconcile_stage has not yet run
     past the `with collect_lock(...)` block.
     """
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     calls = {"n": 0}
     nested = {}
@@ -445,48 +445,48 @@ def test_startup_recover_holds_the_lock_through_reconcile_stage(tmp_path):
     def verify(rt):
         calls["n"] += 1
         if calls["n"] == 1:
-            nested["result"] = startup_recover(auth, cb)
+            nested["result"] = recover(auth, cb)
         return "user@example.com"
     auth.refresh_and_verify.side_effect = verify
 
-    startup_recover(auth, cb)
+    recover(auth, cb)
 
     assert nested["result"] == "busy"
 
 
-def test_startup_recover_returns_error_when_reconcile_stage_raises(tmp_path, capsys):
+def test_recover_returns_error_when_reconcile_stage_raises(tmp_path, capsys):
     """A bug or I/O error in step 0 must not propagate — and must be logged.
 
     An unclassified *verification* failure is now classified as "retain" inside
     reconcile_stage, so this net is exercised from the settlement instead: it
     must still catch anything reconcile_stage does not."""
     from auth import RefreshTerminal
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.side_effect = RefreshTerminal("revoked")
     cb.ack.side_effect = RuntimeError("boom")
 
-    result = startup_recover(auth, cb)
+    result = recover(auth, cb)
 
     assert result == "error"
     captured = capsys.readouterr()
     assert "boom" in captured.err
 
 
-def test_startup_recover_does_not_catch_system_exit(tmp_path):
+def test_recover_does_not_catch_system_exit(tmp_path):
     """A missing env var still exits the process: SystemExit is a BaseException."""
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, _ = build_env(tmp_path)
     auth.validate_and_init.side_effect = SystemExit(1)
 
     with pytest.raises(SystemExit):
-        startup_recover(auth, cb)
+        recover(auth, cb)
 
 
 # ── Startup-recovery outcomes must reach the user ──────────────────────────
 # Casa's browser page is identical for success, denial and a replayed link, so
 # chat is the only place the real outcome is ever learned. A stage resolved by
-# startup_recover is ACKED, and the ack tears the attempt down — so without a
+# recover is ACKED, and the ack tears the attempt down — so without a
 # durable notice the next collect finds nothing and says nothing.
 
 def _next_collect(auth):
@@ -499,11 +499,11 @@ def _next_collect(auth):
 
 
 def test_startup_promotion_is_reported_by_the_next_collect(tmp_path):
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "user@example.com"
 
-    assert startup_recover(auth, cb) == "promoted"
+    assert recover(auth, cb) == "promoted"
 
     out = _next_collect(auth)
     assert any("Gmail connected as user@example.com" in m for m in out["messages"])
@@ -512,11 +512,11 @@ def test_startup_promotion_is_reported_by_the_next_collect(tmp_path):
 def test_startup_wrong_account_rejection_is_reported_by_the_next_collect(tmp_path):
     """The case that matters most: the user granted from the wrong inbox and
     would otherwise get a neutral browser page and total silence in chat."""
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
 
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     out = _next_collect(auth)
     assert any("someone-else@example.com" in m for m in out["messages"])
@@ -524,11 +524,11 @@ def test_startup_wrong_account_rejection_is_reported_by_the_next_collect(tmp_pat
 
 def test_startup_terminal_settlement_is_reported_by_the_next_collect(tmp_path):
     from auth import RefreshTerminal
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
 
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     out = _next_collect(auth)
     assert any("no longer valid" in m for m in out["messages"])
@@ -539,13 +539,13 @@ def test_the_notice_is_written_before_the_ack(tmp_path):
     down; a notice written after it is lost by a crash in between — which is
     the exact scenario the notice exists for."""
     from auth import RefreshTerminal
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
     seen = {}
     cb.ack.side_effect = lambda h: seen.update(notices=store.peek_notices())
 
-    startup_recover(auth, cb)
+    recover(auth, cb)
 
     assert seen["notices"], "the notice must already be on disk when ack runs"
     assert "no longer valid" in seen["notices"][0]
@@ -561,10 +561,10 @@ def test_the_notice_is_written_before_the_ack(tmp_path):
 def test_a_notice_survives_a_pass_that_raises_after_reading_it(tmp_path):
     """The notice is read, then cb.attempts() blows up — the tool
     errors out and the sentence must still be waiting for the retry."""
-    from auth_flow import collect_pass, startup_recover
+    from auth_flow import collect_pass, recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     broken = MagicMock()
     broken.attempts.side_effect = RuntimeError("callback index unreadable")
@@ -581,10 +581,10 @@ def test_a_notice_survives_a_retried_collect_in_the_same_process(tmp_path):
     evidence that the first response reached the agent. If the second pass
     purges what the first returned, the user is told nothing was waiting when
     their authorization had in fact been rejected as the wrong account."""
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     first = _next_collect(auth)["messages"]
     assert any("someone-else@example.com" in m for m in first)
@@ -599,10 +599,10 @@ def test_a_pass_that_raises_does_not_consume_an_offer(tmp_path):
     """The offer is counted only on a normal return, so a pass that blew up
     after peeking leaves the whole budget intact."""
     from token_store import NOTICE_OFFER_LIMIT
-    from auth_flow import collect_pass, startup_recover
+    from auth_flow import collect_pass, recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     broken = MagicMock()
     broken.attempts.side_effect = RuntimeError("callback index unreadable")
@@ -621,10 +621,10 @@ def test_a_notice_is_offered_a_bounded_number_of_times_then_never_again(tmp_path
     must neither reset the budget nor exempt a notice from it — the count is on
     disk, and no process identity is involved anywhere."""
     from token_store import NOTICE_OFFER_LIMIT, TokenStore
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.return_value = "someone-else@example.com"
-    startup_recover(auth, cb)
+    recover(auth, cb)
 
     offers = 0
     for _ in range(NOTICE_OFFER_LIMIT + 5):
@@ -642,16 +642,16 @@ def test_a_failed_ack_does_not_queue_the_notice_twice(tmp_path):
     """The stage survives an ack that failed, so the next startup settles the
     same flow the same way — and must not append the same sentence again."""
     from auth import RefreshTerminal
-    from auth_flow import startup_recover
+    from auth_flow import recover
     auth, cb, store = build_env(tmp_path, staged=("rt-new", FLOW, 9.0))
     auth.refresh_and_verify.side_effect = RefreshTerminal("invalid_grant")
     cb.ack.side_effect = RuntimeError("casa unreachable")
 
-    assert startup_recover(auth, cb) == "error"
+    assert recover(auth, cb) == "error"
     assert store.load_staged() is not None, "a failed ack must keep the stage"
 
     cb.ack.side_effect = None
-    assert startup_recover(auth, cb) == "settled"
+    assert recover(auth, cb) == "settled"
 
     messages = _next_collect(auth)["messages"]
     assert len([m for m in messages if "no longer valid" in m]) == 1
