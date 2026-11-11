@@ -301,3 +301,28 @@ def test_a_wait_gives_up_while_the_other_process_still_holds_the_lock(tmp_path):
             waited = time.monotonic() - started
     assert acquired is False
     assert 0.3 <= waited < 1.0
+
+
+def test_setup_mints_nothing_while_a_newer_sign_in_waits_behind_a_revoked_one(world, monkeypatch):
+    """Recovery brings the old credential into service, but the completed
+    sign-in waiting in the staged slot cannot be confirmed yet. The old one
+    then turns out to be revoked. The waiting sign-in may well be good, so
+    nothing shows that another is needed."""
+    from auth import RefreshRetryable, RefreshTerminal
+    _active(world)
+    world.auth.store.stage("rt-staged", "b" * 64, time.time())
+
+    def unverifiable(refresh_token):
+        raise RefreshRetryable("temporarily_unavailable")
+
+    def revoked(refresh_token):
+        raise RefreshTerminal("invalid_grant")
+    monkeypatch.setattr(world.auth, "refresh_and_verify", unverifiable)
+    monkeypatch.setattr(world.auth, "probe_refresh", revoked)
+    world.server._startup()
+
+    result = json.loads(world.server.setup_gmail())
+
+    assert world.mints == []
+    assert result["status"] == "retry_later"
+    assert world.auth.store.load_staged() is not None          # kept

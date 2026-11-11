@@ -368,11 +368,13 @@ def setup_gmail() -> str:
     #    minting publishes only the former, and the latter trails it by up to
     #    a reconciliation interval. See _outstanding_authorization.
     outcome = _recover()
-    if not _authenticated and outcome in ("busy", "retain", "error"):
+    if outcome in ("busy", "retain", "error"):
         # Nothing shows that a new authorization is needed: the lock holder
         # may be promoting a good one right now, or a completed one is waiting
         # in the staged slot and Google could not confirm it yet. A link minted
         # now would be a second live sign-in for the operator to complete.
+        # Even when recovery put an older credential into service: that one
+        # may be the revoked credential the waiting sign-in replaces.
         reason = (_BUSY_TEXT if outcome == "busy" else
                   "a completed Gmail authorization is waiting to be confirmed, "
                   "and Google could not confirm it just now")
