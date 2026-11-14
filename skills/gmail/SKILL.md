@@ -105,7 +105,7 @@ replayed link, so **chat is the only place the user learns the real outcome**:
 
 ## Interactive Use
 
-Use these tools when the user asks to check, search, or read email; send or reply to a message; manage inbox (archive, label, mark read, trash); or handle attachments.
+Use these tools when the user asks to check, search, or read email; send or reply to a message; manage inbox (archive, label, mark read, trash, one at a time or in bulk); organise labels and filters; or handle attachments.
 
 ### Tool Sequence Rules
 
@@ -135,6 +135,15 @@ Use these tools when the user asks to check, search, or read email; send or repl
   - Suspicious types: `application/x-msdownload`, `application/x-sh`, `application/x-executable`
   - Recommended safe types for automation: `application/pdf`, `image/jpeg`, `image/png`, `image/gif`
 
+### Keeping the Inbox Clean
+
+- **Before `create_filter`:** call `list_filters` to see whether one already covers it, then `search_emails` with the exact query you will use and tell the user how many messages it matches and from whom. A filter acts on all future mail silently, and the approval prompt shows only the query.
+- Prefer labelling and skipping the inbox over trashing; a filter cannot trash or forward.
+- One filter per sender or pattern keeps them easy to remove later.
+- `bulk_manage` changes at most `max_messages` per call; while `more_remaining` is true, call it again with the same arguments.
+- `delete_filter` needs the filter's `description` exactly as `list_filters` returned it.
+- Labels can be given by name (`Receipts/2026`) or ID everywhere.
+
 ### Rate Limit Handling
 
 If a 429 error is returned: tell the user "Gmail API is throttled — I'll retry in 30 seconds", wait 30 seconds, retry once. If the second attempt also fails: "The request is consistently rate-limited. Please try again in a moment."
@@ -147,7 +156,7 @@ These tools are composable for task managers and scheduled agents.
 
 **Batch guidance:** Keep `max_results` ≤ 50. For large date ranges, split into weekly windows (`after:2026-07-01 before:2026-07-08`, then next week, etc.). On 429: back off 30 seconds before retrying. Skip individual failures (log and continue) — do not abort the batch.
 
-**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to tools that need no approval: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`.
+**Protected tools in automation:** `send_email` and `reply_to_thread` ALWAYS require the user's tap-approval. Automation workflows must restrict themselves to tools that need no approval: `search_emails`, `get_email`, `get_thread`, `list_attachments`, `download_attachment`, `save_attachment`, `manage_email`, `bulk_manage`, `list_labels`, `create_label`, `update_label`, `list_filters`. `create_filter`, `delete_filter` and `delete_label` also need the user's tap-approval.
 
 ### Reference Pattern: Invoice Monitoring
 

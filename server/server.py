@@ -587,9 +587,70 @@ def get_thread(thread_id: str, max_messages: int = 20, include_html: bool = Fals
 
 @mcp.tool()
 def manage_email(message_id: str, action: str, label: str = "") -> str:
-    """Manage an email. action: archive|trash|mark_read|mark_unread|add_label|remove_label. label required for add/remove_label."""
+    """Manage an email. action: archive|trash|mark_read|mark_unread|add_label|remove_label. label (a label name or ID) required for add/remove_label."""
     _require_auth()
     return _ok(_client.manage_email(message_id, action, label))
+
+
+@mcp.tool()
+def bulk_manage(query: str, action: str, label: str = "", max_messages: int = 500) -> str:
+    """Apply one action to every email matching a Gmail search. action: archive|trash|mark_read|mark_unread|add_label|remove_label; label (name or ID) for add/remove_label. Only mail that still needs the change is selected, so calling again continues where a capped run stopped: when more_remaining is true, call again with the same arguments. processed counts messages Gmail accepted the change for. Trashed mail stays in Trash for 30 days. max_messages defaults to 500, at most 5000. The query is required (use in:inbox for the whole inbox)."""
+    _require_auth()
+    return _ok(_client.bulk_manage(query, action, label, max_messages))
+
+
+# ── Labels ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_labels() -> str:
+    """List the mailbox's labels: id, name, type (user or system) and colour. Nested labels have names like 'Receipts/2026'."""
+    _require_auth()
+    return _ok(_client.list_labels())
+
+
+@mcp.tool()
+def create_label(name: str, background_color: str = "", text_color: str = "") -> str:
+    """Create a label (nest it with '/', e.g. 'Receipts/2026'). If one with that name already exists it is returned with created=false. Colours are optional and must be pairs from Gmail's label palette (hex like '#fb4c2f')."""
+    _require_auth()
+    return _ok(_client.create_label(name, background_color, text_color))
+
+
+@mcp.tool()
+def update_label(label: str, new_name: str = "", background_color: str = "", text_color: str = "") -> str:
+    """Rename or recolour a user label. label is its name or ID. Colours come as a pair from Gmail's label palette."""
+    _require_auth()
+    return _ok(_client.update_label(label, new_name, background_color, text_color))
+
+
+@mcp.tool()
+def delete_label(label: str) -> str:
+    """Delete a user label (name or ID). The mail is kept, but the label comes off every message, which cannot be undone in bulk. Protected: requires the user's tap-approval."""
+    _require_auth()
+    return _ok(_client.delete_label(label))
+
+
+# ── Filters ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_filters() -> str:
+    """List Gmail filters. Each has an id, a one-line description of what it matches and does, and Gmail's full criteria and action. Check here before creating a filter; pass a filter's id and description to delete_filter."""
+    _require_auth()
+    return _ok(_client.list_filters())
+
+
+@mcp.tool()
+def create_filter(query: str, label: str = "", skip_inbox: bool = False, mark_read: bool = False,
+                  star: bool = False, apply_to_existing: bool = False) -> str:
+    """Create a Gmail filter that acts on ALL FUTURE mail matching query (Gmail search syntax): add a label (created if missing), skip the inbox (archive), mark read, and/or star. It cannot trash or forward. Before calling, run search_emails with the same query and tell the user how much it matches and from whom — the approval prompt cannot show that. apply_to_existing=true also applies the same actions to matching mail already there (up to 5000; more_remaining says if more is left — run bulk_manage to continue). An identical filter is not created twice (created=false). Protected: requires the user's tap-approval."""
+    _require_auth()
+    return _ok(_client.create_filter(query, label, skip_inbox, mark_read, star, apply_to_existing))
+
+
+@mcp.tool()
+def delete_filter(filter_id: str, description: str) -> str:
+    """Delete a Gmail filter. description must be that filter's description exactly as list_filters returned it; if it does not match the filter, nothing is deleted. Protected: requires the user's tap-approval."""
+    _require_auth()
+    return _ok(_client.delete_filter(filter_id, description))
 
 
 # ── Attachments ────────────────────────────────────────────────────────────

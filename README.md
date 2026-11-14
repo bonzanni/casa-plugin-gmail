@@ -108,6 +108,8 @@ If `setup_gmail` returns a `redirect_uri` that doesn't match what's registered o
 
 ### Updating an already-connected install
 
+0.13.0 adds the label, bulk and filter tools. Their Gmail permissions were already part of the sign-in (`gmail.modify` and `gmail.settings.basic`), so no new sign-in is needed.
+
 Updating the plugin on a working system does not disturb the connection, and does not need a re-authorization. The refresh token is kept in `CLAUDE_PLUGIN_DATA`, which is casa's persistent plugin-data directory for a role-assigned plugin — the update replaces the plugin artifact, and the credential is not in it. This plugin also declares a callback and **no triggers**, so an update re-mints no per-trigger secret that could reach the stored grant (a callback declaration carries no secret at all, and its consent ack survives an update that leaves `casa.callbacks` unchanged).
 
 Casa also runs `setup_gmail` after an update. On a healthy install it answers `already_connected` with the connected account and mints nothing, so that line is your confirmation. You can ask the agent to run it at any time; it is argument-free and changes nothing when there is nothing to change.
@@ -188,7 +190,15 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 | `search_emails` | Search inbox with Gmail query syntax |
 | `get_email` | Read full email content |
 | `get_thread` | Read full email thread |
-| `manage_email` | Archive, trash, label, mark read/unread |
+| `manage_email` | Archive, trash, label, mark read/unread (`label` takes a name or an ID) |
+| `bulk_manage` | Archive, trash, label or mark read/unread every email matching a Gmail search (500 by default, at most 5000 per call; only mail that still needs the change is selected, so calling again continues) |
+| `list_labels` | List labels (id, name, user/system, colour) |
+| `create_label` | Create a label, nested with `/` (`Receipts/2026`); an existing one is returned, not duplicated |
+| `update_label` | Rename or recolour a user label |
+| `delete_label` ⚠️ | Delete a user label; the mail stays, the label comes off every message (requires the user's approval) |
+| `list_filters` | List Gmail filters, each with a one-line description and Gmail's full criteria and action |
+| `create_filter` ⚠️ | Create a filter for future mail matching a Gmail search: label it (the label is created if missing), skip the inbox, mark read and/or star; optionally apply the same to matching mail already there. It cannot trash or forward. An identical filter is not created twice (requires the user's approval) |
+| `delete_filter` ⚠️ | Delete a filter; the description from `list_filters` must match it, or nothing is deleted (requires the user's approval) |
 | `list_attachments` | List attachments on an email |
 | `download_attachment` | Download an attachment into Casa's handoff folder (kept 7 days), where other plugins can take it |
 | `save_attachment` | Permanently save a downloaded attachment under `saved/` |
@@ -206,17 +216,19 @@ posts it in the chat you asked from and tells the agent whether it arrived. So t
 passes through the agent, and never lands in a task topic.
 
 The manifest declares one access profile, `read`: `search_emails`,
-`get_email`, `get_thread`, `list_attachments`, `download_attachment` and `list_send_as`.
-An agent assigned Gmail with that profile can search and read mail and download
-attachments, and Casa denies it the other eight tools: sending, replying, archiving, trashing, marking
-or labelling mail, saving attachments, the erasers, and sign-in setup. An assignment without a
+`get_email`, `get_thread`, `list_attachments`, `download_attachment`, `list_send_as`,
+`list_labels` and `list_filters`.
+An agent assigned Gmail with that profile can search and read mail, list labels and filters,
+and download attachments, and Casa denies it the other fourteen tools: sending, replying,
+archiving, trashing, marking or labelling mail (one at a time or in bulk), changing labels or
+filters, saving attachments, the erasers, and sign-in setup. An assignment without a
 profile gets every tool, as before. Casa sets a profile only on a new assignment, so
 narrowing an existing one means unassigning and assigning again with `profile="read"`.
-`casa.provides_tools` lists all fourteen tools by their full names. Casa requires the list
+`casa.provides_tools` lists all twenty-two tools by their full names. Casa requires the list
 once a profile is declared and checks that it names every tool the profile lists, but it
 does not check that the list is complete. The completeness matters, though: the tools Casa
 hides from a read-profiled agent are the ones in this list and not in the profile, and the
-plugin's own tests pin all fourteen.
+plugin's own tests pin all twenty-two.
 
 ⚠️ Protected tools — require tap-approval from the user before execution.
 

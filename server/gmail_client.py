@@ -1,4 +1,5 @@
 import base64
+import difflib
 import os
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -7,6 +8,8 @@ from typing import Any
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+import hygiene
 
 
 SYSTEM_LABELS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "UNREAD", "STARRED"}
@@ -161,6 +164,51 @@ def _translate_error(e: HttpError) -> ValueError:
     return ValueError(f"Gmail API error {e.resp.status}: {reason}")
 
 
+BULK_CEILING = 5000
+
+
+class LabelNotFound(ValueError):
+    """No label matches the given name or ID (as opposed to an ambiguous one)."""
+
+
+def _label_term(label: dict) -> str:
+    """The search term selecting mail that carries `label`."""
+    if label["id"] == "IMPORTANT":
+        return "is:important"
+    if label["id"].startswith("CATEGORY_"):
+        return "category:" + label["id"][len("CATEGORY_"):].lower()
+    return "label:" + hygiene.label_search_term(label["name"])
+
+
+def _refuse_system_label(label: str) -> None:
+    upper = label.upper()
+    if upper in SYSTEM_LABELS:
+        raise ValueError(SYSTEM_LABEL_ERRORS.get(upper, f"Label {upper} is a system label."))
+
+
+def _label_view(raw: dict) -> dict:
+    view = {"id": raw["id"], "name": raw["name"], "type": str(raw.get("type", "user")).lower()}
+    if raw.get("color"):
+        view["color"] = raw["color"]
+    return view
+
+
+def _label_error(e: HttpError, label: str) -> ValueError:
+    if e.resp.status == 404:
+        return ValueError(f"Label '{label}' not found.")
+    if e.resp.status == 400:
+        return ValueError(f"Gmail rejected the label change for '{label}' (colours must come from "
+                          f"Gmail's fixed label palette; names must be unique): {_reason(e)}")
+    return _translate_error(e)
+
+
+def _reason(e: HttpError) -> str:
+    try:
+        return e._get_reason()
+    except Exception:
+        return str(e)
+
+
 class GmailClient:
     def __init__(self, credentials):
         self._service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
@@ -295,9 +343,9 @@ class GmailClient:
         if action in ("add_label", "remove_label"):
             if not label:
                 raise ValueError(f"label is required for action '{action}'.")
-            upper = label.upper()
-            if upper in SYSTEM_LABELS:
-                raise ValueError(SYSTEM_LABEL_ERRORS.get(upper, f"Label {upper} is a system label."))
+            _refuse_system_label(label)
+            label = self.resolve_label(label)["id"]
+            _refuse_system_label(label)
         try:
             svc = self._service.users().messages()
             if action == "archive":
@@ -317,6 +365,282 @@ class GmailClient:
                 raise ValueError(f"Message {message_id} not found or no longer accessible.")
             raise _translate_error(exc)
         return {"success": True}
+
+    # ── Labels ─────────────────────────────────────────────────────────────
+
+    def _raw_labels(self) -> list[dict]:
+        try:
+            return self._service.users().labels().list(userId="me").execute().get("labels", [])
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def list_labels(self) -> list[dict]:
+        return [_label_view(l) for l in self._raw_labels()]
+
+    def resolve_label(self, label: str, labels: list[dict] | None = None) -> dict:
+        """A label by ID, else by exact name, else by name ignoring case."""
+        if not label or not label.strip():
+            raise ValueError("A label name or ID is required.")
+        labels = self._raw_labels() if labels is None else labels
+        for test in (lambda l: l["id"] == label,
+                     lambda l: l["name"] == label,
+                     lambda l: l["name"].casefold() == label.casefold()):
+            hits = [l for l in labels if test(l)]
+            if len(hits) == 1:
+                return _label_view(hits[0])
+            if len(hits) > 1:
+                raise ValueError(f"Label '{label}' is ambiguous: "
+                                 + ", ".join(h["name"] for h in hits) + ". Use the label ID.")
+        close = difflib.get_close_matches(label, [l["name"] for l in labels], n=5, cutoff=0.5)
+        hint = f" Close: {', '.join(close)}." if close else " Call list_labels to see them."
+        raise LabelNotFound(f"No label named '{label}'.{hint}")
+
+    def create_label(self, name: str, background_color: str = "", text_color: str = "") -> dict:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("A label name is required.")
+        existing = self._find_by_name(name, self._raw_labels())
+        if existing:
+            return {**_label_view(existing), "created": False}
+        body = {"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
+        if background_color and text_color:
+            body["color"] = {"backgroundColor": background_color, "textColor": text_color}
+        try:
+            made = self._service.users().labels().create(userId="me", body=body).execute()
+        except HttpError as exc:
+            if exc.resp.status == 409:  # created meanwhile by another call
+                existing = self._find_by_name(name, self._raw_labels())
+                if existing:
+                    return {**_label_view(existing), "created": False}
+            raise _label_error(exc, name)
+        return {**_label_view(made), "created": True}
+
+    @staticmethod
+    def _find_by_name(name: str, labels: list[dict]) -> dict | None:
+        hits = [l for l in labels if l["name"].casefold() == name.casefold()]
+        return hits[0] if hits else None
+
+    def update_label(self, label: str, new_name: str = "", background_color: str = "",
+                     text_color: str = "") -> dict:
+        if not new_name and not (background_color and text_color):
+            raise ValueError("Nothing to change: give new_name, or both background_color and text_color.")
+        target = self._user_label(label)
+        try:
+            current = self._service.users().labels().get(userId="me", id=target["id"]).execute()
+        except HttpError as exc:
+            raise _label_error(exc, label)
+        body = {"name": new_name.strip() if new_name else current["name"],
+                "labelListVisibility": current.get("labelListVisibility", "labelShow"),
+                "messageListVisibility": current.get("messageListVisibility", "show")}
+        if background_color and text_color:
+            body["color"] = {"backgroundColor": background_color, "textColor": text_color}
+        try:
+            updated = self._service.users().labels().patch(userId="me", id=target["id"], body=body).execute()
+        except HttpError as exc:
+            raise _label_error(exc, label)
+        return _label_view(updated)
+
+    def delete_label(self, label: str) -> dict:
+        try:
+            target = self._user_label(label)
+        except LabelNotFound:
+            return {"deleted": False, "reason": "not found (already deleted?)"}
+        try:
+            self._service.users().labels().delete(userId="me", id=target["id"]).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found (already deleted?)"}
+            raise _label_error(exc, label)
+        return {"deleted": True, "name": target["name"]}
+
+    def _user_label(self, label: str) -> dict:
+        _refuse_system_label(label)
+        target = self.resolve_label(label)
+        if target["type"] == "system":
+            raise ValueError(f"Label {target['name']} is a system label and cannot be changed by this plugin.")
+        return target
+
+    # ── Bulk ───────────────────────────────────────────────────────────────
+
+    def _snapshot(self, selector: str, cap: int) -> tuple[list[str], bool]:
+        """IDs matching `selector`, up to `cap`, all collected before any change."""
+        ids, token = [], None
+        msgs = self._service.users().messages()
+        try:
+            while True:
+                kw = {"userId": "me", "q": selector, "maxResults": 500}
+                if token:
+                    kw["pageToken"] = token
+                resp = msgs.list(**kw).execute()
+                for m in resp.get("messages", []):
+                    if len(ids) == cap:
+                        return ids, True
+                    ids.append(m["id"])
+                token = resp.get("nextPageToken")
+                if not token:
+                    return ids, False
+                if len(ids) == cap:
+                    return ids, True
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def apply_to_matching(self, query: str, add_ids: list[str], remove_ids: list[str],
+                          needs: list[str], cap: int) -> dict:
+        """Select every message matching `query` that still needs a change, then
+        apply all the changes at once with batchModify (≤1000 IDs per call)."""
+        try:
+            ids, more = self._snapshot(hygiene.build_selector(query, needs), cap)
+        except ValueError as exc:  # nothing has changed yet
+            return {"matched": 0, "processed": 0, "more_remaining": False, "error": str(exc)}
+        body = {}
+        if add_ids:
+            body["addLabelIds"] = list(add_ids)
+        if remove_ids:
+            body["removeLabelIds"] = list(remove_ids)
+        out = {"matched": len(ids), "processed": 0, "more_remaining": more}
+        msgs = self._service.users().messages()
+        for start in range(0, len(ids), 1000):
+            chunk = ids[start:start + 1000]
+            try:
+                msgs.batchModify(userId="me", body={"ids": chunk, **body}).execute()
+            except HttpError as exc:
+                out["error"] = str(_translate_error(exc))
+                return out
+            out["processed"] += len(chunk)
+        return out
+
+    def trash_matching(self, query: str, cap: int) -> dict:
+        """Trash every message matching `query`, one call per message, stopping at
+        the first failure. (A batch HTTP request would send the whole group before
+        reporting any failure, and batchModify is not documented to take TRASH.)"""
+        ids, more = self._snapshot(hygiene.build_selector(query, []), cap)
+        out = {"matched": len(ids), "processed": 0, "more_remaining": more}
+        msgs = self._service.users().messages()
+        for mid in ids:
+            try:
+                msgs.trash(userId="me", id=mid).execute()
+            except HttpError as exc:
+                out["error"] = str(_translate_error(exc))
+                return out
+            out["processed"] += 1
+        return out
+
+    def bulk_manage(self, query: str, action: str, label: str = "", max_messages: int = 500) -> dict:
+        valid = {"archive", "trash", "mark_read", "mark_unread", "add_label", "remove_label"}
+        if action not in valid:
+            raise ValueError(f"Unknown action '{action}'. Valid: {', '.join(sorted(valid))}")
+        if not query or not query.strip():
+            raise ValueError("A search query is required (use in:inbox to mean the whole inbox).")
+        cap = max(1, min(int(max_messages), BULK_CEILING))
+        if action == "trash":
+            return self.trash_matching(query, cap)
+        if action in ("add_label", "remove_label"):
+            if not label:
+                raise ValueError(f"label is required for action '{action}'.")
+            _refuse_system_label(label)
+            target = self.resolve_label(label)
+            _refuse_system_label(target["id"])
+            term = _label_term(target)
+            if action == "add_label":
+                return self.apply_to_matching(query, [target["id"]], [], [f"-{term}"], cap)
+            return self.apply_to_matching(query, [], [target["id"]], [term], cap)
+        change = {"archive": ([], ["INBOX"]), "mark_read": ([], ["UNREAD"]),
+                  "mark_unread": (["UNREAD"], [])}[action]
+        return self.apply_to_matching(query, *change, [hygiene.NEEDS[action]], cap)
+
+    # ── Filters ────────────────────────────────────────────────────────────
+
+    def _raw_filters(self) -> list[dict]:
+        try:
+            return self._service.users().settings().filters().list(userId="me").execute().get("filter", [])
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def list_filters(self) -> list[dict]:
+        names = {l["id"]: l["name"] for l in self._raw_labels()}
+        out = []
+        for f in self._raw_filters():
+            criteria, action = f.get("criteria", {}), dict(f.get("action", {}))
+            shown = dict(action)
+            for key in ("addLabelIds", "removeLabelIds"):
+                if key in shown:
+                    shown[key] = [names.get(i, i) for i in shown[key]]
+            out.append({"id": f["id"], "description": hygiene.filter_description(criteria, action, names),
+                        "criteria": criteria, "action": shown})
+        return out
+
+    def create_filter(self, query: str, label: str = "", skip_inbox: bool = False,
+                      mark_read: bool = False, star: bool = False,
+                      apply_to_existing: bool = False) -> dict:
+        if not query or not query.strip():
+            raise ValueError("A search query is required for the filter.")
+        if not (label or skip_inbox or mark_read or star):
+            raise ValueError("Give the filter at least one action: label, skip_inbox, mark_read or star.")
+        add_ids, remove_ids, needs = [], [], []
+        label_name, created_label = None, False
+        if label:
+            _refuse_system_label(label)
+            labels = self._raw_labels()
+            try:
+                target = self.resolve_label(label, labels)
+            except LabelNotFound:
+                made = self.create_label(label)
+                target, created_label = made, made["created"]
+            _refuse_system_label(target["id"])
+            add_ids.append(target["id"])
+            needs.append(f"-{_label_term(target)}")
+            label_name = target["name"]
+        if star:
+            add_ids.append("STARRED")
+            needs.append(hygiene.NEEDS["star"])
+        if mark_read:
+            remove_ids.append("UNREAD")
+            needs.append(hygiene.NEEDS["mark_read"])
+        if skip_inbox:
+            remove_ids.append("INBOX")
+            needs.append(hygiene.NEEDS["skip_inbox"])
+        criteria = {"query": query.strip()}
+        action = {k: v for k, v in (("addLabelIds", add_ids), ("removeLabelIds", remove_ids)) if v}
+
+        want = (hygiene.normalize_criteria(criteria), hygiene.normalize_action(action))
+        existing = next((f for f in self._raw_filters()
+                         if (hygiene.normalize_criteria(f.get("criteria", {})),
+                             hygiene.normalize_action(f.get("action", {}))) == want), None)
+        if existing:
+            filter_id, created = existing["id"], False
+        else:
+            try:
+                made = self._service.users().settings().filters().create(
+                    userId="me", body={"criteria": criteria, "action": action}).execute()
+            except HttpError as exc:
+                raise _translate_error(exc)
+            filter_id, created = made["id"], True
+        applied = None
+        if apply_to_existing:
+            applied = self.apply_to_matching(criteria["query"], add_ids, remove_ids, needs, BULK_CEILING)
+        return {"filter_id": filter_id, "created": created, "label": label_name,
+                "created_label": created_label, "applied_to_existing": applied}
+
+    def delete_filter(self, filter_id: str, description: str) -> dict:
+        api = self._service.users().settings().filters()
+        try:
+            stored = api.get(userId="me", id=filter_id).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found"}
+            raise _translate_error(exc)
+        names = {l["id"]: l["name"] for l in self._raw_labels()}
+        actual = hygiene.filter_description(stored.get("criteria", {}), stored.get("action", {}), names)
+        if actual != description:
+            raise ValueError(f"Filter {filter_id} is '{actual}', not '{description}'. Nothing was "
+                             "deleted; call list_filters and pass that filter's description.")
+        try:
+            api.delete(userId="me", id=filter_id).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found"}
+            raise _translate_error(exc)
+        return {"deleted": True, "description": actual}
 
     # ── SendAs ─────────────────────────────────────────────────────────────
 

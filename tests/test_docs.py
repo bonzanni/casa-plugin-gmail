@@ -824,3 +824,16 @@ def test_the_readme_update_section_sits_outside_troubleshooting():
     written for an unrelated falsehood."""
     troubleshooting = _read(README).split("## Troubleshooting")[1]
     assert _README_UPDATE_HEADING not in troubleshooting
+
+
+# ── v0.13.0: the README lists every tool the server serves ─────────────────
+
+def test_readme_lists_every_served_tool():
+    import asyncio
+    import server
+    served = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    tools = _read(README).split("## Tools")[1].split("\n## ")[0]
+    missing = [t for t in sorted(served) if f"| `{t}`" not in tools]
+    assert not missing, f"README Tools table is missing {missing}"
+    assert "all twenty-two tools" in tools
+    assert "all fourteen" not in tools

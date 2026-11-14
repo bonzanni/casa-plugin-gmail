@@ -777,3 +777,462 @@ def test_mime_nesting_that_survives_json_parsing_does_not_crash():
     for _ in range(490):
         payload = {"mimeType": "multipart/mixed", "parts": [payload]}
     assert _read(payload)["body"] == "deep"
+
+
+# --- labels (0.13.0) ---
+
+def _http_error(status):
+    from googleapiclient.errors import HttpError
+    return HttpError(MagicMock(status=status), b"err")
+
+
+_LABELS = [
+    {"id": "INBOX", "name": "INBOX", "type": "system"},
+    {"id": "STARRED", "name": "STARRED", "type": "system"},
+    {"id": "IMPORTANT", "name": "IMPORTANT", "type": "system"},
+    {"id": "CATEGORY_PROMOTIONS", "name": "CATEGORY_PROMOTIONS", "type": "system"},
+    {"id": "Label_1", "name": "News", "type": "user",
+     "labelListVisibility": "labelShow", "messageListVisibility": "show"},
+    {"id": "Label_2", "name": "news-old", "type": "user"},
+]
+
+
+def _labels_api(client):
+    return client._service.users.return_value.labels.return_value
+
+
+def set_labels(client, labels=_LABELS):
+    _labels_api(client).list.return_value.execute.return_value = {"labels": [dict(l) for l in labels]}
+
+
+def test_list_labels_shapes_user_and_system():
+    client = make_client()
+    set_labels(client)
+    out = client.list_labels()
+    types = {l["name"]: l["type"] for l in out}
+    assert types["INBOX"] == "system" and types["News"] == "user"
+    assert set(out[0]) <= {"id", "name", "type", "color"}
+
+
+def test_resolve_label_prefers_id_then_exact_then_casefold():
+    client = make_client()
+    set_labels(client)
+    assert client.resolve_label("Label_1")["id"] == "Label_1"
+    assert client.resolve_label("News")["id"] == "Label_1"
+    assert client.resolve_label("news")["id"] == "Label_1"
+
+
+def test_resolve_label_unknown_names_candidates():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError, match="News"):
+        client.resolve_label("Nws")
+
+
+def test_create_label_existing_returns_created_false_without_api_create():
+    client = make_client()
+    set_labels(client)
+    out = client.create_label("news")
+    assert out["created"] is False and out["id"] == "Label_1"
+    _labels_api(client).create.assert_not_called()
+
+
+def test_create_label_sends_required_visibility():
+    client = make_client()
+    set_labels(client)
+    _labels_api(client).create.return_value.execute.return_value = {"id": "Label_9", "name": "Receipts/2026", "type": "user"}
+    out = client.create_label("Receipts/2026")
+    body = _labels_api(client).create.call_args.kwargs["body"]
+    assert body["labelListVisibility"] == "labelShow"
+    assert body["messageListVisibility"] == "show"
+    assert body["name"] == "Receipts/2026"
+    assert "color" not in body
+    assert out["created"] is True and out["id"] == "Label_9"
+
+
+def test_create_label_409_returns_existing():
+    client = make_client()
+    api = _labels_api(client)
+    api.list.return_value.execute.side_effect = [
+        {"labels": [dict(l) for l in _LABELS]},
+        {"labels": [dict(l) for l in _LABELS] + [{"id": "Label_7", "name": "Travel", "type": "user"}]},
+    ]
+    api.create.return_value.execute.side_effect = _http_error(409)
+    out = client.create_label("Travel")
+    assert out["created"] is False and out["id"] == "Label_7"
+
+
+def test_update_label_recolour_keeps_name_and_visibility():
+    client = make_client()
+    set_labels(client)
+    _labels_api(client).get.return_value.execute.return_value = dict(_LABELS[4])
+    _labels_api(client).patch.return_value.execute.return_value = {"id": "Label_1", "name": "News", "type": "user"}
+    client.update_label("News", background_color="#fb4c2f", text_color="#ffffff")
+    body = _labels_api(client).patch.call_args.kwargs["body"]
+    assert body["name"] == "News"
+    assert body["labelListVisibility"] == "labelShow" and body["messageListVisibility"] == "show"
+    assert body["color"] == {"backgroundColor": "#fb4c2f", "textColor": "#ffffff"}
+
+
+def test_update_label_requires_a_change():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError):
+        client.update_label("News")
+
+
+def test_delete_label_404_is_not_an_error():
+    client = make_client()
+    set_labels(client)
+    _labels_api(client).delete.return_value.execute.side_effect = _http_error(404)
+    out = client.delete_label("News")
+    assert out["deleted"] is False and "not found" in out["reason"]
+
+
+def test_delete_label_refuses_system_label():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError):
+        client.delete_label("INBOX")
+    _labels_api(client).delete.assert_not_called()
+
+
+def test_manage_email_add_label_by_name():
+    client = make_client()
+    set_labels(client)
+    client.manage_email("msg1", "add_label", label="News")
+    body = client._service.users.return_value.messages.return_value.modify.call_args.kwargs["body"]
+    assert body == {"addLabelIds": ["Label_1"]}
+
+
+def test_manage_email_refuses_resolved_system_label():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError, match="system label"):
+        client.manage_email("msg1", "add_label", label="starred")
+    client.manage_email("msg1", "add_label", label="IMPORTANT")
+    client.manage_email("msg1", "add_label", label="CATEGORY_PROMOTIONS")
+    calls = client._service.users.return_value.messages.return_value.modify.call_args_list
+    assert [c.kwargs["body"]["addLabelIds"] for c in calls] == [["IMPORTANT"], ["CATEGORY_PROMOTIONS"]]
+
+
+# --- bulk (0.13.0) ---
+
+def _msgs(client):
+    return client._service.users.return_value.messages.return_value
+
+
+def set_list_pages(client, total, page=500):
+    """messages.list returns `total` IDs in pages of `page`, honouring pageToken."""
+    ids = [f"m{i}" for i in range(total)]
+    def fake_list(**kw):
+        start = int(kw.get("pageToken") or 0)
+        chunk = ids[start:start + min(page, kw.get("maxResults", page))]
+        resp = {"messages": [{"id": i} for i in chunk]}
+        if start + len(chunk) < total:
+            resp["nextPageToken"] = str(start + len(chunk))
+        req = MagicMock()
+        req.execute.return_value = resp
+        return req
+    _msgs(client).list.side_effect = fake_list
+
+
+def test_bulk_snapshots_before_changing():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 700)
+    log = []
+    orig = _msgs(client).list.side_effect
+    _msgs(client).list.side_effect = lambda **kw: (log.append("list"), orig(**kw))[1]
+    _msgs(client).batchModify.side_effect = lambda **kw: (log.append("modify"), MagicMock())[1]
+    client.bulk_manage("from:x", "archive", max_messages=5000)
+    assert log.index("modify") > max(i for i, e in enumerate(log) if e == "list")
+
+
+def test_bulk_archive_selector_keeps_query():
+    client = make_client()
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "archive")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) in:inbox"
+
+
+def test_bulk_add_label_selector_excludes_already_labelled():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "add_label", "News")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) -label:news"
+
+
+def test_bulk_remove_label_selector_keeps_only_labelled():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "remove_label", "News")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) label:news"
+
+
+def test_bulk_cap_reports_more_remaining():
+    client = make_client()
+    set_list_pages(client, 600)
+    out = client.bulk_manage("from:x", "archive", max_messages=500)
+    assert out == {"matched": 500, "processed": 500, "more_remaining": True}
+    body = _msgs(client).batchModify.call_args.kwargs["body"]
+    assert len(body["ids"]) == 500 and body["removeLabelIds"] == ["INBOX"]
+
+
+def test_bulk_exact_cap_without_more_is_not_more_remaining():
+    client = make_client()
+    set_list_pages(client, 500)
+    out = client.bulk_manage("from:x", "archive", max_messages=500)
+    assert out["more_remaining"] is False
+
+
+def test_bulk_chunks_at_1000():
+    client = make_client()
+    set_list_pages(client, 1500)
+    out = client.bulk_manage("from:x", "mark_read", max_messages=5000)
+    sizes = [len(c.kwargs["body"]["ids"]) for c in _msgs(client).batchModify.call_args_list]
+    assert sizes == [1000, 500] and out["processed"] == 1500
+
+
+def test_bulk_max_messages_ceiling_is_5000():
+    client = make_client()
+    set_list_pages(client, 6000)
+    out = client.bulk_manage("from:x", "mark_read", max_messages=99999)
+    assert out["matched"] == 5000 and out["more_remaining"] is True
+
+
+def test_bulk_partial_failure_returns_counts():
+    client = make_client()
+    set_list_pages(client, 1500)
+    ok = MagicMock()
+    bad = MagicMock()
+    bad.execute.side_effect = _http_error(429)
+    _msgs(client).batchModify.side_effect = [ok, bad]
+    out = client.bulk_manage("from:x", "archive", max_messages=5000)
+    assert out["processed"] == 1000 and out["matched"] == 1500 and "error" in out
+
+
+def test_bulk_blank_query_refused():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.bulk_manage("  ", "archive")
+    _msgs(client).list.assert_not_called()
+
+
+def test_bulk_refuses_system_label():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError):
+        client.bulk_manage("from:x", "add_label", "TRASH")
+    with pytest.raises(ValueError):
+        client.bulk_manage("from:x", "add_label", "starred")
+    _msgs(client).list.assert_not_called()
+
+
+def test_bulk_unknown_action_refused():
+    client = make_client()
+    with pytest.raises(ValueError, match="Unknown action"):
+        client.bulk_manage("from:x", "delete_forever")
+
+
+def test_bulk_trash_stops_at_first_failure():
+    client = make_client()
+    set_list_pages(client, 3)
+    good, bad = MagicMock(), MagicMock()
+    bad.execute.side_effect = _http_error(429)
+    _msgs(client).trash.side_effect = [good, bad, good]
+    out = client.bulk_manage("from:x", "trash")
+    assert out["processed"] == 1 and "error" in out
+    assert _msgs(client).trash.call_count == 2
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x)"
+    _msgs(client).batchModify.assert_not_called()
+
+
+# --- filters (0.13.0) ---
+
+def _filters(client):
+    return client._service.users.return_value.settings.return_value.filters.return_value
+
+
+def set_filters(client, filters):
+    _filters(client).list.return_value.execute.return_value = {"filter": filters}
+
+
+def test_create_filter_refuses_trash_label():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label="TRASH")
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label="starred")
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_requires_an_action():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.create_filter("from:x")
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_requires_a_query():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.create_filter("  ", skip_inbox=True)
+
+
+def test_create_filter_creates_missing_label_then_filter():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    log = []
+    _labels_api(client).create.side_effect = lambda **kw: (log.append("label"), MagicMock(
+        execute=MagicMock(return_value={"id": "Label_9", "name": "Receipts", "type": "user"})))[1]
+    _filters(client).create.side_effect = lambda **kw: (log.append("filter"), MagicMock(
+        execute=MagicMock(return_value={"id": "F1"})))[1]
+    out = client.create_filter("from:shop", label="Receipts")
+    assert log == ["label", "filter"]
+    body = _filters(client).create.call_args.kwargs["body"]
+    assert body == {"criteria": {"query": "from:shop"}, "action": {"addLabelIds": ["Label_9"]}}
+    assert out == {"filter_id": "F1", "created": True, "label": "Receipts",
+                   "created_label": True, "applied_to_existing": None}
+
+
+def test_create_filter_duplicate_ignores_gmail_defaults():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x", "sizeComparison": "unspecified"},
+                          "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]}}])
+    out = client.create_filter("from:x", label="News", skip_inbox=True)
+    assert out["created"] is False and out["filter_id"] == "F0"
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_duplicate_needs_full_match():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x", "hasAttachment": True},
+                          "action": {"addLabelIds": ["Label_1"]}}])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    out = client.create_filter("from:x", label="News")
+    assert out["created"] is True and out["filter_id"] == "F1"
+
+
+def test_create_filter_apply_runs_once_with_all_changes(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    calls = []
+    monkeypatch.setattr(client, "apply_to_matching",
+                        lambda *a, **kw: (calls.append((a, kw)), {"matched": 3, "processed": 3,
+                                                                   "more_remaining": False})[1])
+    out = client.create_filter("from:x", label="News", star=True, mark_read=True,
+                               skip_inbox=True, apply_to_existing=True)
+    assert len(calls) == 1
+    (query, add_ids, remove_ids, needs, cap), _ = calls[0]
+    assert query == "from:x" and cap == 5000
+    assert sorted(add_ids) == ["Label_1", "STARRED"] and sorted(remove_ids) == ["INBOX", "UNREAD"]
+    assert sorted(needs) == sorted(["-label:news", "-is:starred", "is:unread", "in:inbox"])
+    assert out["applied_to_existing"]["processed"] == 3
+
+
+def test_create_filter_apply_error_is_reported_not_raised(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    monkeypatch.setattr(client, "apply_to_matching", lambda *a, **kw: {
+        "matched": 5, "processed": 0, "more_remaining": False, "error": "rate limit"})
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["created"] is True and out["applied_to_existing"]["error"] == "rate limit"
+
+
+def test_create_filter_duplicate_still_applies_to_existing(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x"}, "action": {"removeLabelIds": ["INBOX"]}}])
+    called = []
+    monkeypatch.setattr(client, "apply_to_matching", lambda *a, **kw: (called.append(1), {
+        "matched": 0, "processed": 0, "more_remaining": False})[1])
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["created"] is False and called == [1]
+
+
+_STORED = {"id": "F5", "criteria": {"from": "news@x.com"},
+           "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]}}
+
+
+def test_list_filters_resolves_label_names_and_keeps_all_criteria():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F6", "criteria": {"from": "a@b", "size": 10, "sizeComparison": "larger",
+                                                    "hasAttachment": True},
+                          "action": {"addLabelIds": ["Label_1", "Label_404"]}}])
+    [f] = client.list_filters()
+    assert f["criteria"] == {"from": "a@b", "size": 10, "sizeComparison": "larger", "hasAttachment": True}
+    assert f["action"]["addLabelIds"] == ["News", "Label_404"]
+    assert f["description"] == "from=a@b; hasAttachment=true; size=10; sizeComparison=larger → label News, label Label_404"
+
+
+def test_delete_filter_refuses_mismatched_description():
+    client = make_client()
+    set_labels(client)
+    _filters(client).get.return_value.execute.return_value = dict(_STORED)
+    with pytest.raises(ValueError, match="from=news@x.com"):
+        client.delete_filter("F5", "from=payroll@x.com → label News, skip inbox")
+    _filters(client).delete.assert_not_called()
+
+
+def test_delete_filter_matching_description_deletes():
+    client = make_client()
+    set_labels(client)
+    _filters(client).get.return_value.execute.return_value = dict(_STORED)
+    desc = "from=news@x.com → label News, skip inbox"
+    out = client.delete_filter("F5", desc)
+    assert out == {"deleted": True, "description": desc}
+    _filters(client).delete.assert_called_once_with(userId="me", id="F5")
+
+
+def test_delete_filter_404_returns_not_found():
+    client = make_client()
+    _filters(client).get.return_value.execute.side_effect = _http_error(404)
+    out = client.delete_filter("F404", "anything")
+    assert out == {"deleted": False, "reason": "not found"}
+    _filters(client).delete.assert_not_called()
+
+
+# --- code review r1 (Astra) ---
+
+def test_create_filter_reports_filter_when_existing_mail_search_fails():
+    """The real apply path: the filter exists even when the search after it fails."""
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    _msgs(client).list.return_value.execute.side_effect = _http_error(429)
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["filter_id"] == "F1" and out["created"] is True
+    assert out["applied_to_existing"]["processed"] == 0 and "error" in out["applied_to_existing"]
+    _msgs(client).batchModify.assert_not_called()
+
+
+def test_create_filter_refuses_label_resolving_to_trash():
+    client = make_client()
+    set_labels(client, _LABELS + [{"id": "TRASH", "name": "TRASH", "type": "system"}])
+    set_filters(client, [])
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label=" TRASH ")
+    _filters(client).create.assert_not_called()
+    _labels_api(client).create.assert_not_called()
+
+
+def test_delete_label_already_gone_returns_not_deleted():
+    client = make_client()
+    set_labels(client)
+    out = client.delete_label("Vanished")
+    assert out["deleted"] is False and "not found" in out["reason"]
+    _labels_api(client).delete.assert_not_called()
