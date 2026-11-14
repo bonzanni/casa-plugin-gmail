@@ -1048,3 +1048,158 @@ def test_bulk_trash_stops_at_first_failure():
     assert _msgs(client).trash.call_count == 2
     assert _msgs(client).list.call_args.kwargs["q"] == "(from:x)"
     _msgs(client).batchModify.assert_not_called()
+
+
+# --- filters (0.13.0) ---
+
+def _filters(client):
+    return client._service.users.return_value.settings.return_value.filters.return_value
+
+
+def set_filters(client, filters):
+    _filters(client).list.return_value.execute.return_value = {"filter": filters}
+
+
+def test_create_filter_refuses_trash_label():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label="TRASH")
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label="starred")
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_requires_an_action():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.create_filter("from:x")
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_requires_a_query():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.create_filter("  ", skip_inbox=True)
+
+
+def test_create_filter_creates_missing_label_then_filter():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    log = []
+    _labels_api(client).create.side_effect = lambda **kw: (log.append("label"), MagicMock(
+        execute=MagicMock(return_value={"id": "Label_9", "name": "Receipts", "type": "user"})))[1]
+    _filters(client).create.side_effect = lambda **kw: (log.append("filter"), MagicMock(
+        execute=MagicMock(return_value={"id": "F1"})))[1]
+    out = client.create_filter("from:shop", label="Receipts")
+    assert log == ["label", "filter"]
+    body = _filters(client).create.call_args.kwargs["body"]
+    assert body == {"criteria": {"query": "from:shop"}, "action": {"addLabelIds": ["Label_9"]}}
+    assert out == {"filter_id": "F1", "created": True, "label": "Receipts",
+                   "created_label": True, "applied_to_existing": None}
+
+
+def test_create_filter_duplicate_ignores_gmail_defaults():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x", "sizeComparison": "unspecified"},
+                          "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]}}])
+    out = client.create_filter("from:x", label="News", skip_inbox=True)
+    assert out["created"] is False and out["filter_id"] == "F0"
+    _filters(client).create.assert_not_called()
+
+
+def test_create_filter_duplicate_needs_full_match():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x", "hasAttachment": True},
+                          "action": {"addLabelIds": ["Label_1"]}}])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    out = client.create_filter("from:x", label="News")
+    assert out["created"] is True and out["filter_id"] == "F1"
+
+
+def test_create_filter_apply_runs_once_with_all_changes(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    calls = []
+    monkeypatch.setattr(client, "apply_to_matching",
+                        lambda *a, **kw: (calls.append((a, kw)), {"matched": 3, "processed": 3,
+                                                                   "more_remaining": False})[1])
+    out = client.create_filter("from:x", label="News", star=True, mark_read=True,
+                               skip_inbox=True, apply_to_existing=True)
+    assert len(calls) == 1
+    (query, add_ids, remove_ids, needs, cap), _ = calls[0]
+    assert query == "from:x" and cap == 5000
+    assert sorted(add_ids) == ["Label_1", "STARRED"] and sorted(remove_ids) == ["INBOX", "UNREAD"]
+    assert sorted(needs) == sorted(["-label:news", "-is:starred", "is:unread", "in:inbox"])
+    assert out["applied_to_existing"]["processed"] == 3
+
+
+def test_create_filter_apply_error_is_reported_not_raised(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    monkeypatch.setattr(client, "apply_to_matching", lambda *a, **kw: {
+        "matched": 5, "processed": 0, "more_remaining": False, "error": "rate limit"})
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["created"] is True and out["applied_to_existing"]["error"] == "rate limit"
+
+
+def test_create_filter_duplicate_still_applies_to_existing(monkeypatch):
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F0", "criteria": {"query": "from:x"}, "action": {"removeLabelIds": ["INBOX"]}}])
+    called = []
+    monkeypatch.setattr(client, "apply_to_matching", lambda *a, **kw: (called.append(1), {
+        "matched": 0, "processed": 0, "more_remaining": False})[1])
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["created"] is False and called == [1]
+
+
+_STORED = {"id": "F5", "criteria": {"from": "news@x.com"},
+           "action": {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]}}
+
+
+def test_list_filters_resolves_label_names_and_keeps_all_criteria():
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [{"id": "F6", "criteria": {"from": "a@b", "size": 10, "sizeComparison": "larger",
+                                                    "hasAttachment": True},
+                          "action": {"addLabelIds": ["Label_1", "Label_404"]}}])
+    [f] = client.list_filters()
+    assert f["criteria"] == {"from": "a@b", "size": 10, "sizeComparison": "larger", "hasAttachment": True}
+    assert f["action"]["addLabelIds"] == ["News", "Label_404"]
+    assert f["description"] == "from=a@b; hasAttachment=true; size=10; sizeComparison=larger → label News, label Label_404"
+
+
+def test_delete_filter_refuses_mismatched_description():
+    client = make_client()
+    set_labels(client)
+    _filters(client).get.return_value.execute.return_value = dict(_STORED)
+    with pytest.raises(ValueError, match="from=news@x.com"):
+        client.delete_filter("F5", "from=payroll@x.com → label News, skip inbox")
+    _filters(client).delete.assert_not_called()
+
+
+def test_delete_filter_matching_description_deletes():
+    client = make_client()
+    set_labels(client)
+    _filters(client).get.return_value.execute.return_value = dict(_STORED)
+    desc = "from=news@x.com → label News, skip inbox"
+    out = client.delete_filter("F5", desc)
+    assert out == {"deleted": True, "description": desc}
+    _filters(client).delete.assert_called_once_with(userId="me", id="F5")
+
+
+def test_delete_filter_404_returns_not_found():
+    client = make_client()
+    _filters(client).get.return_value.execute.side_effect = _http_error(404)
+    out = client.delete_filter("F404", "anything")
+    assert out == {"deleted": False, "reason": "not found"}
+    _filters(client).delete.assert_not_called()

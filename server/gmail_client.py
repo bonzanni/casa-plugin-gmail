@@ -538,6 +538,100 @@ class GmailClient:
                   "mark_unread": (["UNREAD"], [])}[action]
         return self.apply_to_matching(query, *change, [hygiene.NEEDS[action]], cap)
 
+    # ── Filters ────────────────────────────────────────────────────────────
+
+    def _raw_filters(self) -> list[dict]:
+        try:
+            return self._service.users().settings().filters().list(userId="me").execute().get("filter", [])
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def list_filters(self) -> list[dict]:
+        names = {l["id"]: l["name"] for l in self._raw_labels()}
+        out = []
+        for f in self._raw_filters():
+            criteria, action = f.get("criteria", {}), dict(f.get("action", {}))
+            shown = dict(action)
+            for key in ("addLabelIds", "removeLabelIds"):
+                if key in shown:
+                    shown[key] = [names.get(i, i) for i in shown[key]]
+            out.append({"id": f["id"], "description": hygiene.filter_description(criteria, action, names),
+                        "criteria": criteria, "action": shown})
+        return out
+
+    def create_filter(self, query: str, label: str = "", skip_inbox: bool = False,
+                      mark_read: bool = False, star: bool = False,
+                      apply_to_existing: bool = False) -> dict:
+        if not query or not query.strip():
+            raise ValueError("A search query is required for the filter.")
+        if not (label or skip_inbox or mark_read or star):
+            raise ValueError("Give the filter at least one action: label, skip_inbox, mark_read or star.")
+        add_ids, remove_ids, needs = [], [], []
+        label_name, created_label = None, False
+        if label:
+            _refuse_system_label(label)
+            labels = self._raw_labels()
+            try:
+                target = self.resolve_label(label, labels)
+            except ValueError:
+                made = self.create_label(label)
+                target, created_label = made, made["created"]
+            _refuse_system_label(target["id"])
+            add_ids.append(target["id"])
+            needs.append(f"-{_label_term(target)}")
+            label_name = target["name"]
+        if star:
+            add_ids.append("STARRED")
+            needs.append(hygiene.NEEDS["star"])
+        if mark_read:
+            remove_ids.append("UNREAD")
+            needs.append(hygiene.NEEDS["mark_read"])
+        if skip_inbox:
+            remove_ids.append("INBOX")
+            needs.append(hygiene.NEEDS["skip_inbox"])
+        criteria = {"query": query.strip()}
+        action = {k: v for k, v in (("addLabelIds", add_ids), ("removeLabelIds", remove_ids)) if v}
+
+        want = (hygiene.normalize_criteria(criteria), hygiene.normalize_action(action))
+        existing = next((f for f in self._raw_filters()
+                         if (hygiene.normalize_criteria(f.get("criteria", {})),
+                             hygiene.normalize_action(f.get("action", {}))) == want), None)
+        if existing:
+            filter_id, created = existing["id"], False
+        else:
+            try:
+                made = self._service.users().settings().filters().create(
+                    userId="me", body={"criteria": criteria, "action": action}).execute()
+            except HttpError as exc:
+                raise _translate_error(exc)
+            filter_id, created = made["id"], True
+        applied = None
+        if apply_to_existing:
+            applied = self.apply_to_matching(criteria["query"], add_ids, remove_ids, needs, BULK_CEILING)
+        return {"filter_id": filter_id, "created": created, "label": label_name,
+                "created_label": created_label, "applied_to_existing": applied}
+
+    def delete_filter(self, filter_id: str, description: str) -> dict:
+        api = self._service.users().settings().filters()
+        try:
+            stored = api.get(userId="me", id=filter_id).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found"}
+            raise _translate_error(exc)
+        names = {l["id"]: l["name"] for l in self._raw_labels()}
+        actual = hygiene.filter_description(stored.get("criteria", {}), stored.get("action", {}), names)
+        if actual != description:
+            raise ValueError(f"Filter {filter_id} is '{actual}', not '{description}'. Nothing was "
+                             "deleted; call list_filters and pass that filter's description.")
+        try:
+            api.delete(userId="me", id=filter_id).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found"}
+            raise _translate_error(exc)
+        return {"deleted": True, "description": actual}
+
     # ── SendAs ─────────────────────────────────────────────────────────────
 
     def list_send_as(self) -> list[dict]:
