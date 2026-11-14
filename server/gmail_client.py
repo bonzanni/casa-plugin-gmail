@@ -1,4 +1,5 @@
 import base64
+import difflib
 import os
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -161,6 +162,35 @@ def _translate_error(e: HttpError) -> ValueError:
     return ValueError(f"Gmail API error {e.resp.status}: {reason}")
 
 
+def _refuse_system_label(label: str) -> None:
+    upper = label.upper()
+    if upper in SYSTEM_LABELS:
+        raise ValueError(SYSTEM_LABEL_ERRORS.get(upper, f"Label {upper} is a system label."))
+
+
+def _label_view(raw: dict) -> dict:
+    view = {"id": raw["id"], "name": raw["name"], "type": str(raw.get("type", "user")).lower()}
+    if raw.get("color"):
+        view["color"] = raw["color"]
+    return view
+
+
+def _label_error(e: HttpError, label: str) -> ValueError:
+    if e.resp.status == 404:
+        return ValueError(f"Label '{label}' not found.")
+    if e.resp.status == 400:
+        return ValueError(f"Gmail rejected the label change for '{label}' (colours must come from "
+                          f"Gmail's fixed label palette; names must be unique): {_reason(e)}")
+    return _translate_error(e)
+
+
+def _reason(e: HttpError) -> str:
+    try:
+        return e._get_reason()
+    except Exception:
+        return str(e)
+
+
 class GmailClient:
     def __init__(self, credentials):
         self._service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
@@ -295,9 +325,9 @@ class GmailClient:
         if action in ("add_label", "remove_label"):
             if not label:
                 raise ValueError(f"label is required for action '{action}'.")
-            upper = label.upper()
-            if upper in SYSTEM_LABELS:
-                raise ValueError(SYSTEM_LABEL_ERRORS.get(upper, f"Label {upper} is a system label."))
+            _refuse_system_label(label)
+            label = self.resolve_label(label)["id"]
+            _refuse_system_label(label)
         try:
             svc = self._service.users().messages()
             if action == "archive":
@@ -317,6 +347,97 @@ class GmailClient:
                 raise ValueError(f"Message {message_id} not found or no longer accessible.")
             raise _translate_error(exc)
         return {"success": True}
+
+    # ── Labels ─────────────────────────────────────────────────────────────
+
+    def _raw_labels(self) -> list[dict]:
+        try:
+            return self._service.users().labels().list(userId="me").execute().get("labels", [])
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def list_labels(self) -> list[dict]:
+        return [_label_view(l) for l in self._raw_labels()]
+
+    def resolve_label(self, label: str, labels: list[dict] | None = None) -> dict:
+        """A label by ID, else by exact name, else by name ignoring case."""
+        if not label or not label.strip():
+            raise ValueError("A label name or ID is required.")
+        labels = self._raw_labels() if labels is None else labels
+        for test in (lambda l: l["id"] == label,
+                     lambda l: l["name"] == label,
+                     lambda l: l["name"].casefold() == label.casefold()):
+            hits = [l for l in labels if test(l)]
+            if len(hits) == 1:
+                return _label_view(hits[0])
+            if len(hits) > 1:
+                raise ValueError(f"Label '{label}' is ambiguous: "
+                                 + ", ".join(h["name"] for h in hits) + ". Use the label ID.")
+        close = difflib.get_close_matches(label, [l["name"] for l in labels], n=5, cutoff=0.5)
+        hint = f" Close: {', '.join(close)}." if close else " Call list_labels to see them."
+        raise ValueError(f"No label named '{label}'.{hint}")
+
+    def create_label(self, name: str, background_color: str = "", text_color: str = "") -> dict:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("A label name is required.")
+        existing = self._find_by_name(name, self._raw_labels())
+        if existing:
+            return {**_label_view(existing), "created": False}
+        body = {"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
+        if background_color and text_color:
+            body["color"] = {"backgroundColor": background_color, "textColor": text_color}
+        try:
+            made = self._service.users().labels().create(userId="me", body=body).execute()
+        except HttpError as exc:
+            if exc.resp.status == 409:  # created meanwhile by another call
+                existing = self._find_by_name(name, self._raw_labels())
+                if existing:
+                    return {**_label_view(existing), "created": False}
+            raise _label_error(exc, name)
+        return {**_label_view(made), "created": True}
+
+    @staticmethod
+    def _find_by_name(name: str, labels: list[dict]) -> dict | None:
+        hits = [l for l in labels if l["name"].casefold() == name.casefold()]
+        return hits[0] if hits else None
+
+    def update_label(self, label: str, new_name: str = "", background_color: str = "",
+                     text_color: str = "") -> dict:
+        if not new_name and not (background_color and text_color):
+            raise ValueError("Nothing to change: give new_name, or both background_color and text_color.")
+        target = self._user_label(label)
+        try:
+            current = self._service.users().labels().get(userId="me", id=target["id"]).execute()
+        except HttpError as exc:
+            raise _label_error(exc, label)
+        body = {"name": new_name.strip() if new_name else current["name"],
+                "labelListVisibility": current.get("labelListVisibility", "labelShow"),
+                "messageListVisibility": current.get("messageListVisibility", "show")}
+        if background_color and text_color:
+            body["color"] = {"backgroundColor": background_color, "textColor": text_color}
+        try:
+            updated = self._service.users().labels().patch(userId="me", id=target["id"], body=body).execute()
+        except HttpError as exc:
+            raise _label_error(exc, label)
+        return _label_view(updated)
+
+    def delete_label(self, label: str) -> dict:
+        target = self._user_label(label)
+        try:
+            self._service.users().labels().delete(userId="me", id=target["id"]).execute()
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                return {"deleted": False, "reason": "not found (already deleted?)"}
+            raise _label_error(exc, label)
+        return {"deleted": True, "name": target["name"]}
+
+    def _user_label(self, label: str) -> dict:
+        _refuse_system_label(label)
+        target = self.resolve_label(label)
+        if target["type"] == "system":
+            raise ValueError(f"Label {target['name']} is a system label and cannot be changed by this plugin.")
+        return target
 
     # ── SendAs ─────────────────────────────────────────────────────────────
 
