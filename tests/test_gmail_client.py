@@ -914,3 +914,137 @@ def test_manage_email_refuses_resolved_system_label():
     client.manage_email("msg1", "add_label", label="CATEGORY_PROMOTIONS")
     calls = client._service.users.return_value.messages.return_value.modify.call_args_list
     assert [c.kwargs["body"]["addLabelIds"] for c in calls] == [["IMPORTANT"], ["CATEGORY_PROMOTIONS"]]
+
+
+# --- bulk (0.13.0) ---
+
+def _msgs(client):
+    return client._service.users.return_value.messages.return_value
+
+
+def set_list_pages(client, total, page=500):
+    """messages.list returns `total` IDs in pages of `page`, honouring pageToken."""
+    ids = [f"m{i}" for i in range(total)]
+    def fake_list(**kw):
+        start = int(kw.get("pageToken") or 0)
+        chunk = ids[start:start + min(page, kw.get("maxResults", page))]
+        resp = {"messages": [{"id": i} for i in chunk]}
+        if start + len(chunk) < total:
+            resp["nextPageToken"] = str(start + len(chunk))
+        req = MagicMock()
+        req.execute.return_value = resp
+        return req
+    _msgs(client).list.side_effect = fake_list
+
+
+def test_bulk_snapshots_before_changing():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 700)
+    log = []
+    orig = _msgs(client).list.side_effect
+    _msgs(client).list.side_effect = lambda **kw: (log.append("list"), orig(**kw))[1]
+    _msgs(client).batchModify.side_effect = lambda **kw: (log.append("modify"), MagicMock())[1]
+    client.bulk_manage("from:x", "archive", max_messages=5000)
+    assert log.index("modify") > max(i for i, e in enumerate(log) if e == "list")
+
+
+def test_bulk_archive_selector_keeps_query():
+    client = make_client()
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "archive")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) in:inbox"
+
+
+def test_bulk_add_label_selector_excludes_already_labelled():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "add_label", "News")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) -label:news"
+
+
+def test_bulk_remove_label_selector_keeps_only_labelled():
+    client = make_client()
+    set_labels(client)
+    set_list_pages(client, 0)
+    client.bulk_manage("from:x", "remove_label", "News")
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x) label:news"
+
+
+def test_bulk_cap_reports_more_remaining():
+    client = make_client()
+    set_list_pages(client, 600)
+    out = client.bulk_manage("from:x", "archive", max_messages=500)
+    assert out == {"matched": 500, "processed": 500, "more_remaining": True}
+    body = _msgs(client).batchModify.call_args.kwargs["body"]
+    assert len(body["ids"]) == 500 and body["removeLabelIds"] == ["INBOX"]
+
+
+def test_bulk_exact_cap_without_more_is_not_more_remaining():
+    client = make_client()
+    set_list_pages(client, 500)
+    out = client.bulk_manage("from:x", "archive", max_messages=500)
+    assert out["more_remaining"] is False
+
+
+def test_bulk_chunks_at_1000():
+    client = make_client()
+    set_list_pages(client, 1500)
+    out = client.bulk_manage("from:x", "mark_read", max_messages=5000)
+    sizes = [len(c.kwargs["body"]["ids"]) for c in _msgs(client).batchModify.call_args_list]
+    assert sizes == [1000, 500] and out["processed"] == 1500
+
+
+def test_bulk_max_messages_ceiling_is_5000():
+    client = make_client()
+    set_list_pages(client, 6000)
+    out = client.bulk_manage("from:x", "mark_read", max_messages=99999)
+    assert out["matched"] == 5000 and out["more_remaining"] is True
+
+
+def test_bulk_partial_failure_returns_counts():
+    client = make_client()
+    set_list_pages(client, 1500)
+    ok = MagicMock()
+    bad = MagicMock()
+    bad.execute.side_effect = _http_error(429)
+    _msgs(client).batchModify.side_effect = [ok, bad]
+    out = client.bulk_manage("from:x", "archive", max_messages=5000)
+    assert out["processed"] == 1000 and out["matched"] == 1500 and "error" in out
+
+
+def test_bulk_blank_query_refused():
+    client = make_client()
+    with pytest.raises(ValueError):
+        client.bulk_manage("  ", "archive")
+    _msgs(client).list.assert_not_called()
+
+
+def test_bulk_refuses_system_label():
+    client = make_client()
+    set_labels(client)
+    with pytest.raises(ValueError):
+        client.bulk_manage("from:x", "add_label", "TRASH")
+    with pytest.raises(ValueError):
+        client.bulk_manage("from:x", "add_label", "starred")
+    _msgs(client).list.assert_not_called()
+
+
+def test_bulk_unknown_action_refused():
+    client = make_client()
+    with pytest.raises(ValueError, match="Unknown action"):
+        client.bulk_manage("from:x", "delete_forever")
+
+
+def test_bulk_trash_stops_at_first_failure():
+    client = make_client()
+    set_list_pages(client, 3)
+    good, bad = MagicMock(), MagicMock()
+    bad.execute.side_effect = _http_error(429)
+    _msgs(client).trash.side_effect = [good, bad, good]
+    out = client.bulk_manage("from:x", "trash")
+    assert out["processed"] == 1 and "error" in out
+    assert _msgs(client).trash.call_count == 2
+    assert _msgs(client).list.call_args.kwargs["q"] == "(from:x)"
+    _msgs(client).batchModify.assert_not_called()

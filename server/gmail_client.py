@@ -9,6 +9,8 @@ from typing import Any
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+import hygiene
+
 
 SYSTEM_LABELS = {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "UNREAD", "STARRED"}
 SYSTEM_LABEL_ERRORS = {
@@ -160,6 +162,18 @@ def _translate_error(e: HttpError) -> ValueError:
     except Exception:
         reason = str(e)
     return ValueError(f"Gmail API error {e.resp.status}: {reason}")
+
+
+BULK_CEILING = 5000
+
+
+def _label_term(label: dict) -> str:
+    """The search term selecting mail that carries `label`."""
+    if label["id"] == "IMPORTANT":
+        return "is:important"
+    if label["id"].startswith("CATEGORY_"):
+        return "category:" + label["id"][len("CATEGORY_"):].lower()
+    return "label:" + hygiene.label_search_term(label["name"])
 
 
 def _refuse_system_label(label: str) -> None:
@@ -438,6 +452,91 @@ class GmailClient:
         if target["type"] == "system":
             raise ValueError(f"Label {target['name']} is a system label and cannot be changed by this plugin.")
         return target
+
+    # ── Bulk ───────────────────────────────────────────────────────────────
+
+    def _snapshot(self, selector: str, cap: int) -> tuple[list[str], bool]:
+        """IDs matching `selector`, up to `cap`, all collected before any change."""
+        ids, token = [], None
+        msgs = self._service.users().messages()
+        try:
+            while True:
+                kw = {"userId": "me", "q": selector, "maxResults": 500}
+                if token:
+                    kw["pageToken"] = token
+                resp = msgs.list(**kw).execute()
+                for m in resp.get("messages", []):
+                    if len(ids) == cap:
+                        return ids, True
+                    ids.append(m["id"])
+                token = resp.get("nextPageToken")
+                if not token:
+                    return ids, False
+                if len(ids) == cap:
+                    return ids, True
+        except HttpError as exc:
+            raise _translate_error(exc)
+
+    def apply_to_matching(self, query: str, add_ids: list[str], remove_ids: list[str],
+                          needs: list[str], cap: int) -> dict:
+        """Select every message matching `query` that still needs a change, then
+        apply all the changes at once with batchModify (≤1000 IDs per call)."""
+        ids, more = self._snapshot(hygiene.build_selector(query, needs), cap)
+        body = {}
+        if add_ids:
+            body["addLabelIds"] = list(add_ids)
+        if remove_ids:
+            body["removeLabelIds"] = list(remove_ids)
+        out = {"matched": len(ids), "processed": 0, "more_remaining": more}
+        msgs = self._service.users().messages()
+        for start in range(0, len(ids), 1000):
+            chunk = ids[start:start + 1000]
+            try:
+                msgs.batchModify(userId="me", body={"ids": chunk, **body}).execute()
+            except HttpError as exc:
+                out["error"] = str(_translate_error(exc))
+                return out
+            out["processed"] += len(chunk)
+        return out
+
+    def trash_matching(self, query: str, cap: int) -> dict:
+        """Trash every message matching `query`, one call per message, stopping at
+        the first failure. (A batch HTTP request would send the whole group before
+        reporting any failure, and batchModify is not documented to take TRASH.)"""
+        ids, more = self._snapshot(hygiene.build_selector(query, []), cap)
+        out = {"matched": len(ids), "processed": 0, "more_remaining": more}
+        msgs = self._service.users().messages()
+        for mid in ids:
+            try:
+                msgs.trash(userId="me", id=mid).execute()
+            except HttpError as exc:
+                out["error"] = str(_translate_error(exc))
+                return out
+            out["processed"] += 1
+        return out
+
+    def bulk_manage(self, query: str, action: str, label: str = "", max_messages: int = 500) -> dict:
+        valid = {"archive", "trash", "mark_read", "mark_unread", "add_label", "remove_label"}
+        if action not in valid:
+            raise ValueError(f"Unknown action '{action}'. Valid: {', '.join(sorted(valid))}")
+        if not query or not query.strip():
+            raise ValueError("A search query is required (use in:inbox to mean the whole inbox).")
+        cap = max(1, min(int(max_messages), BULK_CEILING))
+        if action == "trash":
+            return self.trash_matching(query, cap)
+        if action in ("add_label", "remove_label"):
+            if not label:
+                raise ValueError(f"label is required for action '{action}'.")
+            _refuse_system_label(label)
+            target = self.resolve_label(label)
+            _refuse_system_label(target["id"])
+            term = _label_term(target)
+            if action == "add_label":
+                return self.apply_to_matching(query, [target["id"]], [], [f"-{term}"], cap)
+            return self.apply_to_matching(query, [], [target["id"]], [term], cap)
+        change = {"archive": ([], ["INBOX"]), "mark_read": ([], ["UNREAD"]),
+                  "mark_unread": (["UNREAD"], [])}[action]
+        return self.apply_to_matching(query, *change, [hygiene.NEEDS[action]], cap)
 
     # ── SendAs ─────────────────────────────────────────────────────────────
 
