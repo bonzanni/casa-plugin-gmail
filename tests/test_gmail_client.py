@@ -1203,3 +1203,36 @@ def test_delete_filter_404_returns_not_found():
     out = client.delete_filter("F404", "anything")
     assert out == {"deleted": False, "reason": "not found"}
     _filters(client).delete.assert_not_called()
+
+
+# --- code review r1 (Astra) ---
+
+def test_create_filter_reports_filter_when_existing_mail_search_fails():
+    """The real apply path: the filter exists even when the search after it fails."""
+    client = make_client()
+    set_labels(client)
+    set_filters(client, [])
+    _filters(client).create.return_value.execute.return_value = {"id": "F1"}
+    _msgs(client).list.return_value.execute.side_effect = _http_error(429)
+    out = client.create_filter("from:x", skip_inbox=True, apply_to_existing=True)
+    assert out["filter_id"] == "F1" and out["created"] is True
+    assert out["applied_to_existing"]["processed"] == 0 and "error" in out["applied_to_existing"]
+    _msgs(client).batchModify.assert_not_called()
+
+
+def test_create_filter_refuses_label_resolving_to_trash():
+    client = make_client()
+    set_labels(client, _LABELS + [{"id": "TRASH", "name": "TRASH", "type": "system"}])
+    set_filters(client, [])
+    with pytest.raises(ValueError):
+        client.create_filter("from:x", label=" TRASH ")
+    _filters(client).create.assert_not_called()
+    _labels_api(client).create.assert_not_called()
+
+
+def test_delete_label_already_gone_returns_not_deleted():
+    client = make_client()
+    set_labels(client)
+    out = client.delete_label("Vanished")
+    assert out["deleted"] is False and "not found" in out["reason"]
+    _labels_api(client).delete.assert_not_called()

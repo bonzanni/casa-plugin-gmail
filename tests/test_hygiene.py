@@ -74,3 +74,10 @@ def test_description_orders_criteria_fixed():
     d = filter_description({"subject": "s", "from": "f", "size": 5, "sizeComparison": "larger"},
                            {"removeLabelIds": ["INBOX"]}, {})
     assert d == "from=f; subject=s; size=5; sizeComparison=larger → skip inbox"
+
+
+def test_normalize_keeps_an_explicit_zero_size_comparison():
+    assert normalize_criteria({"query": "x", "size": 0, "sizeComparison": "smaller"}) \
+        != normalize_criteria({"query": "x"})
+    d = filter_description({"query": "x", "size": 0, "sizeComparison": "smaller"}, {"removeLabelIds": ["INBOX"]}, {})
+    assert "size=0" in d and "sizeComparison=smaller" in d

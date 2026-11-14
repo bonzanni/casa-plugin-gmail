@@ -167,6 +167,10 @@ def _translate_error(e: HttpError) -> ValueError:
 BULK_CEILING = 5000
 
 
+class LabelNotFound(ValueError):
+    """No label matches the given name or ID (as opposed to an ambiguous one)."""
+
+
 def _label_term(label: dict) -> str:
     """The search term selecting mail that carries `label`."""
     if label["id"] == "IMPORTANT":
@@ -389,7 +393,7 @@ class GmailClient:
                                  + ", ".join(h["name"] for h in hits) + ". Use the label ID.")
         close = difflib.get_close_matches(label, [l["name"] for l in labels], n=5, cutoff=0.5)
         hint = f" Close: {', '.join(close)}." if close else " Call list_labels to see them."
-        raise ValueError(f"No label named '{label}'.{hint}")
+        raise LabelNotFound(f"No label named '{label}'.{hint}")
 
     def create_label(self, name: str, background_color: str = "", text_color: str = "") -> dict:
         name = (name or "").strip()
@@ -437,7 +441,10 @@ class GmailClient:
         return _label_view(updated)
 
     def delete_label(self, label: str) -> dict:
-        target = self._user_label(label)
+        try:
+            target = self._user_label(label)
+        except LabelNotFound:
+            return {"deleted": False, "reason": "not found (already deleted?)"}
         try:
             self._service.users().labels().delete(userId="me", id=target["id"]).execute()
         except HttpError as exc:
@@ -481,7 +488,10 @@ class GmailClient:
                           needs: list[str], cap: int) -> dict:
         """Select every message matching `query` that still needs a change, then
         apply all the changes at once with batchModify (≤1000 IDs per call)."""
-        ids, more = self._snapshot(hygiene.build_selector(query, needs), cap)
+        try:
+            ids, more = self._snapshot(hygiene.build_selector(query, needs), cap)
+        except ValueError as exc:  # nothing has changed yet
+            return {"matched": 0, "processed": 0, "more_remaining": False, "error": str(exc)}
         body = {}
         if add_ids:
             body["addLabelIds"] = list(add_ids)
@@ -573,7 +583,7 @@ class GmailClient:
             labels = self._raw_labels()
             try:
                 target = self.resolve_label(label, labels)
-            except ValueError:
+            except LabelNotFound:
                 made = self.create_label(label)
                 target, created_label = made, made["created"]
             _refuse_system_label(target["id"])

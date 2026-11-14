@@ -49,11 +49,12 @@ def build_selector(query: str, needs: list[str]) -> str:
 
 def normalize_criteria(criteria: dict) -> dict:
     """Criteria with Gmail's defaults removed, so equal behaviour compares equal."""
-    out = {k: v for k, v in (criteria or {}).items() if v not in (None, False, "", [], 0)}
+    out = {k: v for k, v in (criteria or {}).items() if v is not None and v is not False and v not in ("", [])}
     if out.get("sizeComparison") == "unspecified":
         out.pop("sizeComparison")
-    if "size" not in out:
-        out.pop("sizeComparison", None)
+    # A size only restricts anything together with a comparison; 0 alone is Gmail's default.
+    if "sizeComparison" not in out and out.get("size") == 0:
+        out.pop("size")
     return out
 
 
