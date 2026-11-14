@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -24,10 +24,18 @@
       "mcp__plugin_gmail_gmail__send_email",
       "mcp__plugin_gmail_gmail__reply_to_thread",
       "mcp__plugin_gmail_gmail__erase_gmail",
-      "mcp__plugin_gmail_gmail__erase_gmail_data"
+      "mcp__plugin_gmail_gmail__erase_gmail_data",
+      "mcp__plugin_gmail_gmail__bulk_manage",
+      "mcp__plugin_gmail_gmail__list_labels",
+      "mcp__plugin_gmail_gmail__create_label",
+      "mcp__plugin_gmail_gmail__update_label",
+      "mcp__plugin_gmail_gmail__delete_label",
+      "mcp__plugin_gmail_gmail__list_filters",
+      "mcp__plugin_gmail_gmail__create_filter",
+      "mcp__plugin_gmail_gmail__delete_filter"
     ],
     "profiles": {
-      "read": ["search_emails", "get_email", "get_thread", "list_attachments", "download_attachment", "list_send_as"]
+      "read": ["search_emails", "get_email", "get_thread", "list_attachments", "download_attachment", "list_send_as", "list_labels", "list_filters"]
     },
     "eraseTool": "erase_gmail",
     "eraseDataOnlyTool": "erase_gmail_data",
@@ -35,7 +43,10 @@
       {"name": "send_email", "summary": "Send email to {to}: {subject}"},
       {"name": "reply_to_thread", "summary": "Reply to: {display_subject}"},
       {"name": "erase_gmail", "summary": "Revokes Gmail's access at Google and deletes the stored sign-in, the sent log and saved attachments. Reconnecting needs a new sign-in."},
-      {"name": "erase_gmail_data", "summary": "Deletes the sent log and saved attachments; keeps the Gmail sign-in, so a reinstall stays connected."}
+      {"name": "erase_gmail_data", "summary": "Deletes the sent log and saved attachments; keeps the Gmail sign-in, so a reinstall stays connected."},
+      {"name": "create_filter", "summary": "Create a Gmail filter for new mail matching: {query}"},
+      {"name": "delete_filter", "summary": "Delete the Gmail filter: {description}"},
+      {"name": "delete_label", "summary": "Delete the Gmail label \"{label}\" (mail stays, the label comes off every message)"}
     ],
     "resultContract": {
       "version": 1,
@@ -54,7 +65,15 @@
         "send_email": {"result": "safe"},
         "reply_to_thread": {"result": "safe"},
         "erase_gmail": {"result": "safe"},
-        "erase_gmail_data": {"result": "safe"}
+        "erase_gmail_data": {"result": "safe"},
+        "bulk_manage": {"result": "safe"},
+        "list_labels": {"result": "safe"},
+        "create_label": {"result": "safe"},
+        "update_label": {"result": "safe"},
+        "delete_label": {"result": "safe"},
+        "list_filters": {"result": "safe"},
+        "create_filter": {"result": "safe"},
+        "delete_filter": {"result": "safe"}
       }
     }
   }

@@ -290,7 +290,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.12.1"
+    assert manifest["version"] == "0.13.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -330,7 +330,7 @@ def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
 # the deny list Casa builds from (provides_tools - profile), so it lists all.
 
 _READ_TOOLS = ["search_emails", "get_email", "get_thread", "list_attachments",
-               "download_attachment", "list_send_as"]
+               "download_attachment", "list_send_as", "list_labels", "list_filters"]
 
 
 def _qualified(tool):
@@ -347,7 +347,7 @@ def test_manifest_provides_every_served_tool_fully_qualified():
     for tool in _registered_tool_names():
         expected |= _qualified(tool)
     assert set(declared) == expected
-    assert len(declared) == 14
+    assert len(declared) == 22
 
 
 def test_manifest_read_profile_is_exactly_the_tools_that_only_read():
@@ -358,7 +358,9 @@ def test_manifest_read_profile_is_exactly_the_tools_that_only_read():
     # Everything else sends, changes, saves or erases mail, or signs in.
     assert served - set(_READ_TOOLS) == {
         "send_email", "reply_to_thread", "manage_email", "save_attachment",
-        "erase_gmail", "erase_gmail_data", "setup_gmail", "gmail_auth_collect"}
+        "erase_gmail", "erase_gmail_data", "setup_gmail", "gmail_auth_collect",
+        "create_label", "update_label", "delete_label", "bulk_manage", "create_filter",
+        "delete_filter"}
 
 
 def test_manifest_profiles_pass_casas_shape_rules():
@@ -529,7 +531,8 @@ def test_the_setup_tool_is_not_protected():
     operator's Erase tap at uninstall can run them (Casa >= 0.329.0)."""
     names = [t["name"] for t in _manifest()["casa"]["protectedTools"]]
     assert "setup_gmail" not in names
-    assert names == ["send_email", "reply_to_thread", "erase_gmail", "erase_gmail_data"]
+    assert names == ["send_email", "reply_to_thread", "erase_gmail", "erase_gmail_data",
+                     "create_filter", "delete_filter", "delete_label"]
 
 
 def test_the_setup_tool_exists_and_is_argument_free():
@@ -1322,3 +1325,27 @@ def test_every_str_parameter_of_every_tool_keeps_json_shaped_values():
                 assert getattr(parsed, field) == value, (tool.name, field, value)
                 checked += 1
     assert checked >= 15 * len(_JSON_SHAPED)
+
+
+# ── v0.13.0: protected summaries may only name required arguments ──────────
+# Casa renders the summary only when every placeholder is present in the call's
+# arguments (authz_grants._interpolate_summary); an optional one left out sends
+# the operator the raw-arguments card instead.
+
+def test_protected_summaries_use_only_required_args():
+    import server
+    for entry in _manifest()["casa"]["protectedTools"]:
+        summary = entry.get("summary", "")
+        params = inspect.signature(getattr(server, entry["name"])).parameters
+        for name in re.findall(r"\{(\w+)\}", summary):
+            assert name in params, (entry["name"], name)
+            assert params[name].default is inspect.Parameter.empty, (entry["name"], name)
+        assert len(summary) <= 200
+
+
+def test_new_protected_summaries_are_the_designed_sentences():
+    summaries = {e["name"]: e.get("summary") for e in _manifest()["casa"]["protectedTools"]}
+    assert summaries["create_filter"] == "Create a Gmail filter for new mail matching: {query}"
+    assert summaries["delete_filter"] == "Delete the Gmail filter: {description}"
+    assert summaries["delete_label"] == ('Delete the Gmail label "{label}" (mail stays, '
+                                         'the label comes off every message)')
