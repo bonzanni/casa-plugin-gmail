@@ -66,3 +66,31 @@ def test_persistence_across_instances(tmp_path):
     from sent_log import SentLog
     log2 = SentLog(str(tmp_path / "sent_log.json"))
     assert log2.check("req-1", "a@b.com", "Hello") == "msg-abc"
+
+
+
+# --- cc and bcc are part of the key (post-cap fix) ---
+
+def test_cc_and_bcc_are_compared_as_address_sets(tmp_path):
+    log = make_log(tmp_path)
+    log.record("r", "m", "a@b.com", "S", cc="Bob <b@x.com>, c@Y.org", bcc="h@x.com")
+    assert log.check("r", "a@b.com", "S", cc="c@y.org, b@x.com", bcc="H <h@X.com>") == "m"
+    assert log.check("r", "a@b.com", "S", cc="b@x.com", bcc="h@x.com") is None
+    assert log.check("r", "a@b.com", "S", cc="b@x.com, c@y.org") is None
+    assert log.check("r", "a@b.com", "S", cc="B@x.com, c@y.org", bcc="h@x.com") is None  # local part keeps case
+
+
+def test_record_stores_the_address_sets(tmp_path):
+    log = make_log(tmp_path)
+    log.record("r", "m", "a@b.com", "S", cc="Z <z@X.com>, a@x.com")
+    entry = json.loads((tmp_path / "sent_log.json").read_text())["r"]
+    assert entry["cc"] == ["a@x.com", "z@x.com"] and entry["bcc"] == []
+
+
+def test_a_legacy_entry_matches_only_empty_cc_and_bcc(tmp_path):
+    (tmp_path / "sent_log.json").write_text(json.dumps({"r": {
+        "message_id": "m", "timestamp": "2026-11-15T10:00:00+00:00", "to": "a@b.com", "subject": "S"}}))
+    log = make_log(tmp_path)
+    assert log.check("r", "a@b.com", "S") == "m"
+    assert log.check("r", "a@b.com", "S", cc="c@x.com") is None
+    assert log.check("r", "a@b.com", "S", bcc="c@x.com") is None

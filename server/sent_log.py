@@ -8,6 +8,19 @@ RETENTION_DAYS = 90
 CLEANUP_INTERVAL_SECONDS = 24 * 3600
 
 
+def _address_set(name: str, value: str) -> list[str]:
+    """The addresses of an address list as a sorted, de-duplicated key: display
+    names dropped, domains lower-cased (local parts can be case-sensitive)."""
+    if not value:
+        return []
+    from gmail_client import _parse_address_list
+    out = set()
+    for _, addr in _parse_address_list(name, value):
+        local, _, domain = addr.rpartition("@")
+        out.add(f"{local}@{domain.lower()}")
+    return sorted(out)
+
+
 class SentLog:
     def __init__(self, path: str):
         self._path = path
@@ -34,29 +47,38 @@ class SentLog:
         with open(self._path, "w") as f:
             json.dump(self._data, f, indent=2)
 
-    def check(self, request_id: str, to: str, subject: str) -> str | None:
-        """Return message_id if this exact (request_id, to, subject) was already sent, else None."""
+    def check(self, request_id: str, to: str, subject: str, cc: str = "", bcc: str = "") -> str | None:
+        """Return message_id if this exact (request_id, to, subject, cc and bcc
+        address sets) was already sent, else None. A changed cc or bcc is a new
+        send; an entry from before cc/bcc were recorded matches only none."""
+        key = (_address_set("cc", cc), _address_set("bcc", bcc))
         with self._lock:
             self._data = self._load()
             entry = self._data.get(request_id)
-            if entry and entry.get("to") == to and entry.get("subject") == subject:
+            if (entry and entry.get("to") == to and entry.get("subject") == subject
+                    and (entry.get("cc", []), entry.get("bcc", [])) == key):
                 return entry["message_id"]
             return None
 
-    def record(self, request_id: str, message_id: str, to: str, subject: str):
+    def record(self, request_id: str, message_id: str, to: str, subject: str,
+               cc: str = "", bcc: str = ""):
+        cc_set, bcc_set = _address_set("cc", cc), _address_set("bcc", bcc)
         with self._lock:
             # The file is the record, not this process's copy: another server
             # process, or an erase, may have changed it since this one read it,
             # and writing a stale copy back would restore what was erased.
             self._data = self._load()
             existing = self._data.get(request_id)
-            if existing and (existing.get("to") != to or existing.get("subject") != subject):
+            if existing and (existing.get("to") != to or existing.get("subject") != subject
+                             or existing.get("cc", []) != cc_set or existing.get("bcc", []) != bcc_set):
                 print(f"WARNING: request_id '{request_id}' collision — proceeding with new send.", flush=True)
             self._data[request_id] = {
                 "message_id": message_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "to": to,
                 "subject": subject,
+                "cc": cc_set,
+                "bcc": bcc_set,
             }
             self._save()
 

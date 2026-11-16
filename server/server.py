@@ -723,13 +723,13 @@ def send_email(
     _require_auth()
     attachments = _read_attachments(attachment_paths or [])
     if request_id:
-        existing = _log.check(request_id, to, subject)
+        existing = _log.check(request_id, to, subject, cc=cc, bcc=bcc)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
     msg_id = _client.send_email(to, subject, body, attachments, from_address=from_address,
                                 cc=cc, bcc=bcc)
     if request_id:
-        _log.record(request_id, msg_id, to, subject)
+        _log.record(request_id, msg_id, to, subject, cc=cc, bcc=bcc)
     return _ok({"message_id": msg_id, "already_sent": False})
 
 
@@ -748,13 +748,13 @@ def reply_to_thread(
     _require_auth()
     attachments = _read_attachments(attachment_paths or [])
     if request_id:
-        existing = _log.check(request_id, thread_id, display_subject)
+        existing = _log.check(request_id, thread_id, display_subject, cc=cc, bcc=bcc)
         if existing:
             return _ok({"message_id": existing, "already_sent": True})
     msg_id = _client.reply_to_thread(thread_id, body, attachments, from_address=from_address,
                                      cc=cc, bcc=bcc)
     if request_id:
-        _log.record(request_id, msg_id, thread_id, display_subject)
+        _log.record(request_id, msg_id, thread_id, display_subject, cc=cc, bcc=bcc)
     return _ok({"message_id": msg_id, "already_sent": False})
 
 
