@@ -1422,3 +1422,49 @@ def test_a_non_ascii_address_is_refused_with_the_field_named(value):
     with pytest.raises(ValueError, match="bcc"):
         client.send_email("to@b.com", "Hello", "Body", bcc=value)
     client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+# --- every recipient must be a complete address (fix round 3) ---
+# The parser turns a phrase into a "bare address" ("Invoice approver" ->
+# "Invoice"), so each parsed address must be a whole local@domain.dot.
+
+_NOT_ADDRESSES = ["Invoice approver", "plain", "a@b", "a b@x.com",
+                  "ok@x.com, Invoice approver", "Bob <a b@x.com>"]
+
+
+@pytest.mark.parametrize("field", ["to", "cc", "bcc", "from_address"])
+@pytest.mark.parametrize("value", _NOT_ADDRESSES)
+def test_a_recipient_that_is_not_a_complete_address_is_refused(field, value):
+    client = make_client()
+    args = {"to": "to@b.com", "cc": "", "bcc": "", "from_address": ""} | {field: value}
+    with pytest.raises(ValueError, match=field):
+        client.send_email(args["to"], "Hello", "Body", cc=args["cc"], bcc=args["bcc"],
+                          from_address=args["from_address"])
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [
+    "a@x.com",
+    "a.b+tag@mail.example.co.uk, Jane Doe <j_d@x-y.com>",
+    '"Doe, Jane" <d@x.com>, e@x.com',
+    "José Núñez <j@x.com>",
+])
+def test_valid_address_lists_are_unchanged(value):
+    from email import message_from_bytes
+    from email.header import decode_header, make_header
+    from email.utils import getaddresses
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email("to@b.com", "Hello", "Body", cc=value)
+    sent = str(make_header(decode_header(message_from_bytes(_sent_raw(client))["Cc"])))
+    assert getaddresses([sent]) == getaddresses([value])
+
+
+def test_reply_fallback_to_an_incomplete_address_is_still_refused():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="Foo Bar [Ext] <someone>")
+    )
+    with pytest.raises(ValueError, match="to"):
+        client.reply_to_thread("thr1", "body")
+    client._service.users.return_value.messages.return_value.send.assert_not_called()

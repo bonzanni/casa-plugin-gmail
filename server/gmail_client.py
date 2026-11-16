@@ -1,6 +1,7 @@
 import base64
 import difflib
 import os
+import re
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -176,6 +177,11 @@ def _refuse_header_breaks(**fields: str) -> None:
                              f"on one line, separated by commas.")
 
 
+_ADDR_SPEC = re.compile(
+    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    r"@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
+
+
 def _address_list(name: str, value: str) -> str:
     """*value* as an address header that encodes only the display names.
 
@@ -189,11 +195,13 @@ def _address_list(name: str, value: str) -> str:
     if not pairs or any(not addr for _, addr in pairs):
         raise ValueError(f"{name} could not be read as a list of addresses: {value!r}. "
                          f"Separate the addresses with commas.")
-    try:
-        return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
-    except UnicodeEncodeError:
-        raise ValueError(f"{name} has an address with non-ASCII characters: {value!r}. "
-                         f"Only plain ASCII addresses can be sent to.") from None
+    # The parser also reads a phrase as a "bare address" ("Invoice approver"
+    # becomes "Invoice"), so each address must be a whole ASCII local@domain.
+    for _, addr in pairs:
+        if not _ADDR_SPEC.fullmatch(addr):
+            raise ValueError(f"{name} has an entry that is not a complete email address: "
+                             f"{addr!r} (in {value!r}).")
+    return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
 
 
 def _reply_recipient(from_header: str) -> str:
