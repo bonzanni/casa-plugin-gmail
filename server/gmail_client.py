@@ -189,7 +189,27 @@ def _address_list(name: str, value: str) -> str:
     if not pairs or any(not addr for _, addr in pairs):
         raise ValueError(f"{name} could not be read as a list of addresses: {value!r}. "
                          f"Separate the addresses with commas.")
-    return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
+    try:
+        return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
+    except UnicodeEncodeError:
+        raise ValueError(f"{name} has an address with non-ASCII characters: {value!r}. "
+                         f"Only plain ASCII addresses can be sent to.") from None
+
+
+def _reply_recipient(from_header: str) -> str:
+    """The original sender, as the reply's To. A display name with an unquoted
+    special ("Foo Bar [Ext] <a@x.com>") is unreadable to the strict parser,
+    and the reply has no `to` the caller could correct, so it falls back to
+    the address inside the last <...>. Without one, the refusal stands."""
+    try:
+        _address_list("to", from_header)
+        return from_header
+    except ValueError:
+        start = from_header.rfind("<")
+        end = from_header.find(">", start + 1)
+        if start == -1 or end == -1 or not from_header[start + 1:end].strip():
+            raise
+        return from_header[start + 1:end].strip()
 
 
 class LabelNotFound(ValueError):
@@ -740,7 +760,7 @@ class GmailClient:
         subject = _get_header(h, "Subject") or ""
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
-        reply_to = _get_header(h, "From")
+        reply_to = _reply_recipient(_get_header(h, "From"))
         msg_id_header = _get_header(h, "Message-ID")
         refs = _get_header(h, "References")
         msg = self._build_message(

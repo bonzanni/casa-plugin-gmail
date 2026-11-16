@@ -1371,3 +1371,54 @@ def test_an_address_list_that_does_not_parse_is_refused_not_dropped(value):
     with pytest.raises(ValueError, match="cc"):
         client.send_email("to@b.com", "Hello", "Body", cc=value)
     client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+# --- a reply to a sender with an unusual display name (fix round 2) ---
+# The strict parser cannot read these real-world From headers (unquoted
+# specials in the display name). The reply has no `to` to correct, so it goes
+# to the bare address; a user-supplied list keeps the strict refusal.
+
+_ODD_FROMS = [
+    ("John @ Acme <a@x.com>", "a@x.com"),
+    ("Foo Bar [Ext] <a@x.com>", "a@x.com"),
+    ("Jane@Company <j@x.com>", "j@x.com"),
+    ("Name; Co <a@x.com>", "a@x.com"),
+]
+
+
+@pytest.mark.parametrize("from_header,addr", _ODD_FROMS)
+def test_reply_to_an_unusual_display_name_goes_to_the_bare_address(from_header, addr):
+    from email import message_from_bytes
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr=from_header)
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    assert client.reply_to_thread("thr1", "body") == "r"
+    assert message_from_bytes(_sent_raw(client))["To"] == addr
+
+
+@pytest.mark.parametrize("from_header,addr", _ODD_FROMS)
+def test_a_user_supplied_cc_with_an_unusual_display_name_is_still_refused(from_header, addr):
+    client = make_client()
+    with pytest.raises(ValueError, match="cc"):
+        client.send_email("to@b.com", "Hello", "Body", cc=from_header)
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+def test_reply_to_an_unreadable_from_without_angle_brackets_is_still_refused():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="a@x.com; b@x.com")
+    )
+    with pytest.raises(ValueError, match="to"):
+        client.reply_to_thread("thr1", "body")
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["josé@x.com", "José <josé@x.com>"])
+def test_a_non_ascii_address_is_refused_with_the_field_named(value):
+    client = make_client()
+    with pytest.raises(ValueError, match="bcc"):
+        client.send_email("to@b.com", "Hello", "Body", bcc=value)
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
