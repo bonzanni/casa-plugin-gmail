@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 GOOGLE_URL = "https://accounts.google.com/o?state=s"
 _REF_RE = re.compile(r"^casa-cap-[0-9a-f]{32}$")
@@ -77,7 +77,7 @@ def test_send_email_passes_from_address_to_client(monkeypatch):
 
     server.send_email(to="to@b.com", subject="Hi", body="body", from_address="alias@workspace.example.com")
     mock_client.send_email.assert_called_once_with(
-        "to@b.com", "Hi", "body", [], from_address="alias@workspace.example.com"
+        "to@b.com", "Hi", "body", [], from_address="alias@workspace.example.com", cc="", bcc=""
     )
 
 
@@ -94,7 +94,7 @@ def test_send_email_passes_empty_from_address_to_client(monkeypatch):
 
     server.send_email(to="to@b.com", subject="Hi", body="body")
     mock_client.send_email.assert_called_once_with(
-        "to@b.com", "Hi", "body", [], from_address=""
+        "to@b.com", "Hi", "body", [], from_address="", cc="", bcc=""
     )
 
 
@@ -116,7 +116,7 @@ def test_reply_to_thread_passes_from_address_to_client(monkeypatch):
         from_address="alias@workspace.example.com",
     )
     mock_client.reply_to_thread.assert_called_once_with(
-        "thr1", "body", [], from_address="alias@workspace.example.com"
+        "thr1", "body", [], from_address="alias@workspace.example.com", cc="", bcc=""
     )
 
 
@@ -133,8 +133,51 @@ def test_reply_to_thread_passes_empty_from_address_to_client(monkeypatch):
 
     server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="body")
     mock_client.reply_to_thread.assert_called_once_with(
-        "thr1", "body", [], from_address=""
+        "thr1", "body", [], from_address="", cc="", bcc=""
     )
+
+
+def _send_mocks(monkeypatch):
+    import server
+    mock_client = MagicMock()
+    mock_client.send_email.return_value = "sent-cc"
+    mock_client.reply_to_thread.return_value = "reply-cc"
+    mock_log = MagicMock()
+    mock_log.check.return_value = None
+    monkeypatch.setattr(server, "_client", mock_client)
+    monkeypatch.setattr(server, "_log", mock_log)
+    _setup_authenticated(monkeypatch)
+    return mock_client, mock_log
+
+
+def test_send_email_passes_cc_bcc_to_client(monkeypatch):
+    import server
+    mock_client, mock_log = _send_mocks(monkeypatch)
+    server.send_email(to="to@b.com", subject="Invoice 7", body="body", request_id="rid-1",
+                      cc="acct@b.com, boss@b.com", bcc="archive@b.com")
+    mock_client.send_email.assert_called_once_with(
+        "to@b.com", "Invoice 7", "body", [], from_address="",
+        cc="acct@b.com, boss@b.com", bcc="archive@b.com",
+    )
+    # A changed cc or bcc is a new send, so both are part of the dedupe key.
+    mock_log.check.assert_called_once_with("rid-1", "to@b.com", "Invoice 7",
+                                           cc="acct@b.com, boss@b.com", bcc="archive@b.com")
+    mock_log.record.assert_called_once_with("rid-1", "sent-cc", "to@b.com", "Invoice 7",
+                                            cc="acct@b.com, boss@b.com", bcc="archive@b.com")
+
+
+def test_reply_to_thread_passes_cc_bcc_to_client(monkeypatch):
+    import server
+    mock_client, mock_log = _send_mocks(monkeypatch)
+    server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="body", request_id="rid-2",
+                           cc="acct@b.com", bcc="archive@b.com")
+    mock_client.reply_to_thread.assert_called_once_with(
+        "thr1", "body", [], from_address="", cc="acct@b.com", bcc="archive@b.com",
+    )
+    mock_log.check.assert_called_once_with("rid-2", "thr1", "Re: Hello",
+                                           cc="acct@b.com", bcc="archive@b.com")
+    mock_log.record.assert_called_once_with("rid-2", "reply-cc", "thr1", "Re: Hello",
+                                            cc="acct@b.com", bcc="archive@b.com")
 
 
 def test_unauthenticated_tools_raise(monkeypatch):
@@ -290,7 +333,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.13.0"
+    assert manifest["version"] == "0.14.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -1349,3 +1392,120 @@ def test_new_protected_summaries_are_the_designed_sentences():
     assert summaries["delete_filter"] == "Delete the Gmail filter: {description}"
     assert summaries["delete_label"] == ('Delete the Gmail label "{label}" (mail stays, '
                                          'the label comes off every message)')
+
+
+# ── v0.14.0: cc and bcc on send_email and reply_to_thread ──────────────────
+# cc and bcc are optional, so they cannot be summary placeholders (see above:
+# an absent one sends the operator the raw-arguments card for every plain
+# send). The sentence names them in words instead; Casa's approval card lists
+# every argument the call carries, a bcc included.
+
+def test_protected_summary_mentions_cc_bcc():
+    summaries = {e["name"]: e.get("summary") for e in _manifest()["casa"]["protectedTools"]}
+    assert summaries["send_email"] == "Send email to {to} (and to any cc or bcc listed): {subject}"
+    assert summaries["reply_to_thread"] == "Reply to: {display_subject} (and to any cc or bcc listed)"
+
+
+def test_send_and_reply_take_optional_cc_and_bcc():
+    import server
+    for name in ("send_email", "reply_to_thread"):
+        params = inspect.signature(getattr(server, name)).parameters
+        for field in ("cc", "bcc"):
+            assert params[field].default == "", (name, field)
+
+
+
+# --- post-cap fix: a changed cc or bcc is a new send, not a duplicate ---
+# Real SentLog on disk, real GmailClient over a stub Gmail service: the
+# Gmail send call count and the captured MIME are the evidence.
+
+def _real_send_stack(monkeypatch, tmp_path):
+    import server
+    from gmail_client import GmailClient
+    from sent_log import SentLog
+    with patch("gmail_client.build") as mock_build:
+        client = GmailClient(MagicMock())
+    service = mock_build.return_value
+    client._service = service
+    send = service.users.return_value.messages.return_value.send
+    send.return_value.execute.side_effect = lambda: {"id": f"m{send.call_count}"}
+    service.users.return_value.threads.return_value.get.return_value.execute.return_value = {
+        "messages": [{"id": "x", "threadId": "thr1", "payload": {"headers": [
+            {"name": "Subject", "value": "Hello"}, {"name": "From", "value": "alice@example.org"},
+            {"name": "Message-ID", "value": "<orig@mail>"}]}}]}
+    log_path = tmp_path / "sent_log.json"
+    monkeypatch.setattr(server, "_client", client)
+    monkeypatch.setattr(server, "_log", SentLog(str(log_path)))
+    _setup_authenticated(monkeypatch)
+    return server, send, log_path
+
+
+def _cc_of_last_send(send):
+    import base64
+    from email import message_from_bytes, policy
+    raw = send.call_args.kwargs["body"]["raw"]
+    msg = message_from_bytes(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)), policy=policy.default)
+    return sorted(a.addr_spec for a in msg["Cc"].addresses) if msg["Cc"] else []
+
+
+def test_same_request_id_and_same_recipients_is_already_sent(monkeypatch, tmp_path):
+    server, send, _ = _real_send_stack(monkeypatch, tmp_path)
+    first = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1",
+                                         cc="a@x.com, Bob <b@x.com>", bcc="h@x.com"))
+    assert first["already_sent"] is False and send.call_count == 1
+    # same address set: other order, other display name, domain case
+    again = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1",
+                                         cc="b@X.COM, a@x.com", bcc="Hidden <h@x.com>"))
+    assert again == {"message_id": first["message_id"], "already_sent": True}
+    assert send.call_count == 1
+
+
+@pytest.mark.parametrize("field,value", [("cc", "a@x.com, new@x.com"), ("bcc", "new@x.com"),
+                                         ("cc", "A@x.com")])
+def test_same_request_id_with_a_changed_cc_or_bcc_sends_and_records_it(monkeypatch, tmp_path, field, value):
+    server, send, _ = _real_send_stack(monkeypatch, tmp_path)
+    server.send_email(to="to@b.com", subject="S", body="b", request_id="r1", cc="a@x.com")
+    assert send.call_count == 1
+    args = {"cc": "a@x.com", "bcc": ""} | {field: value}
+    out = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1", **args))
+    assert out["already_sent"] is False and send.call_count == 2
+    if field == "cc":
+        assert _cc_of_last_send(send) == sorted(v.strip() for v in value.split(","))
+    # the new set is now the recorded one
+    out = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1", **args))
+    assert out["already_sent"] is True and send.call_count == 2
+
+
+def test_reply_with_the_same_request_id_and_an_added_cc_sends(monkeypatch, tmp_path):
+    server, send, _ = _real_send_stack(monkeypatch, tmp_path)
+    server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="b", request_id="r2")
+    out = json.loads(server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="b",
+                                            request_id="r2"))
+    assert out["already_sent"] is True and send.call_count == 1
+    out = json.loads(server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="b",
+                                            request_id="r2", cc="acct@b.com"))
+    assert out["already_sent"] is False and send.call_count == 2
+    assert _cc_of_last_send(send) == ["acct@b.com"]
+
+
+def _legacy_entry(log_path, to="to@b.com", subject="S"):
+    log_path.write_text(json.dumps({"r1": {"message_id": "old", "timestamp": "2026-11-15T10:00:00+00:00",
+                                           "to": to, "subject": subject}}))
+
+
+def test_a_legacy_entry_matches_a_call_with_no_cc_or_bcc(monkeypatch, tmp_path):
+    server, send, log_path = _real_send_stack(monkeypatch, tmp_path)
+    _legacy_entry(log_path)
+    out = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1"))
+    assert out == {"message_id": "old", "already_sent": True}
+    assert send.call_count == 0
+
+
+@pytest.mark.parametrize("field", ["cc", "bcc"])
+def test_a_legacy_entry_does_not_match_a_call_with_cc_or_bcc(monkeypatch, tmp_path, field):
+    server, send, log_path = _real_send_stack(monkeypatch, tmp_path)
+    _legacy_entry(log_path)
+    out = json.loads(server.send_email(to="to@b.com", subject="S", body="b", request_id="r1",
+                                       **{field: "acct@b.com"}))
+    assert out["already_sent"] is False and send.call_count == 1
+    assert json.loads(log_path.read_text())["r1"][field] == ["acct@b.com"]

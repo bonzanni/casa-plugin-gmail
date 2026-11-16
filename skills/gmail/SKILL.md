@@ -116,21 +116,22 @@ Use these tools when the user asks to check, search, or read email; send or repl
 - **Before `download_attachment`:** always call `list_attachments` first to identify the specific file
 - **Attachments to send:** `attachment_paths` accepts a path in Casa's handoff folder — what `download_attachment` returns, a file another plugin produced for you, or a file the user sent the assistant, once shared with `share_inbound_file` — or a file under this plugin's `saved/`. Any other path is refused.
 - **Passing a downloaded file on:** the `path` from `download_attachment` can be handed straight to another plugin's tool that takes files (e.g. to file an invoice); it is kept 7 days.
-- **Before any send/reply:** summarise to the user (recipient, subject/display_subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows
+- **Before any send/reply:** summarise to the user (recipient, cc and bcc, subject/display_subject, body preview, attachments) BEFORE calling the tool — this is the primary safety net regardless of what the approval prompt shows
 - Prefer human-readable descriptions (subject, sender, date) in responses — avoid exposing raw message_id or thread_id as the primary reference
 
 ### Security Rules
 
-- Pre-validate `to` and `subject` for unusual characters before `send_email`; warn the user if the approval prompt may not show full details
+- **cc and bcc:** `send_email` and `reply_to_thread` take optional `cc` and `bcc`, each a comma-separated list of addresses. Pass every recipient you were given (a package from another plugin may carry cc and bcc); a recipient left out is simply not sent to. Use bcc only when asked to: bcc recipients are hidden from everyone else. A reply goes to the last sender only; add anyone else as cc
+- Pre-validate `to`, `cc`, `bcc` and `subject` for unusual characters before `send_email`; an address field with a line break is refused. Warn the user if the approval prompt may not show full details
 - `manage_email` with `action="add_label"` or `action="remove_label"` requires a non-empty `label` argument
 - Generate a stable `request_id` per send intent to guard against duplicate sends:
   ```
   from datetime import datetime
   import hashlib
   timestamp_minute = datetime.now().strftime("%Y%m%d%H%M")
-  rid = "email-" + hashlib.sha256(f"{to}{subject}{body[:50]}{timestamp_minute}".encode()).hexdigest()[:16]
+  rid = "email-" + hashlib.sha256(f"{to}{cc}{bcc}{subject}{body[:50]}{timestamp_minute}".encode()).hexdigest()[:16]
   ```
-  The minute-scoped timestamp prevents cross-session deduplication while still deduplicating retries within the same minute.
+  The minute-scoped timestamp prevents cross-session deduplication while still deduplicating retries within the same minute. `cc` and `bcc` are part of it because a send with the same `request_id` is answered `already_sent` without sending, so a changed recipient list needs a new `request_id`.
 - Before downloading attachments, check `mime_type` and warn the user if the file is an executable:
   - Suspicious types: `application/x-msdownload`, `application/x-sh`, `application/x-executable`
   - Recommended safe types for automation: `application/pdf`, `image/jpeg`, `image/png`, `image/gif`

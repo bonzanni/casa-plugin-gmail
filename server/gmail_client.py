@@ -1,6 +1,7 @@
 import base64
 import difflib
 import os
+import re
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -165,6 +166,152 @@ def _translate_error(e: HttpError) -> ValueError:
 
 
 BULK_CEILING = 5000
+
+
+def _refuse_header_breaks(**fields: str) -> None:
+    """A line break in an address field would end the header and start another
+    (a hidden Bcc, say), so it is refused before anything reaches Gmail."""
+    for name, value in fields.items():
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"{name} contains a line break; give the addresses "
+                             f"on one line, separated by commas.")
+
+
+# addr-spec, ASCII only: a dot-atom or quoted-string local part, "@", and a
+# domain of at least two letter/digit/hyphen labels (no hyphen at either end).
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_ADDR_SPEC = re.compile(
+    rf'(?:{_ATEXT}(?:\.{_ATEXT})*|"(?:[\x20\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])+")'
+    r"@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
+_QUOTED_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
+
+
+def _outside_quotes(text: str):
+    """(index, char) for each character of *text* outside a quoted-string,
+    or None when a quote is left open."""
+    out, quoted, escaped = [], False, False
+    for i, ch in enumerate(text):
+        if escaped:
+            escaped = False
+        elif quoted and ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif not quoted:
+            out.append((i, ch))
+    return None if quoted else out
+
+
+def _strip_comments(text: str):
+    """*text* with each RFC 5322 comment (parentheses outside quoted strings,
+    nested, backslash escapes) replaced by a space, or None when a comment is
+    left open. Quoted strings pass through untouched."""
+    out, depth, quoted, escaped = [], 0, False, False
+    for ch in text:
+        if escaped:
+            escaped = False
+            if not depth:
+                out.append(ch)
+        elif ch == "\\" and (quoted or depth):
+            escaped = True
+            if not depth:
+                out.append(ch)
+        elif depth:
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if not depth:
+                out.append(" ")
+        elif quoted:
+            out.append(ch)
+            quoted = ch != '"'
+        elif ch == "(":
+            depth = 1
+        else:
+            out.append(ch)
+            quoted = ch == '"'
+    return None if depth else "".join(out)
+
+
+def _parse_address_list(name: str, value: str, sender: bool = False) -> list[tuple[str, str]]:
+    """*value* as (display name, addr-spec) pairs, or a ValueError naming the
+    field and the entry as given. Nothing is ever rewritten into an address:
+    the email package's parser turns what it cannot read into something else
+    ("Invoice approver" -> "Invoice"), so this one only accepts, per entry
+    between commas outside quotes and <...>, an addr-spec alone or a display
+    part followed by <addr-spec>.
+
+    In a list the caller wrote, an unquoted display name may not hold "@",
+    "<", ">", ";" or ",": each is a sign of a missing comma ("a@x.com; Bob
+    <b@x.com>" would reach only b@x.com), so it is refused; a quoted name is
+    free. In the original sender's From header (*sender*) the last <...> is
+    the sender and the rest is only a name, and RFC 5322 comments
+    ("alice@x.org (Alice Smith)") are removed first. A comment never becomes
+    the display name, and a refusal there quotes the entry without them."""
+    def refuse(entry: str, why: str = "is not an email address") -> ValueError:
+        return ValueError(f'{name} has an entry that {why}: "{entry}". Give each recipient '
+                          f"as name@example.com or Name <name@example.com>, separated by commas.")
+
+    if sender:
+        stripped = _strip_comments(value)
+        if stripped is None:
+            raise refuse(value.strip(), "has an unclosed comment")
+        value = stripped
+    chars = _outside_quotes(value)
+    if chars is None:
+        raise refuse(value.strip(), "has an unclosed quote")
+    entries, start, angle = [], 0, False
+    for i, ch in chars:
+        if ch == "<":
+            angle = True
+        elif ch == ">":
+            angle = False
+        elif ch == "," and not angle:
+            entries.append(value[start:i])
+            start = i + 1
+    entries.append(value[start:])
+
+    pairs = []
+    for raw in entries:
+        entry = raw.strip()
+        if not entry:
+            raise ValueError(f"{name} has an empty entry (a stray or trailing comma): "
+                             f'"{value}". Separate the addresses with single commas.')
+        opens = [i for i, ch in _outside_quotes(entry) if ch == "<"]
+        if not opens:
+            display, addr = "", entry
+        elif entry.endswith(">"):
+            display, addr = entry[:opens[-1]].strip(), entry[opens[-1] + 1:-1].strip()
+        else:
+            raise refuse(entry)
+        if not _ADDR_SPEC.fullmatch(addr):
+            raise refuse(entry)
+        quoted = _QUOTED_STRING.fullmatch(display)
+        if quoted:
+            display = re.sub(r"\\(.)", r"\1", quoted.group(1), flags=re.S)
+        elif not sender and any(ch in display for ch in "@<>;,"):
+            raise refuse(entry, "looks like more than one address (a missing comma?); "
+                                'quote a display name that holds "@", "<", ">", ";" or ","')
+        if "=?" in display:
+            from email.errors import HeaderParseError
+            from email.header import decode_header, make_header
+            try:
+                display = str(make_header(decode_header(display)))
+            except (HeaderParseError, LookupError, UnicodeDecodeError):
+                pass  # only the display name; the address is already exact
+        if "\r" in display or "\n" in display:
+            raise refuse(entry, "has a line break in its display name")
+        pairs.append((display, addr))
+    return pairs
+
+
+def _address_list(name: str, value: str, sender: bool = False) -> str:
+    """*value* as an address header that encodes only the display names.
+
+    Set raw, a non-ASCII display name makes the email package encode the whole
+    header as one RFC 2047 word, addresses included, and Gmail cannot read the
+    recipients in it."""
+    from email.utils import formataddr
+    return ", ".join(formataddr(pair, charset="utf-8")
+                     for pair in _parse_address_list(name, value, sender))
 
 
 class LabelNotFound(ValueError):
@@ -670,13 +817,18 @@ class GmailClient:
         body: str,
         attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ) -> str:
+        _refuse_header_breaks(to=to, cc=cc, bcc=bcc, from_address=from_address)
         msg = self._build_message(
             to=to,
             subject=subject,
             body=body,
             attachments=attachments or [],
             from_address=from_address,
+            cc=cc,
+            bcc=bcc,
         )
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         try:
@@ -691,7 +843,10 @@ class GmailClient:
         body: str,
         attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ) -> str:
+        _refuse_header_breaks(cc=cc, bcc=bcc, from_address=from_address)
         try:
             thread = self._service.users().threads().get(
                 userId="me", id=thread_id, format="metadata",
@@ -707,7 +862,10 @@ class GmailClient:
         subject = _get_header(h, "Subject") or ""
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
-        reply_to = _get_header(h, "From")
+        # Read leniently here; formataddr quotes any name holding "@" or "<",
+        # so _build_message's strict pass reads the result unchanged.
+        reply_to = _address_list("the original sender's From header",
+                                 _get_header(h, "From"), sender=True)
         msg_id_header = _get_header(h, "Message-ID")
         refs = _get_header(h, "References")
         msg = self._build_message(
@@ -716,6 +874,8 @@ class GmailClient:
             body=body,
             attachments=attachments or [],
             from_address=from_address,
+            cc=cc,
+            bcc=bcc,
         )
         msg["In-Reply-To"] = msg_id_header
         msg["References"] = f"{refs} {msg_id_header}".strip() if refs else msg_id_header
@@ -735,12 +895,18 @@ class GmailClient:
         to: str = "",
         subject: str = "",
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ):
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
         from email.mime.base import MIMEBase
         from email import encoders
         import mimetypes
+        to, cc, bcc, from_address = (
+            _address_list(name, value) if value else ""
+            for name, value in (("to", to), ("cc", cc), ("bcc", bcc),
+                                ("from_address", from_address)))
         if attachments:
             msg = MIMEMultipart()
             if to:
@@ -748,6 +914,11 @@ class GmailClient:
             msg["Subject"] = subject
             if from_address:
                 msg["From"] = from_address
+            if cc:
+                msg["Cc"] = cc
+            if bcc:
+                # Gmail delivers to the Bcc header's recipients (users.messages.send).
+                msg["Bcc"] = bcc
             msg.attach(MIMEText(body, "plain"))
             # (filename, bytes) pairs, already read through a guarded
             # descriptor by the caller — never a path to open here.
@@ -766,4 +937,9 @@ class GmailClient:
             msg["Subject"] = subject
             if from_address:
                 msg["From"] = from_address
+            if cc:
+                msg["Cc"] = cc
+            if bcc:
+                # Gmail delivers to the Bcc header's recipients (users.messages.send).
+                msg["Bcc"] = bcc
         return msg
