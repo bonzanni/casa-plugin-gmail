@@ -129,9 +129,9 @@ Use these tools when the user asks to check, search, or read email; send or repl
   from datetime import datetime
   import hashlib
   timestamp_minute = datetime.now().strftime("%Y%m%d%H%M")
-  rid = "email-" + hashlib.sha256(f"{to}{subject}{body[:50]}{timestamp_minute}".encode()).hexdigest()[:16]
+  rid = "email-" + hashlib.sha256(f"{to}{cc}{bcc}{subject}{body[:50]}{timestamp_minute}".encode()).hexdigest()[:16]
   ```
-  The minute-scoped timestamp prevents cross-session deduplication while still deduplicating retries within the same minute.
+  The minute-scoped timestamp prevents cross-session deduplication while still deduplicating retries within the same minute. `cc` and `bcc` are part of it because a send with the same `request_id` is answered `already_sent` without sending, so a changed recipient list needs a new `request_id`.
 - Before downloading attachments, check `mime_type` and warn the user if the file is an executable:
   - Suspicious types: `application/x-msdownload`, `application/x-sh`, `application/x-executable`
   - Recommended safe types for automation: `application/pdf`, `image/jpeg`, `image/png`, `image/gif`

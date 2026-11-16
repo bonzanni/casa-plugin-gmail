@@ -1313,3 +1313,61 @@ def test_reply_refuses_a_line_break_in_cc_or_bcc_before_reading_the_thread(field
         client.reply_to_thread("thr1", "body", **{field: value})
     client._service.users.return_value.threads.return_value.get.assert_not_called()
     client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+# --- address headers: only the display name is encoded (fix round 1) ---
+
+_NON_ASCII_LIST = "José Núñez <j@x.com>, plain@x.com"
+
+
+def _header_lines(raw: bytes, name: str) -> bytes:
+    """The named header as sent, unfolded."""
+    head = raw.split(b"\n\n", 1)[0].replace(b"\r\n", b"\n").replace(b"\n ", b" ").replace(b"\n\t", b" ")
+    return b"\n".join(l for l in head.split(b"\n") if l.startswith(name.encode() + b":"))
+
+
+@pytest.mark.parametrize("attachments", [None, [("file.txt", b"content")]])
+@pytest.mark.parametrize("field", ["to", "cc", "bcc"])
+def test_address_headers_encode_only_the_display_name(attachments, field):
+    from email import message_from_bytes
+    from email.header import decode_header, make_header
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    args = {"to": "to@b.com", "cc": "", "bcc": ""} | {field: _NON_ASCII_LIST}
+    client.send_email(args["to"], "Hello", "Body", attachments=attachments, cc=args["cc"], bcc=args["bcc"])
+    raw = _sent_raw(client)
+    line = _header_lines(raw, field.capitalize())
+    assert b"<j@x.com>" in line and b"plain@x.com" in line, line
+    assert b"=?utf-8?b?Sm9zw6kgTsO6w7FleiA8akB4" not in line   # the whole list as one encoded-word
+    decoded = str(make_header(decode_header(message_from_bytes(raw)[field.capitalize()])))
+    assert decoded == "José Núñez <j@x.com>, plain@x.com"
+
+
+def test_address_list_keeps_a_quoted_comma_in_a_display_name():
+    from email import message_from_bytes
+    from email.utils import getaddresses
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email("to@b.com", "Hello", "Body", cc='"Doe, Jane" <d@x.com>, e@x.com')
+    sent = message_from_bytes(_sent_raw(client))
+    assert getaddresses([sent["Cc"]]) == [("Doe, Jane", "d@x.com"), ("", "e@x.com")]
+
+
+def test_reply_encodes_only_the_display_name_of_the_original_sender():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="José Núñez <j@x.com>")
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    client.reply_to_thread("thr1", "body", cc="Zoë <z@x.com>")
+    raw = _sent_raw(client)
+    assert b"<j@x.com>" in _header_lines(raw, "To")
+    assert b"<z@x.com>" in _header_lines(raw, "Cc")
+
+
+@pytest.mark.parametrize("value", ["a@x.com,", "a@x.com; b@x.com", "a@x.com,,b@x.com"])
+def test_an_address_list_that_does_not_parse_is_refused_not_dropped(value):
+    client = make_client()
+    with pytest.raises(ValueError, match="cc"):
+        client.send_email("to@b.com", "Hello", "Body", cc=value)
+    client._service.users.return_value.messages.return_value.send.assert_not_called()

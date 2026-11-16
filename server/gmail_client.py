@@ -176,6 +176,22 @@ def _refuse_header_breaks(**fields: str) -> None:
                              f"on one line, separated by commas.")
 
 
+def _address_list(name: str, value: str) -> str:
+    """*value* as an address header that encodes only the display names.
+
+    Set raw, a non-ASCII display name makes the email package encode the whole
+    header as one RFC 2047 word, addresses included, and Gmail cannot read the
+    recipients in it. A list that does not parse is refused, not trimmed:
+    the strict parser reads a trailing comma or a ';' list as one empty
+    address, and dropping it would send to nobody."""
+    from email.utils import formataddr, getaddresses
+    pairs = getaddresses([value])
+    if not pairs or any(not addr for _, addr in pairs):
+        raise ValueError(f"{name} could not be read as a list of addresses: {value!r}. "
+                         f"Separate the addresses with commas.")
+    return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
+
+
 class LabelNotFound(ValueError):
     """No label matches the given name or ID (as opposed to an ambiguous one)."""
 
@@ -762,6 +778,10 @@ class GmailClient:
         from email.mime.base import MIMEBase
         from email import encoders
         import mimetypes
+        to, cc, bcc, from_address = (
+            _address_list(name, value) if value else ""
+            for name, value in (("to", to), ("cc", cc), ("bcc", bcc),
+                                ("from_address", from_address)))
         if attachments:
             msg = MIMEMultipart()
             if to:
