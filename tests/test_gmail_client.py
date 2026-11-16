@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -1374,36 +1376,35 @@ def test_an_address_list_that_does_not_parse_is_refused_not_dropped(value):
 
 
 # --- a reply to a sender with an unusual display name (fix round 2) ---
-# The strict parser cannot read these real-world From headers (unquoted
-# specials in the display name). The reply has no `to` to correct, so it goes
-# to the bare address; a user-supplied list keeps the strict refusal.
+# Real-world From headers carry unquoted specials in the display name. The
+# strict parser (fix round 4) reads them as display text, so the reply keeps
+# both the name and the address, and a user-supplied list is read the same way.
 
 _ODD_FROMS = [
-    ("John @ Acme <a@x.com>", "a@x.com"),
-    ("Foo Bar [Ext] <a@x.com>", "a@x.com"),
-    ("Jane@Company <j@x.com>", "j@x.com"),
-    ("Name; Co <a@x.com>", "a@x.com"),
+    ("John @ Acme <a@x.com>", ("John @ Acme", "a@x.com")),
+    ("Foo Bar [Ext] <a@x.com>", ("Foo Bar [Ext]", "a@x.com")),
+    ("Jane@Company <j@x.com>", ("Jane@Company", "j@x.com")),
+    ("Name; Co <a@x.com>", ("Name; Co", "a@x.com")),
 ]
 
 
-@pytest.mark.parametrize("from_header,addr", _ODD_FROMS)
-def test_reply_to_an_unusual_display_name_goes_to_the_bare_address(from_header, addr):
-    from email import message_from_bytes
+@pytest.mark.parametrize("from_header,pair", _ODD_FROMS)
+def test_reply_to_an_unusual_display_name_keeps_name_and_address(from_header, pair):
     client = make_client()
     client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
         _make_thread_response(from_addr=from_header)
     )
     client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
     assert client.reply_to_thread("thr1", "body") == "r"
-    assert message_from_bytes(_sent_raw(client))["To"] == addr
+    assert _recipients(_sent_raw(client), "To") == [pair]
 
 
-@pytest.mark.parametrize("from_header,addr", _ODD_FROMS)
-def test_a_user_supplied_cc_with_an_unusual_display_name_is_still_refused(from_header, addr):
+@pytest.mark.parametrize("from_header,pair", _ODD_FROMS)
+def test_a_user_supplied_cc_with_an_unusual_display_name_is_sent(from_header, pair):
     client = make_client()
-    with pytest.raises(ValueError, match="cc"):
-        client.send_email("to@b.com", "Hello", "Body", cc=from_header)
-    client._service.users.return_value.messages.return_value.send.assert_not_called()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email("to@b.com", "Hello", "Body", cc=from_header)
+    assert _recipients(_sent_raw(client), "Cc") == [pair]
 
 
 def test_reply_to_an_unreadable_from_without_angle_brackets_is_still_refused():
@@ -1411,8 +1412,9 @@ def test_reply_to_an_unreadable_from_without_angle_brackets_is_still_refused():
     client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
         _make_thread_response(from_addr="a@x.com; b@x.com")
     )
-    with pytest.raises(ValueError, match="to"):
+    with pytest.raises(ValueError, match="From header") as exc:
         client.reply_to_thread("thr1", "body")
+    assert "a@x.com; b@x.com" in str(exc.value)
     client._service.users.return_value.messages.return_value.send.assert_not_called()
 
 
@@ -1465,6 +1467,200 @@ def test_reply_fallback_to_an_incomplete_address_is_still_refused():
     client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
         _make_thread_response(from_addr="Foo Bar [Ext] <someone>")
     )
-    with pytest.raises(ValueError, match="to"):
+    with pytest.raises(ValueError, match="From header"):
         client.reply_to_thread("thr1", "body")
     client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+# --- a strict address-list parser (fix round 4) ---
+# getaddresses() rewrites what it cannot read ("billing@example.com Invoice
+# approver" became "billing@example.comInvoiceapprover"), so the plugin parses
+# address lists itself: each comma-separated entry is exactly an addr-spec or
+# "display <addr-spec>", and anything else is refused as given.
+
+def _recipients(raw: bytes, header: str) -> list[tuple[str, str]]:
+    """The header's recipients as the modern email parser (not ours) reads them."""
+    from email import message_from_bytes, policy
+    msg = message_from_bytes(raw, policy=policy.default)
+    return [(a.display_name, a.addr_spec) for a in msg[header].addresses]
+
+
+_PARSES = [
+    ("José Núñez <j@x.com>, plain@x.com", [("José Núñez", "j@x.com"), ("", "plain@x.com")]),
+    ("John @ Acme <a@x.com>", [("John @ Acme", "a@x.com")]),
+    ("Foo Bar [Ext] <a@x.com>", [("Foo Bar [Ext]", "a@x.com")]),
+    ("Jane@Company <j@x.com>", [("Jane@Company", "j@x.com")]),
+    ("Name; Co <a@x.com>", [("Name; Co", "a@x.com")]),
+    ('"billing team"@example.org', [("", '"billing team"@example.org')]),
+    ('Billing <"billing team"@example.org>', [("Billing", '"billing team"@example.org')]),
+    ('"a\\"b"@x.com', [("", '"a\\"b"@x.com')]),
+    ('"Doe, Jane" <d@x.com>, e@x.com', [("Doe, Jane", "d@x.com"), ("", "e@x.com")]),
+    ('"a \\"quoted\\" name" <q@x.com>', [('a "quoted" name', "q@x.com")]),
+    ("a+tag@sub.x-y.com", [("", "a+tag@sub.x-y.com")]),
+    ("o'brien@x.ie", [("", "o'brien@x.ie")]),
+    ("BOB@X.COM", [("", "BOB@X.COM")]),
+    ("=?utf-8?q?Jos=C3=A9_N=C3=BA=C3=B1ez?= <j@x.com>", [("José Núñez", "j@x.com")]),
+    ("=?UTF-8?B?Sm9zw6kgTsO6w7Fleg==?= <j@x.com>", [("José Núñez", "j@x.com")]),
+    ("<a@x.com>", [("", "a@x.com")]),
+    ("  a@x.com ,\tB <b@x.com>  ", [("", "a@x.com"), ("B", "b@x.com")]),
+    ("j@x.com <j@x.com>", [("j@x.com", "j@x.com")]),
+    ('"a@x.com via Docs" <b@x.com>', [("a@x.com via Docs", "b@x.com")]),
+    ("Bob <a@x.com>, Ann <b@y.org>, c@z.net",
+     [("Bob", "a@x.com"), ("Ann", "b@y.org"), ("", "c@z.net")]),
+]
+
+
+@pytest.mark.parametrize("value,pairs", _PARSES)
+def test_parser_reads_each_entry_exactly(value, pairs):
+    from gmail_client import _parse_address_list
+    assert _parse_address_list("cc", value) == pairs
+
+
+# (field value, the entry the refusal must quote as given)
+_REFUSALS = [
+    ("billing@example.com Invoice approver", "billing@example.com Invoice approver"),
+    ("Invoice approver", "Invoice approver"),
+    ("plain", "plain"),
+    ("a@b", "a@b"),
+    ("a b@x.com", "a b@x.com"),
+    ("a@x.com;b@x.com", "a@x.com;b@x.com"),
+    ("a@x.com; b@x.com", "a@x.com; b@x.com"),
+    ("josé@x.com", "josé@x.com"),
+    ("José <josé@x.com>", "José <josé@x.com>"),
+    ("ok@x.com, Invoice approver", "Invoice approver"),
+    ("Bob <a b@x.com>", "Bob <a b@x.com>"),
+    ("Bob <a@x.com> extra", "Bob <a@x.com> extra"),
+    ("Bob <a@x.com", "Bob <a@x.com"),
+    ("a@x.com>", "a@x.com>"),
+    ("<a@x.com, b@x.com>", "<a@x.com, b@x.com>"),
+    ('"unclosed <a@x.com>', '"unclosed <a@x.com>'),
+    (".a@x.com", ".a@x.com"),
+    ("a.@x.com", "a.@x.com"),
+    ("a..b@x.com", "a..b@x.com"),
+    ("a@-x.com", "a@-x.com"),
+    ("a@x-.com", "a@x-.com"),
+    ("a@x..com", "a@x..com"),
+    ("a@x.com.", "a@x.com."),
+    ("a@@x.com", "a@@x.com"),
+    ('"tab\there"@x.com', '"tab\there"@x.com'),
+    ("=?utf-8?q?Bob=0D=0ABcc:_e@x.com?= <a@x.com>", "=?utf-8?q?Bob=0D=0ABcc:_e@x.com?= <a@x.com>"),
+    # a missing comma must not reach only the last address
+    ("a@x.com Bob <b@x.com>", "a@x.com Bob <b@x.com>"),
+    ("Bob <a@x.com> <b@x.com>", "Bob <a@x.com> <b@x.com>"),
+    ("Bob <a@x.com> Ann <b@x.com>", "Bob <a@x.com> Ann <b@x.com>"),
+    ("ok@x.com, a@x.com b@x.com", "a@x.com b@x.com"),
+]
+
+
+@pytest.mark.parametrize("value,entry", _REFUSALS)
+def test_parser_refuses_and_quotes_the_entry_as_given(value, entry):
+    from gmail_client import _parse_address_list
+    with pytest.raises(ValueError) as exc:
+        _parse_address_list("bcc", value)
+    assert str(exc.value).startswith("bcc "), exc.value
+    assert entry in str(exc.value), exc.value
+
+
+@pytest.mark.parametrize("value", ["a@x.com,", "a@x.com,,b@x.com", ",a@x.com", "a@x.com, ", ""])
+def test_parser_refuses_an_empty_entry(value):
+    from gmail_client import _parse_address_list
+    with pytest.raises(ValueError, match="^cc .*empty entry"):
+        _parse_address_list("cc", value)
+
+
+def _unfolded_header(raw: bytes, name: str) -> bytes:
+    head = raw.split(b"\n\n", 1)[0].replace(b"\r\n", b"\n")
+    head = re.sub(rb"\n[ \t]", b" ", head)
+    return b"\n".join(l for l in head.split(b"\n") if l.startswith(name.encode() + b":"))
+
+
+_E2E = {
+    "to": ("José Núñez <j@x.com>, plain@x.com",
+           [("José Núñez", "j@x.com"), ("", "plain@x.com")]),
+    "cc": ('"Doe, Jane" <d@x.com>, "billing team"@example.org, Name; Co <n@x.com>',
+           [("Doe, Jane", "d@x.com"), ("", '"billing team"@example.org'), ("Name; Co", "n@x.com")]),
+    "bcc": ('Billing <"billing team"@example.org>, BOB@X.COM, o\'brien@x.ie',
+            [("Billing", '"billing team"@example.org'), ("", "BOB@X.COM"), ("", "o'brien@x.ie")]),
+}
+
+
+@pytest.mark.parametrize("attachments", [None, [("file.txt", b"content")]])
+def test_send_email_raw_mime_carries_exactly_the_requested_recipients(attachments):
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email(_E2E["to"][0], "Hello", "Body", attachments=attachments,
+                      cc=_E2E["cc"][0], bcc=_E2E["bcc"][0])
+    raw = _sent_raw(client)
+    assert raw.split(b"\n\n", 1)[0].count(b"multipart/mixed") == (1 if attachments else 0)
+    for field, (_, pairs) in _E2E.items():
+        header = field.capitalize()
+        assert _recipients(raw, header) == pairs
+        line = _unfolded_header(raw, header)
+        for _, addr in pairs:
+            assert addr.encode() in line, (addr, line)   # the addr-spec byte-for-byte
+
+
+@pytest.mark.parametrize("attachments", [None, [("file.txt", b"content")]])
+@pytest.mark.parametrize("from_header,pair", [
+    ('Billing <"billing team"@example.org>', ("Billing", '"billing team"@example.org')),
+    ("Name; Co <a@x.com>", ("Name; Co", "a@x.com")),
+    ("=?utf-8?q?Jos=C3=A9_N=C3=BA=C3=B1ez?= <j@x.com>", ("José Núñez", "j@x.com")),
+    ("plain@x.com", ("", "plain@x.com")),
+])
+def test_reply_raw_mime_carries_exactly_the_requested_recipients(attachments, from_header, pair):
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr=from_header)
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    client.reply_to_thread("thr1", "body", attachments=attachments, cc=_E2E["cc"][0], bcc=_E2E["bcc"][0])
+    raw = _sent_raw(client)
+    assert raw.split(b"\n\n", 1)[0].count(b"multipart/mixed") == (1 if attachments else 0)
+    assert _recipients(raw, "To") == [pair]
+    assert pair[1].encode() in _unfolded_header(raw, "To")
+    assert _recipients(raw, "Cc") == _E2E["cc"][1]
+    assert _recipients(raw, "Bcc") == _E2E["bcc"][1]
+
+
+def test_reply_to_a_from_with_an_encoded_line_break_is_refused():
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="=?utf-8?q?Bob=0D=0ABcc:_e@x.com?= <a@x.com>")
+    )
+    with pytest.raises(ValueError, match="From header"):
+        client.reply_to_thread("thr1", "body")
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["to", "cc", "bcc", "from_address"])
+@pytest.mark.parametrize("value", ["billing@example.com Invoice approver", "Invoice approver"])
+def test_send_refuses_a_phrase_in_any_address_field(field, value):
+    client = make_client()
+    args = {"to": "to@b.com", "cc": "", "bcc": "", "from_address": ""} | {field: value}
+    with pytest.raises(ValueError, match=f"^{field} ") as exc:
+        client.send_email(args["to"], "Hello", "Body", cc=args["cc"], bcc=args["bcc"],
+                          from_address=args["from_address"])
+    assert value in str(exc.value)
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("from_header,pair", [
+    ("a@x.com via Docs <b@x.com>", ("a@x.com via Docs", "b@x.com")),
+    ("Bob <a@x.com> <b@x.com>", ("Bob <a@x.com>", "b@x.com")),
+])
+def test_reply_reads_the_last_angle_address_of_the_from_header_as_the_sender(from_header, pair):
+    # The From header's display text is only a name; a user-supplied list with
+    # the same shape is refused as a missing comma (see _REFUSALS).
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr=from_header)
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    client.reply_to_thread("thr1", "body")
+    assert _recipients(_sent_raw(client), "To") == [pair]
+
+
+def test_parser_names_an_unclosed_quote():
+    from gmail_client import _parse_address_list
+    with pytest.raises(ValueError, match='^cc .*unclosed quote.*"Doe, Jane <d@x.com>'):
+        _parse_address_list("cc", '"Doe, Jane <d@x.com>')

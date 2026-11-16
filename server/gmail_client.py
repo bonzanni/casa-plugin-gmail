@@ -177,47 +177,107 @@ def _refuse_header_breaks(**fields: str) -> None:
                              f"on one line, separated by commas.")
 
 
+# addr-spec, ASCII only: a dot-atom or quoted-string local part, "@", and a
+# domain of at least two letter/digit/hyphen labels (no hyphen at either end).
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
 _ADDR_SPEC = re.compile(
-    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    rf'(?:{_ATEXT}(?:\.{_ATEXT})*|"(?:[\x20\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])+")'
     r"@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
+_QUOTED_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
 
 
-def _address_list(name: str, value: str) -> str:
+def _outside_quotes(text: str):
+    """(index, char) for each character of *text* outside a quoted-string,
+    or None when a quote is left open."""
+    out, quoted, escaped = [], False, False
+    for i, ch in enumerate(text):
+        if escaped:
+            escaped = False
+        elif quoted and ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif not quoted:
+            out.append((i, ch))
+    return None if quoted else out
+
+
+def _parse_address_list(name: str, value: str, sender: bool = False) -> list[tuple[str, str]]:
+    """*value* as (display name, addr-spec) pairs, or a ValueError naming the
+    field and the entry as given. Nothing is ever rewritten into an address:
+    the email package's parser turns what it cannot read into something else
+    ("Invoice approver" -> "Invoice"), so this one only accepts, per entry
+    between commas outside quotes and <...>, an addr-spec alone or a display
+    part followed by <addr-spec>.
+
+    In a list the caller wrote, an unquoted display name holding a <, a > or
+    another address is a missing comma ("a@x.com Bob <b@x.com>" would reach
+    only b@x.com), so it is refused. In the original sender's From header
+    (*sender*) the last <...> is the sender, and the rest is only a name."""
+    def refuse(entry: str, why: str = "is not an email address") -> ValueError:
+        return ValueError(f'{name} has an entry that {why}: "{entry}". Give each recipient '
+                          f"as name@example.com or Name <name@example.com>, separated by commas.")
+
+    chars = _outside_quotes(value)
+    if chars is None:
+        raise refuse(value.strip(), "has an unclosed quote")
+    entries, start, angle = [], 0, False
+    for i, ch in chars:
+        if ch == "<":
+            angle = True
+        elif ch == ">":
+            angle = False
+        elif ch == "," and not angle:
+            entries.append(value[start:i])
+            start = i + 1
+    entries.append(value[start:])
+
+    pairs = []
+    for raw in entries:
+        entry = raw.strip()
+        if not entry:
+            raise ValueError(f"{name} has an empty entry (a stray or trailing comma): "
+                             f'"{value}". Separate the addresses with single commas.')
+        opens = [i for i, ch in _outside_quotes(entry) if ch == "<"]
+        if not opens:
+            display, addr = "", entry
+        elif entry.endswith(">"):
+            display, addr = entry[:opens[-1]].strip(), entry[opens[-1] + 1:-1].strip()
+        else:
+            raise refuse(entry)
+        if not _ADDR_SPEC.fullmatch(addr):
+            raise refuse(entry)
+        quoted = _QUOTED_STRING.fullmatch(display)
+        if quoted:
+            display = re.sub(r"\\(.)", r"\1", quoted.group(1), flags=re.S)
+        elif not sender and (
+                any(ch in "<>" for _, ch in _outside_quotes(display))
+                or any(_ADDR_SPEC.fullmatch(t) and t.lower() != addr.lower()
+                       for t in display.split())):
+            raise refuse(entry, "looks like more than one address (a missing comma?); "
+                                "quote a display name that holds an address")
+        if "=?" in display:
+            from email.errors import HeaderParseError
+            from email.header import decode_header, make_header
+            try:
+                display = str(make_header(decode_header(display)))
+            except (HeaderParseError, LookupError, UnicodeDecodeError):
+                pass  # only the display name; the address is already exact
+        if "\r" in display or "\n" in display:
+            raise refuse(entry, "has a line break in its display name")
+        pairs.append((display, addr))
+    return pairs
+
+
+def _address_list(name: str, value: str, sender: bool = False) -> str:
     """*value* as an address header that encodes only the display names.
 
     Set raw, a non-ASCII display name makes the email package encode the whole
     header as one RFC 2047 word, addresses included, and Gmail cannot read the
-    recipients in it. A list that does not parse is refused, not trimmed:
-    the strict parser reads a trailing comma or a ';' list as one empty
-    address, and dropping it would send to nobody."""
-    from email.utils import formataddr, getaddresses
-    pairs = getaddresses([value])
-    if not pairs or any(not addr for _, addr in pairs):
-        raise ValueError(f"{name} could not be read as a list of addresses: {value!r}. "
-                         f"Separate the addresses with commas.")
-    # The parser also reads a phrase as a "bare address" ("Invoice approver"
-    # becomes "Invoice"), so each address must be a whole ASCII local@domain.
-    for _, addr in pairs:
-        if not _ADDR_SPEC.fullmatch(addr):
-            raise ValueError(f"{name} has an entry that is not a complete email address: "
-                             f"{addr!r} (in {value!r}).")
-    return ", ".join(formataddr((display, addr), charset="utf-8") for display, addr in pairs)
-
-
-def _reply_recipient(from_header: str) -> str:
-    """The original sender, as the reply's To. A display name with an unquoted
-    special ("Foo Bar [Ext] <a@x.com>") is unreadable to the strict parser,
-    and the reply has no `to` the caller could correct, so it falls back to
-    the address inside the last <...>. Without one, the refusal stands."""
-    try:
-        _address_list("to", from_header)
-        return from_header
-    except ValueError:
-        start = from_header.rfind("<")
-        end = from_header.find(">", start + 1)
-        if start == -1 or end == -1 or not from_header[start + 1:end].strip():
-            raise
-        return from_header[start + 1:end].strip()
+    recipients in it."""
+    from email.utils import formataddr
+    return ", ".join(formataddr(pair, charset="utf-8")
+                     for pair in _parse_address_list(name, value, sender))
 
 
 class LabelNotFound(ValueError):
@@ -768,7 +828,10 @@ class GmailClient:
         subject = _get_header(h, "Subject") or ""
         if not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
-        reply_to = _reply_recipient(_get_header(h, "From"))
+        # Read leniently here; formataddr quotes any name holding "@" or "<",
+        # so _build_message's strict pass reads the result unchanged.
+        reply_to = _address_list("the original sender's From header",
+                                 _get_header(h, "From"), sender=True)
         msg_id_header = _get_header(h, "Message-ID")
         refs = _get_header(h, "References")
         msg = self._build_message(
