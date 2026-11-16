@@ -202,6 +202,35 @@ def _outside_quotes(text: str):
     return None if quoted else out
 
 
+def _strip_comments(text: str):
+    """*text* with each RFC 5322 comment (parentheses outside quoted strings,
+    nested, backslash escapes) replaced by a space, or None when a comment is
+    left open. Quoted strings pass through untouched."""
+    out, depth, quoted, escaped = [], 0, False, False
+    for ch in text:
+        if escaped:
+            escaped = False
+            if not depth:
+                out.append(ch)
+        elif ch == "\\" and (quoted or depth):
+            escaped = True
+            if not depth:
+                out.append(ch)
+        elif depth:
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if not depth:
+                out.append(" ")
+        elif quoted:
+            out.append(ch)
+            quoted = ch != '"'
+        elif ch == "(":
+            depth = 1
+        else:
+            out.append(ch)
+            quoted = ch == '"'
+    return None if depth else "".join(out)
+
+
 def _parse_address_list(name: str, value: str, sender: bool = False) -> list[tuple[str, str]]:
     """*value* as (display name, addr-spec) pairs, or a ValueError naming the
     field and the entry as given. Nothing is ever rewritten into an address:
@@ -210,14 +239,22 @@ def _parse_address_list(name: str, value: str, sender: bool = False) -> list[tup
     between commas outside quotes and <...>, an addr-spec alone or a display
     part followed by <addr-spec>.
 
-    In a list the caller wrote, an unquoted display name holding a <, a > or
-    another address is a missing comma ("a@x.com Bob <b@x.com>" would reach
-    only b@x.com), so it is refused. In the original sender's From header
-    (*sender*) the last <...> is the sender, and the rest is only a name."""
+    In a list the caller wrote, an unquoted display name may not hold "@",
+    "<", ">", ";" or ",": each is a sign of a missing comma ("a@x.com; Bob
+    <b@x.com>" would reach only b@x.com), so it is refused; a quoted name is
+    free. In the original sender's From header (*sender*) the last <...> is
+    the sender and the rest is only a name, and RFC 5322 comments
+    ("alice@x.org (Alice Smith)") are removed first. A comment never becomes
+    the display name, and a refusal there quotes the entry without them."""
     def refuse(entry: str, why: str = "is not an email address") -> ValueError:
         return ValueError(f'{name} has an entry that {why}: "{entry}". Give each recipient '
                           f"as name@example.com or Name <name@example.com>, separated by commas.")
 
+    if sender:
+        stripped = _strip_comments(value)
+        if stripped is None:
+            raise refuse(value.strip(), "has an unclosed comment")
+        value = stripped
     chars = _outside_quotes(value)
     if chars is None:
         raise refuse(value.strip(), "has an unclosed quote")
@@ -250,12 +287,9 @@ def _parse_address_list(name: str, value: str, sender: bool = False) -> list[tup
         quoted = _QUOTED_STRING.fullmatch(display)
         if quoted:
             display = re.sub(r"\\(.)", r"\1", quoted.group(1), flags=re.S)
-        elif not sender and (
-                any(ch in "<>" for _, ch in _outside_quotes(display))
-                or any(_ADDR_SPEC.fullmatch(t) and t.lower() != addr.lower()
-                       for t in display.split())):
+        elif not sender and any(ch in display for ch in "@<>;,"):
             raise refuse(entry, "looks like more than one address (a missing comma?); "
-                                "quote a display name that holds an address")
+                                'quote a display name that holds "@", "<", ">", ";" or ","')
         if "=?" in display:
             from email.errors import HeaderParseError
             from email.header import decode_header, make_header

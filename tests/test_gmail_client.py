@@ -1400,10 +1400,19 @@ def test_reply_to_an_unusual_display_name_keeps_name_and_address(from_header, pa
 
 
 @pytest.mark.parametrize("from_header,pair", _ODD_FROMS)
-def test_a_user_supplied_cc_with_an_unusual_display_name_is_sent(from_header, pair):
+def test_a_user_supplied_cc_with_an_unusual_display_name(from_header, pair):
+    # Fix round 5: in a list the caller wrote, an unquoted name may not hold
+    # '@', '<', '>', ';' or ','; quoting it is the way to send such a name.
     client = make_client()
     client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
-    client.send_email("to@b.com", "Hello", "Body", cc=from_header)
+    if any(c in pair[0] for c in "@;"):
+        with pytest.raises(ValueError, match="^cc ") as exc:
+            client.send_email("to@b.com", "Hello", "Body", cc=from_header)
+        assert from_header in str(exc.value)
+        client._service.users.return_value.messages.return_value.send.assert_not_called()
+        client.send_email("to@b.com", "Hello", "Body", cc=f'"{pair[0]}" <{pair[1]}>')
+    else:
+        client.send_email("to@b.com", "Hello", "Body", cc=from_header)
     assert _recipients(_sent_raw(client), "Cc") == [pair]
 
 
@@ -1487,10 +1496,7 @@ def _recipients(raw: bytes, header: str) -> list[tuple[str, str]]:
 
 _PARSES = [
     ("José Núñez <j@x.com>, plain@x.com", [("José Núñez", "j@x.com"), ("", "plain@x.com")]),
-    ("John @ Acme <a@x.com>", [("John @ Acme", "a@x.com")]),
     ("Foo Bar [Ext] <a@x.com>", [("Foo Bar [Ext]", "a@x.com")]),
-    ("Jane@Company <j@x.com>", [("Jane@Company", "j@x.com")]),
-    ("Name; Co <a@x.com>", [("Name; Co", "a@x.com")]),
     ('"billing team"@example.org', [("", '"billing team"@example.org')]),
     ('Billing <"billing team"@example.org>', [("Billing", '"billing team"@example.org')]),
     ('"a\\"b"@x.com', [("", '"a\\"b"@x.com')]),
@@ -1503,8 +1509,10 @@ _PARSES = [
     ("=?UTF-8?B?Sm9zw6kgTsO6w7Fleg==?= <j@x.com>", [("José Núñez", "j@x.com")]),
     ("<a@x.com>", [("", "a@x.com")]),
     ("  a@x.com ,\tB <b@x.com>  ", [("", "a@x.com"), ("B", "b@x.com")]),
-    ("j@x.com <j@x.com>", [("j@x.com", "j@x.com")]),
     ('"a@x.com via Docs" <b@x.com>', [("a@x.com via Docs", "b@x.com")]),
+    ('"Name; Co" <a@x.com>, "John @ Acme" <b@x.com>', [("Name; Co", "a@x.com"), ("John @ Acme", "b@x.com")]),
+    ('"first@example.org; Second" <second@example.org>',
+     [("first@example.org; Second", "second@example.org")]),
     ("Bob <a@x.com>, Ann <b@y.org>, c@z.net",
      [("Bob", "a@x.com"), ("Ann", "b@y.org"), ("", "c@z.net")]),
 ]
@@ -1549,6 +1557,16 @@ _REFUSALS = [
     ("Bob <a@x.com> <b@x.com>", "Bob <a@x.com> <b@x.com>"),
     ("Bob <a@x.com> Ann <b@x.com>", "Bob <a@x.com> Ann <b@x.com>"),
     ("ok@x.com, a@x.com b@x.com", "a@x.com b@x.com"),
+    # fix round 5: no '@', '<', '>', ';' or ',' in an unquoted display name
+    ("first@example.org; Second <second@example.org>", "first@example.org; Second <second@example.org>"),
+    ("John @ Acme <a@x.com>", "John @ Acme <a@x.com>"),
+    ("Jane@Company <j@x.com>", "Jane@Company <j@x.com>"),
+    ("Name; Co <a@x.com>", "Name; Co <a@x.com>"),
+    ("j@x.com <j@x.com>", "j@x.com <j@x.com>"),
+    ("a > b <c@x.com>", "a > b <c@x.com>"),
+    ("ok@x.com, x;y <c@x.com>", "x;y <c@x.com>"),
+    # a comment is read only in the original sender's From header
+    ("alice@example.org (Alice Smith)", "alice@example.org (Alice Smith)"),
 ]
 
 
@@ -1577,8 +1595,8 @@ def _unfolded_header(raw: bytes, name: str) -> bytes:
 _E2E = {
     "to": ("José Núñez <j@x.com>, plain@x.com",
            [("José Núñez", "j@x.com"), ("", "plain@x.com")]),
-    "cc": ('"Doe, Jane" <d@x.com>, "billing team"@example.org, Name; Co <n@x.com>',
-           [("Doe, Jane", "d@x.com"), ("", '"billing team"@example.org'), ("Name; Co", "n@x.com")]),
+    "cc": ('"Doe, Jane" <d@x.com>, "billing team"@example.org, Foo Bar [Ext] <n@x.com>',
+           [("Doe, Jane", "d@x.com"), ("", '"billing team"@example.org'), ("Foo Bar [Ext]", "n@x.com")]),
     "bcc": ('Billing <"billing team"@example.org>, BOB@X.COM, o\'brien@x.ie',
             [("Billing", '"billing team"@example.org'), ("", "BOB@X.COM"), ("", "o'brien@x.ie")]),
 }
@@ -1664,3 +1682,84 @@ def test_parser_names_an_unclosed_quote():
     from gmail_client import _parse_address_list
     with pytest.raises(ValueError, match='^cc .*unclosed quote.*"Doe, Jane <d@x.com>'):
         _parse_address_list("cc", '"Doe, Jane <d@x.com>')
+
+
+
+# --- fix round 5 ---
+# (1) "first@example.org; Second <second@example.org>" reached only second@:
+#     an unquoted display name in a caller-written list may not hold '@', '<',
+#     '>', ';' or ','. (2) The original sender's From may carry RFC 5322
+#     comments; they are removed before parsing (a comment is never a name).
+
+_SENDER_PARSES = [
+    ("John @ Acme <a@x.com>", [("John @ Acme", "a@x.com")]),
+    ("Jane@Company <j@x.com>", [("Jane@Company", "j@x.com")]),
+    ("Name; Co <a@x.com>", [("Name; Co", "a@x.com")]),
+    ("j@x.com <j@x.com>", [("j@x.com", "j@x.com")]),
+    ("alice@example.org (Alice Smith)", [("", "alice@example.org")]),
+    ("Alice <alice@example.org> (Accounts)", [("Alice", "alice@example.org")]),
+    ("Alice <alice@example.com> (external sender)", [("Alice", "alice@example.com")]),
+    ("(lead) Alice (x) <alice@example.org>", [("Alice", "alice@example.org")]),
+    ("alice@example.org (Smith, Alice)", [("", "alice@example.org")]),
+    ("alice@example.org (A (nested) B)", [("", "alice@example.org")]),
+    ("alice@example.org (A \\) B \\( C)", [("", "alice@example.org")]),
+    ('"Al (x)" <alice@example.org>', [("Al (x)", "alice@example.org")]),
+    ('"billing team"@example.org (Billing)', [("", '"billing team"@example.org')]),
+]
+
+
+@pytest.mark.parametrize("value,pairs", _SENDER_PARSES)
+def test_sender_from_header_is_read_with_comments_removed(value, pairs):
+    from gmail_client import _parse_address_list
+    assert _parse_address_list("From", value, sender=True) == pairs
+
+
+@pytest.mark.parametrize("value", [
+    "alice@x (Alice Smith)",              # the address stays strictly checked
+    "alice@example.org (Alice",           # an unclosed comment
+    "Alice <alice@example.org> (A (B)",   # an unclosed nested comment
+    "Alice (x <alice@example.org>",
+])
+def test_sender_from_header_with_a_bad_address_or_comment_is_refused(value):
+    from gmail_client import _parse_address_list
+    with pytest.raises(ValueError, match="^From "):
+        _parse_address_list("From", value, sender=True)
+
+
+def test_cc_without_a_comma_before_a_named_entry_is_refused_and_nothing_is_sent():
+    client = make_client()
+    with pytest.raises(ValueError, match="^cc ") as exc:
+        client.send_email("to@b.com", "Hello", "Body",
+                          cc="first@example.org; Second <second@example.org>")
+    assert "first@example.org; Second <second@example.org>" in str(exc.value)
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("attachments", [None, [("file.txt", b"content")]])
+def test_cc_with_the_comma_reaches_both_recipients(attachments):
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email("to@b.com", "Hello", "Body", attachments=attachments,
+                      cc="first@example.org, Second <second@example.org>")
+    assert _recipients(_sent_raw(client), "Cc") == [("", "first@example.org"),
+                                                    ("Second", "second@example.org")]
+
+
+@pytest.mark.parametrize("attachments", [None, [("file.txt", b"content")]])
+@pytest.mark.parametrize("from_header,pair", [
+    ("alice@example.org (Alice Smith)", ("", "alice@example.org")),
+    ("Alice <alice@example.org> (Accounts)", ("Alice", "alice@example.org")),
+    ("Alice <alice@example.com> (external sender)", ("Alice", "alice@example.com")),
+])
+def test_reply_to_a_from_with_a_comment_reaches_exactly_the_sender(attachments, from_header, pair):
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr=from_header)
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    client.reply_to_thread("thr1", "body", attachments=attachments, cc="acct@b.com")
+    raw = _sent_raw(client)
+    assert raw.split(b"\n\n", 1)[0].count(b"multipart/mixed") == (1 if attachments else 0)
+    assert _recipients(raw, "To") == [pair]
+    assert _recipients(raw, "Cc") == [("", "acct@b.com")]
+    assert b"(" not in _unfolded_header(raw, "To")
