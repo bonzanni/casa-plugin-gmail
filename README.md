@@ -108,6 +108,8 @@ If `setup_gmail` returns a `redirect_uri` that doesn't match what's registered o
 
 ### Updating an already-connected install
 
+0.14.0 adds optional `cc` and `bcc` to `send_email` and `reply_to_thread`; sending already needed `gmail.send`, so no new sign-in is needed.
+
 0.13.0 adds the label, bulk and filter tools. Their Gmail permissions were already part of the sign-in (`gmail.modify` and `gmail.settings.basic`), so no new sign-in is needed.
 
 Updating the plugin on a working system does not disturb the connection, and does not need a re-authorization. The refresh token is kept in `CLAUDE_PLUGIN_DATA`, which is casa's persistent plugin-data directory for a role-assigned plugin — the update replaces the plugin artifact, and the credential is not in it. This plugin also declares a callback and **no triggers**, so an update re-mints no per-trigger secret that could reach the stored grant (a callback declaration carries no secret at all, and its consent ack survives an update that leaves `casa.callbacks` unchanged).
@@ -203,8 +205,8 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 | `download_attachment` | Download an attachment into Casa's handoff folder (kept 7 days), where other plugins can take it |
 | `save_attachment` | Permanently save a downloaded attachment under `saved/` |
 | `list_send_as` | List available SendAs aliases (includes verification status) |
-| `send_email` ⚠️ | Send new email (optional `from_address` for SendAs alias; requires the user's approval) |
-| `reply_to_thread` ⚠️ | Reply to thread (optional `from_address` for SendAs alias; requires the user's approval) |
+| `send_email` ⚠️ | Send new email (optional `cc` and `bcc`, comma-separated; optional `from_address` for SendAs alias; requires the user's approval) |
+| `reply_to_thread` ⚠️ | Reply to thread (optional `cc` and `bcc`, comma-separated; optional `from_address` for SendAs alias; requires the user's approval) |
 | `erase_gmail` ⚠️ | Casa's `casa.eraseTool`: revokes Gmail's access at Google, then deletes everything in the plugin's data directory. Run by casa at uninstall when you choose **Erase everything** |
 | `erase_gmail_data` ⚠️ | Casa's `casa.eraseDataOnlyTool`: deletes the sent log and saved attachments but keeps the sign-in. Run by casa at uninstall when you choose **Erase data, keep sign-ins** |
 

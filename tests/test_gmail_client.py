@@ -1236,3 +1236,80 @@ def test_delete_label_already_gone_returns_not_deleted():
     out = client.delete_label("Vanished")
     assert out["deleted"] is False and "not found" in out["reason"]
     _labels_api(client).delete.assert_not_called()
+
+
+# --- cc / bcc (0.14.0) ---
+
+def _sent_raw(client):
+    import base64
+    raw = client._service.users.return_value.messages.return_value.send.call_args.kwargs["body"]["raw"]
+    return base64.urlsafe_b64decode(raw + "=" * ((4 - len(raw) % 4) % 4))
+
+
+@pytest.mark.parametrize("attachments", [[], [("file.txt", b"content")]])
+def test_build_message_sets_cc_and_bcc(attachments):
+    client = make_client()
+    msg = client._build_message(body="b", attachments=attachments, to="to@b.com", subject="s",
+                                cc="acct@b.com, boss@b.com", bcc="archive@b.com")
+    assert msg["To"] == "to@b.com"
+    assert msg["Cc"] == "acct@b.com, boss@b.com"
+    assert msg["Bcc"] == "archive@b.com"
+
+
+@pytest.mark.parametrize("attachments", [[], [("file.txt", b"content")]])
+def test_build_message_omits_empty_cc_bcc(attachments):
+    client = make_client()
+    msg = client._build_message(body="b", attachments=attachments, to="to@b.com", subject="s")
+    assert "Cc" not in msg
+    assert "Bcc" not in msg
+
+
+def test_send_email_puts_cc_and_bcc_in_the_raw_message():
+    from email import message_from_bytes
+    client = make_client()
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "s"}
+    client.send_email("to@b.com", "Hello", "Body", cc="acct@b.com", bcc="archive@b.com")
+    sent = message_from_bytes(_sent_raw(client))
+    assert sent["To"] == "to@b.com"
+    assert sent["Cc"] == "acct@b.com"
+    # Gmail delivers to the Bcc header's recipients (users.messages.send).
+    assert sent["Bcc"] == "archive@b.com"
+
+
+def test_reply_sets_cc_header():
+    from email import message_from_bytes
+    client = make_client()
+    client._service.users.return_value.threads.return_value.get.return_value.execute.return_value = (
+        _make_thread_response(from_addr="alice@example.com", msg_id="<orig@mail>")
+    )
+    client._service.users.return_value.messages.return_value.send.return_value.execute.return_value = {"id": "r"}
+    client.reply_to_thread("thr1", "body", cc="acct@b.com", bcc="archive@b.com")
+    sent = message_from_bytes(_sent_raw(client))
+    assert sent["To"] == "alice@example.com"
+    assert sent["Cc"] == "acct@b.com"
+    assert sent["Bcc"] == "archive@b.com"
+    assert sent["In-Reply-To"] == "<orig@mail>"
+    assert sent["References"] == "<orig@mail>"
+
+
+_BREAKS = ["a@b.com\r\nBcc: evil@x.com", "a@b.com\nBcc: evil@x.com", "a@b.com\r", "a@b.com\n x"]
+
+
+@pytest.mark.parametrize("field", ["to", "cc", "bcc"])
+@pytest.mark.parametrize("value", _BREAKS)
+def test_send_email_refuses_a_line_break_in_an_address_field(field, value):
+    client = make_client()
+    args = {"to": "to@b.com", "cc": "", "bcc": ""} | {field: value}
+    with pytest.raises(ValueError, match=field):
+        client.send_email(args["to"], "Hello", "Body", cc=args["cc"], bcc=args["bcc"])
+    client._service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["cc", "bcc"])
+@pytest.mark.parametrize("value", _BREAKS)
+def test_reply_refuses_a_line_break_in_cc_or_bcc_before_reading_the_thread(field, value):
+    client = make_client()
+    with pytest.raises(ValueError, match=field):
+        client.reply_to_thread("thr1", "body", **{field: value})
+    client._service.users.return_value.threads.return_value.get.assert_not_called()
+    client._service.users.return_value.messages.return_value.send.assert_not_called()

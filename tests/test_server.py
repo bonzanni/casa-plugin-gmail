@@ -77,7 +77,7 @@ def test_send_email_passes_from_address_to_client(monkeypatch):
 
     server.send_email(to="to@b.com", subject="Hi", body="body", from_address="alias@workspace.example.com")
     mock_client.send_email.assert_called_once_with(
-        "to@b.com", "Hi", "body", [], from_address="alias@workspace.example.com"
+        "to@b.com", "Hi", "body", [], from_address="alias@workspace.example.com", cc="", bcc=""
     )
 
 
@@ -94,7 +94,7 @@ def test_send_email_passes_empty_from_address_to_client(monkeypatch):
 
     server.send_email(to="to@b.com", subject="Hi", body="body")
     mock_client.send_email.assert_called_once_with(
-        "to@b.com", "Hi", "body", [], from_address=""
+        "to@b.com", "Hi", "body", [], from_address="", cc="", bcc=""
     )
 
 
@@ -116,7 +116,7 @@ def test_reply_to_thread_passes_from_address_to_client(monkeypatch):
         from_address="alias@workspace.example.com",
     )
     mock_client.reply_to_thread.assert_called_once_with(
-        "thr1", "body", [], from_address="alias@workspace.example.com"
+        "thr1", "body", [], from_address="alias@workspace.example.com", cc="", bcc=""
     )
 
 
@@ -133,7 +133,44 @@ def test_reply_to_thread_passes_empty_from_address_to_client(monkeypatch):
 
     server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="body")
     mock_client.reply_to_thread.assert_called_once_with(
-        "thr1", "body", [], from_address=""
+        "thr1", "body", [], from_address="", cc="", bcc=""
+    )
+
+
+def _send_mocks(monkeypatch):
+    import server
+    mock_client = MagicMock()
+    mock_client.send_email.return_value = "sent-cc"
+    mock_client.reply_to_thread.return_value = "reply-cc"
+    mock_log = MagicMock()
+    mock_log.check.return_value = None
+    monkeypatch.setattr(server, "_client", mock_client)
+    monkeypatch.setattr(server, "_log", mock_log)
+    _setup_authenticated(monkeypatch)
+    return mock_client, mock_log
+
+
+def test_send_email_passes_cc_bcc_to_client(monkeypatch):
+    import server
+    mock_client, mock_log = _send_mocks(monkeypatch)
+    server.send_email(to="to@b.com", subject="Invoice 7", body="body", request_id="rid-1",
+                      cc="acct@b.com, boss@b.com", bcc="archive@b.com")
+    mock_client.send_email.assert_called_once_with(
+        "to@b.com", "Invoice 7", "body", [], from_address="",
+        cc="acct@b.com, boss@b.com", bcc="archive@b.com",
+    )
+    # The sent-log dedupe key is unchanged: request_id, to, subject.
+    mock_log.check.assert_called_once_with("rid-1", "to@b.com", "Invoice 7")
+    mock_log.record.assert_called_once_with("rid-1", "sent-cc", "to@b.com", "Invoice 7")
+
+
+def test_reply_to_thread_passes_cc_bcc_to_client(monkeypatch):
+    import server
+    mock_client, _ = _send_mocks(monkeypatch)
+    server.reply_to_thread(thread_id="thr1", display_subject="Re: Hello", body="body",
+                           cc="acct@b.com", bcc="archive@b.com")
+    mock_client.reply_to_thread.assert_called_once_with(
+        "thr1", "body", [], from_address="", cc="acct@b.com", bcc="archive@b.com",
     )
 
 
@@ -290,7 +327,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.13.0"
+    assert manifest["version"] == "0.14.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -1349,3 +1386,23 @@ def test_new_protected_summaries_are_the_designed_sentences():
     assert summaries["delete_filter"] == "Delete the Gmail filter: {description}"
     assert summaries["delete_label"] == ('Delete the Gmail label "{label}" (mail stays, '
                                          'the label comes off every message)')
+
+
+# ── v0.14.0: cc and bcc on send_email and reply_to_thread ──────────────────
+# cc and bcc are optional, so they cannot be summary placeholders (see above:
+# an absent one sends the operator the raw-arguments card for every plain
+# send). The sentence names them in words instead; Casa's approval card lists
+# every argument the call carries, a bcc included.
+
+def test_protected_summary_mentions_cc_bcc():
+    summaries = {e["name"]: e.get("summary") for e in _manifest()["casa"]["protectedTools"]}
+    assert summaries["send_email"] == "Send email to {to} (and to any cc or bcc listed): {subject}"
+    assert summaries["reply_to_thread"] == "Reply to: {display_subject} (and to any cc or bcc listed)"
+
+
+def test_send_and_reply_take_optional_cc_and_bcc():
+    import server
+    for name in ("send_email", "reply_to_thread"):
+        params = inspect.signature(getattr(server, name)).parameters
+        for field in ("cc", "bcc"):
+            assert params[field].default == "", (name, field)

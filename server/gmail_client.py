@@ -167,6 +167,15 @@ def _translate_error(e: HttpError) -> ValueError:
 BULK_CEILING = 5000
 
 
+def _refuse_header_breaks(**fields: str) -> None:
+    """A line break in an address field would end the header and start another
+    (a hidden Bcc, say), so it is refused before anything reaches Gmail."""
+    for name, value in fields.items():
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"{name} contains a line break; give the addresses "
+                             f"on one line, separated by commas.")
+
+
 class LabelNotFound(ValueError):
     """No label matches the given name or ID (as opposed to an ambiguous one)."""
 
@@ -670,13 +679,18 @@ class GmailClient:
         body: str,
         attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ) -> str:
+        _refuse_header_breaks(to=to, cc=cc, bcc=bcc, from_address=from_address)
         msg = self._build_message(
             to=to,
             subject=subject,
             body=body,
             attachments=attachments or [],
             from_address=from_address,
+            cc=cc,
+            bcc=bcc,
         )
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         try:
@@ -691,7 +705,10 @@ class GmailClient:
         body: str,
         attachments: list[tuple[str, bytes]] | None = None,
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ) -> str:
+        _refuse_header_breaks(cc=cc, bcc=bcc, from_address=from_address)
         try:
             thread = self._service.users().threads().get(
                 userId="me", id=thread_id, format="metadata",
@@ -716,6 +733,8 @@ class GmailClient:
             body=body,
             attachments=attachments or [],
             from_address=from_address,
+            cc=cc,
+            bcc=bcc,
         )
         msg["In-Reply-To"] = msg_id_header
         msg["References"] = f"{refs} {msg_id_header}".strip() if refs else msg_id_header
@@ -735,6 +754,8 @@ class GmailClient:
         to: str = "",
         subject: str = "",
         from_address: str = "",
+        cc: str = "",
+        bcc: str = "",
     ):
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
@@ -748,6 +769,11 @@ class GmailClient:
             msg["Subject"] = subject
             if from_address:
                 msg["From"] = from_address
+            if cc:
+                msg["Cc"] = cc
+            if bcc:
+                # Gmail delivers to the Bcc header's recipients (users.messages.send).
+                msg["Bcc"] = bcc
             msg.attach(MIMEText(body, "plain"))
             # (filename, bytes) pairs, already read through a guarded
             # descriptor by the caller — never a path to open here.
@@ -766,4 +792,9 @@ class GmailClient:
             msg["Subject"] = subject
             if from_address:
                 msg["From"] = from_address
+            if cc:
+                msg["Cc"] = cc
+            if bcc:
+                # Gmail delivers to the Bcc header's recipients (users.messages.send).
+                msg["Bcc"] = bcc
         return msg
