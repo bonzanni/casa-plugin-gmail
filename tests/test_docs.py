@@ -835,5 +835,5 @@ def test_readme_lists_every_served_tool():
     tools = _read(README).split("## Tools")[1].split("\n## ")[0]
     missing = [t for t in sorted(served) if f"| `{t}`" not in tools]
     assert not missing, f"README Tools table is missing {missing}"
-    assert "all twenty-two tools" in tools
+    assert "all twenty-three tools" in tools
     assert "all fourteen" not in tools

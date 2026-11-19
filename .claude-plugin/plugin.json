@@ -1,6 +1,6 @@
 {
   "name": "gmail",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Gmail integration for the agent — read, search, send, manage the user's inbox via per-user OAuth 2.0. Consent completes through casa's authorization-callback endpoint; the refresh token is persisted in plugin data.",
   "author": {"name": "Nicola Bonzanni", "url": "https://github.com/bonzanni"},
   "homepage": "https://github.com/bonzanni/casa-plugin-gmail",
@@ -19,6 +19,7 @@
       "mcp__plugin_gmail_gmail__manage_email",
       "mcp__plugin_gmail_gmail__list_attachments",
       "mcp__plugin_gmail_gmail__download_attachment",
+      "mcp__plugin_gmail_gmail__send_attachment_to_chat",
       "mcp__plugin_gmail_gmail__save_attachment",
       "mcp__plugin_gmail_gmail__list_send_as",
       "mcp__plugin_gmail_gmail__send_email",
@@ -35,7 +36,7 @@
       "mcp__plugin_gmail_gmail__delete_filter"
     ],
     "profiles": {
-      "read": ["search_emails", "get_email", "get_thread", "list_attachments", "download_attachment", "list_send_as", "list_labels", "list_filters"]
+      "read": ["search_emails", "get_email", "get_thread", "list_attachments", "download_attachment", "send_attachment_to_chat", "list_send_as", "list_labels", "list_filters"]
     },
     "eraseTool": "erase_gmail",
     "eraseDataOnlyTool": "erase_gmail_data",
@@ -60,6 +61,8 @@
         "manage_email": {"result": "safe"},
         "list_attachments": {"result": "safe"},
         "download_attachment": {"result": "safe"},
+        "send_attachment_to_chat": {"result": "capability", "provides": ["file"],
+                                    "delivers": {"file": "operator_file"}, "filename": true},
         "save_attachment": {"result": "safe"},
         "list_send_as": {"result": "safe"},
         "send_email": {"result": "safe"},

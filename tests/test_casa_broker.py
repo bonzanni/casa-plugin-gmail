@@ -196,3 +196,34 @@ class DepositTests(unittest.TestCase):
                 self.sock = os.environ[casa_broker.ENV_SOCKET] = os.path.join(d.name, "s")
                 self.serve(answer)
                 self.assertEqual(self.refused(), "unrecognized_error")
+
+
+class FileDepositTests(unittest.TestCase):
+    """An `operator_file` deposit: the staged path, the media kind and the
+    name to send it under (Casa >= 0.344.0)."""
+    setUp = DepositTests.setUp
+    serve = DepositTests.serve
+
+    def test_a_file_deposit_carries_kind_and_filename(self):
+        broker = self.serve(lambda body: _json({"reference": REFERENCE}))
+        ref = casa_broker.deposit_file("file", "/data/plugin-outbox/gmail-ab.pdf",
+                                       kind="document", caption="", filename="a.pdf")
+        self.assertEqual(ref, REFERENCE)
+        [(method, path, body)] = broker.requests
+        self.assertEqual((method, path), ("POST", "/internal/broker/deposit"))
+        self.assertEqual(body, {"client": CLIENT, "slot": "file",
+                                "value": "/data/plugin-outbox/gmail-ab.pdf",
+                                "kind": "document", "filename": "a.pdf"})
+
+    def test_a_caption_is_sent_when_there_is_one(self):
+        broker = self.serve(lambda body: _json({"reference": REFERENCE}))
+        casa_broker.deposit_file("file", "/o/x.zip", kind="zip", caption="From Ann",
+                                 filename="x.zip")
+        self.assertEqual(broker.requests[0][2]["caption"], "From Ann")
+
+    def test_casas_refusal_code_is_raised(self):
+        self.serve(lambda body: _json({"error": "bad_filename"}))
+        with self.assertRaises(casa_broker.DepositFailed) as caught:
+            casa_broker.deposit_file("file", "/o/x.zip", kind="zip", caption="",
+                                     filename="x.zip")
+        self.assertEqual(caught.exception.code, "bad_filename")

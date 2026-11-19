@@ -1,4 +1,5 @@
-"""Hand the Google sign-in link to Casa, which posts it in the user's chat.
+"""Hand the Google sign-in link, or a file, to Casa, which posts it in the
+user's chat.
 
 Casa >= 0.318.0's result contract lets a `capability` tool declare that a slot
 it provides is `delivers`-ed as an `operator_link`. The tool
@@ -22,6 +23,11 @@ it is not a single printable line or contains `://` or `www.`. It also refuses
 a label with text that reads as a domain. This plugin's label and caption are
 fixed literals, checked against those rules by the tests.
 
+A file goes the same way as an `operator_file` (Casa >= 0.339.0; the
+`filename` member >= 0.344.0): the value is the path of a file staged in Casa's
+plugin outbox, with `"kind"` (a Casa media kind) and optionally `"filename"`
+and `"caption"`.
+
 Nothing Casa sends back is echoed: a reference must have Casa's exact shape,
 and an error must look like one of Casa's codes, or it is reported by a fixed
 label. Standard library only.
@@ -44,7 +50,7 @@ _CODE_RE = re.compile(r"^[a-z][a-z_]{0,39}$")
 
 
 class DepositFailed(Exception):
-    """The link was not accepted for delivery. `code` is a Casa error code or
+    """The link or file was not accepted for delivery. `code` is a Casa error code or
     one of this module's own fixed labels, never text Casa or the transport
     wrote."""
 
@@ -70,7 +76,25 @@ class _UnixHTTP(http.client.HTTPConnection):
 
 
 def deposit_link(slot: str, url: str, *, label: str, caption: str) -> str:
-    """Deposit `url` in `slot` and return Casa's reference.
+    """Deposit `url` in `slot` and return Casa's reference. Raises
+    `DepositFailed` as `_deposit` does."""
+    return _deposit({"slot": slot, "value": url, "label": label, "caption": caption})
+
+
+def deposit_file(slot: str, path: str, *, kind: str, caption: str, filename: str) -> str:
+    """Deposit a file staged in Casa's plugin outbox as an `operator_file`
+    (Casa >= 0.344.0): Casa claims `path`, checks it against media `kind` and
+    sends it to the user's chat as `filename`, with `caption` (sent only when
+    non-empty) beneath Casa's own label. Raises `DepositFailed` as `_deposit`
+    does."""
+    fields = {"slot": slot, "value": path, "kind": kind, "filename": filename}
+    if caption:
+        fields["caption"] = caption
+    return _deposit(fields)
+
+
+def _deposit(fields: dict) -> str:
+    """POST one deposit and return Casa's reference.
 
     Raises `DepositFailed` with: `broker_env_missing` when Casa gave this
     server no broker; `broker_unreachable:<ExceptionClass>` on a transport
@@ -82,8 +106,7 @@ def deposit_link(slot: str, url: str, *, label: str, caption: str) -> str:
     client = os.environ.get(ENV_CLIENT, "")
     if not path or not client:
         raise DepositFailed("broker_env_missing")
-    body = {"client": client, "slot": slot, "value": url,
-            "label": label, "caption": caption}
+    body = {"client": client, **fields}
     conn = _UnixHTTP(path)
     try:
         conn.request("POST", DEPOSIT_ROUTE,
