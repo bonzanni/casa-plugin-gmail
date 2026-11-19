@@ -7,7 +7,7 @@ Gives the agent (casa's resident assistant) full Gmail access on the user's beha
 - Google Cloud project with Gmail API enabled
 - An OAuth 2.0 client of type **Web application** — not Desktop app (see below). The consent screen's **user type** depends on your account, and only one of the two is ever selectable: see Step 2.
 - A casa deployment with `public_url` set to a public `https://` origin, and the plugin assigned to an agent that can reach it (Step 3)
-- **Casa 0.338.0 or later.** An older Casa either refuses this plugin's manifest or lacks the sign-in link delivery, the two-choice erase at uninstall or the `read` profile described below.
+- **Casa 0.344.0 or later.** An older Casa either refuses this plugin's manifest or lacks the sign-in link delivery, the two-choice erase at uninstall, the `read` profile described below or the delivery of an attachment into the chat.
 - **An `amd64` Home Assistant host.** `server/vendor/` holds compiled modules for CPython 3.11 on linux x86_64 only, so on `aarch64` the plugin's server cannot start (see License).
 
 ### Why the OAuth client must be a Web application client
@@ -108,7 +108,7 @@ If `setup_gmail` returns a `redirect_uri` that doesn't match what's registered o
 
 ### Updating an already-connected install
 
-0.14.0 adds optional `cc` and `bcc` to `send_email` and `reply_to_thread`; sending already needed `gmail.send`, so no new sign-in is needed.
+0.14.0 adds optional `cc` and `bcc` to `send_email` and `reply_to_thread`; sending already needed `gmail.send`, so no new sign-in is needed. 0.15.0 adds `send_attachment_to_chat`, which reads with the access already granted and needs Casa 0.344.0.
 
 0.13.0 adds the label, bulk and filter tools. Their Gmail permissions were already part of the sign-in (`gmail.modify` and `gmail.settings.basic`), so no new sign-in is needed.
 
@@ -135,6 +135,7 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 | `GMAIL_USER_EMAIL` | Yes | the user's Gmail address |
 | `CLAUDE_PLUGIN_DATA` | Provided by Casa | Plugin-writable data directory (token + saved attachments) |
 | `CASA_HANDOFF_DIR` | Casa (default `/data/handoff`) | Casa's shared file handoff folder: downloads land here, and attachments may come from here |
+| `CASA_PLUGIN_OUTBOX_DIR` | Casa (default `/data/plugin-outbox`) | Casa's plugin outbox: an attachment bound for the chat is staged here and Casa takes it |
 
 ## Troubleshooting
 
@@ -203,6 +204,7 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 | `delete_filter` ⚠️ | Delete a filter; the description from `list_filters` must match it, or nothing is deleted (requires the user's approval) |
 | `list_attachments` | List attachments on an email |
 | `download_attachment` | Download an attachment into Casa's handoff folder (kept 7 days), where other plugins can take it |
+| `send_attachment_to_chat` | Send an attachment to the user as a file in their chat. Casa posts it: PDFs, JPEG/PNG images, plain-text and zip files as they are, any other type inside a zip; at most 20 MB |
 | `save_attachment` | Permanently save a downloaded attachment under `saved/` |
 | `list_send_as` | List available SendAs aliases (includes verification status) |
 | `send_email` ⚠️ | Send new email (optional `cc` and `bcc`, comma-separated; optional `from_address` for SendAs alias; requires the user's approval) |
@@ -210,27 +212,30 @@ Casa removes the plugin only when the eraser reports the erasure complete. If Go
 | `erase_gmail` ⚠️ | Casa's `casa.eraseTool`: revokes Gmail's access at Google, then deletes everything in the plugin's data directory. Run by casa at uninstall when you choose **Erase everything** |
 | `erase_gmail_data` ⚠️ | Casa's `casa.eraseDataOnlyTool`: deletes the sent log and saved attachments but keeps the sign-in. Run by casa at uninstall when you choose **Erase data, keep sign-ins** |
 
-Every tool except `setup_gmail` is declared `{"result": "safe"}` in `casa.resultContract`:
+Every tool except `setup_gmail` and `send_attachment_to_chat` is declared `{"result": "safe"}` in `casa.resultContract`:
 Casa refuses, before it runs, any tool missing from that declaration, so a new tool must be
 added there too. `setup_gmail` is declared a `capability` that provides `auth_url` and
 `delivers` it as an `operator_link`: it deposits the sign-in link with casa's broker, and casa
 posts it in the chat you asked from and tells the agent whether it arrived. So the link never
-passes through the agent, and never lands in a task topic.
+passes through the agent, and never lands in a task topic. `send_attachment_to_chat` is a
+`capability` too: it provides `file`, delivered as an `operator_file`. Casa's `send_media`
+sends only files in Casa's plugin outbox, not the handoff folder `download_attachment` writes
+to, so this tool stages the attachment in the outbox and Casa claims and posts it.
 
 The manifest declares one access profile, `read`: `search_emails`,
-`get_email`, `get_thread`, `list_attachments`, `download_attachment`, `list_send_as`,
-`list_labels` and `list_filters`.
+`get_email`, `get_thread`, `list_attachments`, `download_attachment`,
+`send_attachment_to_chat`, `list_send_as`, `list_labels` and `list_filters`.
 An agent assigned Gmail with that profile can search and read mail, list labels and filters,
-and download attachments, and Casa denies it the other fourteen tools: sending, replying,
+download attachments and send one to the chat, and Casa denies it the other fourteen tools: sending, replying,
 archiving, trashing, marking or labelling mail (one at a time or in bulk), changing labels or
 filters, saving attachments, the erasers, and sign-in setup. An assignment without a
 profile gets every tool, as before. Casa sets a profile only on a new assignment, so
 narrowing an existing one means unassigning and assigning again with `profile="read"`.
-`casa.provides_tools` lists all twenty-two tools by their full names. Casa requires the list
+`casa.provides_tools` lists all twenty-three tools by their full names. Casa requires the list
 once a profile is declared and checks that it names every tool the profile lists, but it
 does not check that the list is complete. The completeness matters, though: the tools Casa
 hides from a read-profiled agent are the ones in this list and not in the profile, and the
-plugin's own tests pin all twenty-two.
+plugin's own tests pin all twenty-three.
 
 ⚠️ Protected tools — require tap-approval from the user before execution.
 

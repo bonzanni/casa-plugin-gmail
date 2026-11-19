@@ -1,7 +1,13 @@
+import contextlib
+import io
 import json
 import os
+import re
+import secrets
 import sys
+import tempfile
 import time
+import zipfile
 
 from mcp.server.fastmcp import FastMCP
 
@@ -665,7 +671,7 @@ def list_attachments(message_id: str) -> str:
 
 @mcp.tool()
 def download_attachment(message_id: str, attachment_id: str, max_bytes: int = 10485760) -> str:
-    """Download an email attachment into Casa's handoff folder and return its path, under the attachment's own filename. Other plugins can take the file from that path (e.g. to store an invoice), and send_email can attach it. Kept 7 days. Files over 25 MB are refused whatever max_bytes says."""
+    """Download an email attachment into Casa's handoff folder and return its path, under the attachment's own filename. Other plugins can take the file from that path (e.g. to store an invoice), and send_email can attach it. To give the user the file in their chat, call send_attachment_to_chat instead. Kept 7 days. Files over 25 MB are refused whatever max_bytes says."""
     _require_auth()
     att_meta = _client.find_attachment(message_id, attachment_id)
     size = att_meta["size_bytes"]
@@ -696,6 +702,116 @@ def save_attachment(cached_path: str, destination: str, overwrite: bool = False)
     _require_auth()
     path = _att.save_attachment(cached_path, destination, overwrite)
     return _ok({"path": path})
+
+
+# ── An attachment into the user's chat: delivered by Casa ──────────────────
+#
+# Casa's `send_media` sends only files in its plugin outbox, never a handoff
+# path, so the path `download_attachment` returns cannot reach the chat.
+# `send_attachment_to_chat` stages the bytes in the outbox and deposits the
+# path as an `operator_file` (Casa >= 0.344.0); Casa claims the file, checks
+# it against the media kind and posts it. The tables below copy Casa's
+# `media_policies.py`: a file passes only if its extension, size and content
+# all fit a kind, and anything that fits none is sent zipped.
+
+FILE_SLOT = "file"
+OUTBOX_ENV = "CASA_PLUGIN_OUTBOX_DIR"
+DEFAULT_OUTBOX = "/data/plugin-outbox"
+_MB = 1024 * 1024
+CHAT_MAX_BYTES = 20 * _MB
+CHAT_KINDS = {                      # kind: (extensions, size cap)
+    "document": ((".pdf",), 20 * _MB),
+    "photo": ((".jpg", ".jpeg", ".png"), 10 * _MB),
+    "text": ((".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml"), 5 * _MB),
+    "zip": ((".zip",), 20 * _MB),
+}
+_TEXT_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_deposit_file = casa_broker.deposit_file     # test seam
+
+
+def _fits_kind(kind: str, data: bytes) -> bool:
+    """Casa's content check for a media kind."""
+    if kind == "document":
+        return data.startswith(b"%PDF-")
+    if kind == "photo":
+        return data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+    if kind == "zip":
+        return (data.startswith(b"PK\x03\x04") and len(data) >= 30) or (
+            data.startswith(b"PK\x05\x06") and len(data) >= 22)
+    try:
+        return bool(data) and _TEXT_FORBIDDEN.search(data.decode("utf-8")) is None
+    except UnicodeDecodeError:
+        return False
+
+
+def _chat_form(name: str, data: bytes) -> tuple[str, str, bytes]:
+    """``(kind, name, bytes)`` as the chat gets it: the file itself when Casa
+    has a kind for it, else a zip holding it."""
+    ext = os.path.splitext(name)[1].lower()
+    for kind, (extensions, cap) in CHAT_KINDS.items():
+        if ext in extensions and len(data) <= cap and _fits_kind(kind, data):
+            return kind, name, data
+    packed = io.BytesIO()
+    with zipfile.ZipFile(packed, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, data)
+    return "zip", name + ".zip", packed.getvalue()
+
+
+def _stage_in_outbox(data: bytes, ext: str) -> str:
+    """Write ``data`` into Casa's plugin outbox under a fresh name and return
+    the path. Written as a ``.part`` file and renamed, so Casa never claims a
+    half-written file."""
+    outbox = os.environ.get(OUTBOX_ENV) or DEFAULT_OUTBOX
+    try:
+        fd, tmp = tempfile.mkstemp(dir=outbox, prefix=".gmail-", suffix=".part")
+    except OSError as exc:
+        raise ValueError(
+            f"Casa's plugin outbox {outbox} cannot be written ({exc.strerror}); "
+            "nothing was sent.") from None
+    path = os.path.join(outbox, f"gmail-{secrets.token_hex(8)}{ext}")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise ValueError(
+            f"Casa's plugin outbox {outbox} cannot be written ({exc.strerror}); "
+            "nothing was sent.") from None
+    return path
+
+
+@mcp.tool()
+def send_attachment_to_chat(message_id: str, attachment_id: str, caption: str = "") -> str:
+    """Send an email attachment to the user as a file in their chat; Casa posts it. This is the way to hand the user an attachment: Casa's send_media does not take the path download_attachment returns. attachment_id comes from list_attachments. PDFs, JPEG and PNG images, plain-text and zip files arrive as they are; any other type arrives inside a zip. At most 20 MB. caption: an optional single short line."""
+    _require_auth()
+    att_meta = _client.find_attachment(message_id, attachment_id)
+    too_large = ("Attachment is larger than 20 MB, the most Casa can send to the chat; "
+                 "nothing was sent.")
+    if att_meta["size_bytes"] > CHAT_MAX_BYTES:
+        raise ValueError(too_large)
+    data = _client.get_attachment_data(message_id, att_meta["gmail_attachment_id"])
+    name = casa_handoff.clean_filename(
+        att_meta["filename"], f"attachment_{attachment_id}"[:100])
+    kind, sent_as, payload = _chat_form(name, data)
+    if len(payload) > CHAT_MAX_BYTES:
+        raise ValueError(too_large)
+    path = _stage_in_outbox(payload, os.path.splitext(sent_as)[1].lower())
+    try:
+        reference = _deposit_file(FILE_SLOT, path, kind=kind, caption=caption,
+                                  filename=sent_as)
+    except casa_broker.DepositFailed as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise ValueError(
+            f"Casa did not accept the file for the chat ({exc.code}); nothing was sent."
+            + (" The caption must be one short line." if exc.code == "bad_caption" else "")
+        ) from None
+    return _ok({FILE_SLOT: reference, "filename": att_meta["filename"],
+                "sent_as": sent_as, "kind": kind})
 
 
 # ── SendAs ─────────────────────────────────────────────────────────────────

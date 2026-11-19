@@ -333,7 +333,7 @@ def test_manifest_declares_the_callback_and_no_stale_protected_tool():
     names = [t["name"] for t in manifest["casa"]["protectedTools"]]
     assert "gmail_auth_complete" not in names
     assert "gmail_auth_collect" not in names        # must stay unprotected
-    assert manifest["version"] == "0.14.0"
+    assert manifest["version"] == "0.15.0"
 
 
 # ── v0.7.0: casa.resultContract — Casa >= 0.290.0 refuses undeclared tools ──
@@ -373,7 +373,8 @@ def test_manifest_result_contract_covers_exactly_the_non_setup_tools():
 # the deny list Casa builds from (provides_tools - profile), so it lists all.
 
 _READ_TOOLS = ["search_emails", "get_email", "get_thread", "list_attachments",
-               "download_attachment", "list_send_as", "list_labels", "list_filters"]
+               "download_attachment", "send_attachment_to_chat", "list_send_as",
+               "list_labels", "list_filters"]
 
 
 def _qualified(tool):
@@ -390,7 +391,7 @@ def test_manifest_provides_every_served_tool_fully_qualified():
     for tool in _registered_tool_names():
         expected |= _qualified(tool)
     assert set(declared) == expected
-    assert len(declared) == 22
+    assert len(declared) == 23
 
 
 def test_manifest_read_profile_is_exactly_the_tools_that_only_read():
@@ -422,8 +423,9 @@ def test_manifest_profiles_pass_casas_shape_rules():
             assert _qualified(t) <= set(casa["provides_tools"])
 
 
-def test_manifest_result_contract_entries_are_safe_except_the_sign_in_link():
-    """Every entry but setup_gmail's is exactly {"result": "safe"}. setup_gmail
+def test_manifest_result_contract_entries_are_safe_except_the_two_casa_delivers():
+    """Every entry but setup_gmail's and send_attachment_to_chat's (pinned
+    with its tests) is exactly {"result": "safe"}. setup_gmail
     is the one tool that makes a link, and Casa delivers it:
     a capability providing exactly `auth_url`, delivered as an operator link,
     consuming nothing -- the only capability shape Casa accepts on a setup tool."""
@@ -433,8 +435,8 @@ def test_manifest_result_contract_entries_are_safe_except_the_sign_in_link():
         "delivers": {"auth_url": "operator_link"}}
     import server
     assert server.AUTH_SLOT == "auth_url"
-    assert all(entry == {"result": "safe"}
-               for name, entry in tools.items() if name != "setup_gmail")
+    assert all(entry == {"result": "safe"} for name, entry in tools.items()
+               if name not in ("setup_gmail", "send_attachment_to_chat"))
 
 
 # Casa's acceptance rules for a delivered link's label and caption
@@ -1509,3 +1511,165 @@ def test_a_legacy_entry_does_not_match_a_call_with_cc_or_bcc(monkeypatch, tmp_pa
                                        **{field: "acct@b.com"}))
     assert out["already_sent"] is False and send.call_count == 1
     assert json.loads(log_path.read_text())["r1"][field] == ["acct@b.com"]
+
+
+# ── v0.15.0: an attachment into the user's chat, delivered by Casa ─────────
+# Casa's send_media takes only files in its plugin outbox, never a handoff
+# path, so a downloaded attachment could not reach the chat. This tool stages
+# the file in the outbox and deposits it as an `operator_file`; Casa posts it.
+
+class _FileBroker:
+    def __init__(self):
+        self.deposits = []
+        self.refuse = None
+
+    def __call__(self, slot, path, *, kind, caption, filename):
+        import casa_broker
+        if self.refuse is not None:
+            raise casa_broker.DepositFailed(self.refuse)
+        self.deposits.append({"slot": slot, "path": path, "kind": kind,
+                              "caption": caption, "filename": filename,
+                              "bytes": Path(path).read_bytes()})
+        return "casa-cap-%032x" % len(self.deposits)
+
+
+@pytest.fixture
+def outbox(tmp_path, monkeypatch):
+    import server
+    root = tmp_path / "outbox"
+    root.mkdir()
+    monkeypatch.setenv(server.OUTBOX_ENV, str(root))
+    return root
+
+
+@pytest.fixture
+def file_broker(monkeypatch):
+    import server
+    b = _FileBroker()
+    monkeypatch.setattr(server, "_deposit_file", b)
+    return b
+
+
+def _chat_att(monkeypatch, tmp_path, name, data, size=None):
+    mc = _att_client(monkeypatch, tmp_path, size=len(data) if size is None else size,
+                     data=data)
+    mc.find_attachment.return_value["filename"] = name
+    return mc
+
+
+def test_a_pdf_attachment_is_staged_in_the_outbox_and_deposited_as_a_document(
+        monkeypatch, tmp_path, outbox, file_broker):
+    import server
+    pdf = b"%PDF-1.7 body"
+    mc = _chat_att(monkeypatch, tmp_path, "PEP-verklaring.pdf", pdf)
+    out = json.loads(server.send_attachment_to_chat("m1", "a1", caption="From Jolanda"))
+    mc.get_attachment_data.assert_called_once_with("m1", "g1")
+    [d] = file_broker.deposits
+    assert (d["slot"], d["kind"], d["filename"], d["caption"], d["bytes"]) == (
+        "file", "document", "PEP-verklaring.pdf", "From Jolanda", pdf)
+    # Casa claims a file only when it lies directly in the outbox, and checks
+    # the staged name's extension against the kind as well as the sent name's.
+    assert os.path.dirname(d["path"]) == str(outbox)
+    assert d["path"].endswith(".pdf")
+    assert os.listdir(outbox) == [os.path.basename(d["path"])]
+    assert _REF_RE.fullmatch(out["file"])
+    assert out["sent_as"] == "PEP-verklaring.pdf"
+
+
+@pytest.mark.parametrize("name, data, kind", [
+    ("scan.JPG", b"\xff\xd8\xff\xe0jpeg", "photo"),
+    ("shot.png", b"\x89PNG\r\n\x1a\nrest", "photo"),
+    ("export.csv", "a;b\nc;dé\n".encode(), "text"),
+    ("bundle.zip", b"PK\x03\x04" + b"\0" * 26, "zip"),
+], ids=["jpg", "png", "csv", "zip"])
+def test_kinds_casa_sends_as_they_are(monkeypatch, tmp_path, outbox, file_broker,
+                                      name, data, kind):
+    import server
+    _chat_att(monkeypatch, tmp_path, name, data)
+    server.send_attachment_to_chat("m1", "a1")
+    [d] = file_broker.deposits
+    assert (d["kind"], d["filename"], d["bytes"], d["caption"]) == (kind, name, data, "")
+    assert d["path"].endswith(os.path.splitext(name)[1].lower())
+
+
+@pytest.mark.parametrize("name, data", [
+    ("offerte.docx", b"PK\x03\x04" + b"word" * 10),      # a type Casa has no kind for
+    ("broken.pdf", b"<html>not a pdf</html>"),            # the name lies about the bytes
+    ("latin1.txt", b"caf\xe9"),                           # not UTF-8
+    ("no extension", b"data"),
+    ("huge.png", b"\x89PNG\r\n\x1a\n" + b"\0" * (10 * 1024 * 1024)),   # over photo's cap
+], ids=["docx", "not-a-pdf", "not-utf8", "no-extension", "photo-over-cap"])
+def test_anything_else_arrives_zipped_under_its_own_name(
+        monkeypatch, tmp_path, outbox, file_broker, name, data):
+    import io
+    import zipfile
+    import server
+    _chat_att(monkeypatch, tmp_path, name, data)
+    out = json.loads(server.send_attachment_to_chat("m1", "a1"))
+    [d] = file_broker.deposits
+    assert (d["kind"], d["filename"]) == ("zip", name + ".zip")
+    assert d["path"].endswith(".zip")
+    with zipfile.ZipFile(io.BytesIO(d["bytes"])) as z:
+        assert z.namelist() == [name]
+        assert z.read(name) == data
+    assert out["sent_as"] == name + ".zip"
+
+
+def test_over_20_mb_is_refused_before_it_is_downloaded(
+        monkeypatch, tmp_path, outbox, file_broker):
+    import server
+    mc = _chat_att(monkeypatch, tmp_path, "big.pdf", b"%PDF-", size=20 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match="20 MB"):
+        server.send_attachment_to_chat("m1", "a1")
+    mc.get_attachment_data.assert_not_called()
+    assert file_broker.deposits == [] and os.listdir(outbox) == []
+
+
+def test_a_file_casa_refuses_leaves_nothing_staged(
+        monkeypatch, tmp_path, outbox, file_broker):
+    import server
+    _chat_att(monkeypatch, tmp_path, "a.pdf", b"%PDF-1")
+    file_broker.refuse = "bad_caption"
+    with pytest.raises(ValueError, match="bad_caption") as caught:
+        server.send_attachment_to_chat("m1", "a1", caption="x\ny")
+    assert "nothing was sent" in str(caught.value)
+    assert os.listdir(outbox) == []
+
+
+def test_no_outbox_is_said_plainly(monkeypatch, tmp_path, file_broker):
+    import server
+    monkeypatch.setenv(server.OUTBOX_ENV, str(tmp_path / "absent"))
+    _chat_att(monkeypatch, tmp_path, "a.pdf", b"%PDF-1")
+    with pytest.raises(ValueError, match="outbox"):
+        server.send_attachment_to_chat("m1", "a1")
+    assert file_broker.deposits == []
+
+
+def test_the_kind_rules_are_casas(monkeypatch):
+    """Extensions, caps and content checks are copied from Casa's
+    media_policies.py; where the checkout is present, compare them."""
+    import importlib.util
+    import server
+    src = Path.home() / "Projects/ha-casa-app/casa/rootfs/opt/casa/media_policies.py"
+    if not src.exists():
+        pytest.skip("no Casa checkout")
+    spec = importlib.util.spec_from_file_location("casa_media_policies", src)
+    casa = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(casa)
+    for kind, (exts, cap) in server.CHAT_KINDS.items():
+        policy = casa.MEDIA_POLICIES[kind]
+        assert set(exts) <= policy.extensions and cap == policy.size_cap
+    samples = [b"", b"%PDF-1", b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"PK\x03\x04",
+               b"PK\x03\x04" + b"\0" * 26, b"PK\x05\x06" + b"\0" * 18, b"plain\n",
+               b"caf\xe9", b"esc\x1b[0m", b"\xef\xbb\xbfbom"]
+    for kind in server.CHAT_KINDS:
+        for s in samples:
+            assert server._fits_kind(kind, s) == casa.MEDIA_POLICIES[kind].accepts(s), (kind, s)
+
+
+def test_manifest_declares_the_chat_file_as_a_delivered_operator_file():
+    import server
+    entry = _manifest()["casa"]["resultContract"]["tools"]["send_attachment_to_chat"]
+    assert entry == {"result": "capability", "provides": ["file"],
+                     "delivers": {"file": "operator_file"}, "filename": True}
+    assert server.FILE_SLOT == "file"
