@@ -15,7 +15,7 @@ assistant's context, and never the chat or topic the assistant happens to be in.
 Protocol (Casa `result_broker.py`, 0.318.0):
 
     POST /internal/broker/deposit
-         {"client", "slot", "value", "caption"?, "label"?}
+         {"client", "slot", "value", "caption"?, "label"?, "tool_use_id"?}
       -> {"reference": "casa-cap-<32 hex>"} | {"error": "<code>"}
 
 Casa refuses a label over 40 characters, a caption over 200, and either one if
@@ -28,9 +28,16 @@ A file goes the same way as an `operator_file` (Casa >= 0.339.0; the
 plugin outbox, with `"kind"` (a Casa media kind) and optionally `"filename"`
 and `"caption"`.
 
+Every deposit made while a tool call is served names that call: Claude Code
+sends the call's id in the request's metadata (`_meta["claudecode/toolUseId"]`)
+and the body gains `"tool_use_id": <id>`. With no id (an older Claude Code, or
+a call made with no model) the member is left out and the body is as above.
+Casa versions that do not read it ignore it.
+
 Nothing Casa sends back is echoed: a reference must have Casa's exact shape,
 and an error must look like one of Casa's codes, or it is reported by a fixed
-label. Standard library only.
+label. Standard library only, apart from reading the call id from the `mcp`
+server serving the call.
 """
 from __future__ import annotations
 
@@ -47,6 +54,8 @@ DEPOSIT_ROUTE = "/internal/broker/deposit"
 TIMEOUT_S = 10.0
 MAX_RESPONSE_BYTES = 64 * 1024
 _CODE_RE = re.compile(r"^[a-z][a-z_]{0,39}$")
+CALL_ID_KEY = "claudecode/toolUseId"
+MAX_CALL_ID_CHARS = 128
 
 
 class DepositFailed(Exception):
@@ -75,6 +84,24 @@ class _UnixHTTP(http.client.HTTPConnection):
         self.sock = sock
 
 
+def call_id() -> str | None:
+    """The id of the tool call this process is serving, or None.
+
+    Read from the request context the `mcp` server keeps for the call being
+    handled (a tool runs inside it), at the moment of asking. Only a non-empty
+    string of at most 128 characters is an id; anything else, no call being
+    served, or any failure to read it gives None."""
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        meta = request_ctx.get().meta
+        value = (meta.model_extra or {}).get(CALL_ID_KEY) if meta else None
+    except Exception:                            # noqa: BLE001 — no id, no harm
+        return None
+    if isinstance(value, str) and 0 < len(value) <= MAX_CALL_ID_CHARS:
+        return value
+    return None
+
+
 def deposit_link(slot: str, url: str, *, label: str, caption: str) -> str:
     """Deposit `url` in `slot` and return Casa's reference. Raises
     `DepositFailed` as `_deposit` does."""
@@ -94,7 +121,8 @@ def deposit_file(slot: str, path: str, *, kind: str, caption: str, filename: str
 
 
 def _deposit(fields: dict) -> str:
-    """POST one deposit and return Casa's reference.
+    """POST one deposit, naming the call being served when there is one, and
+    return Casa's reference.
 
     Raises `DepositFailed` with: `broker_env_missing` when Casa gave this
     server no broker; `broker_unreachable:<ExceptionClass>` on a transport
@@ -107,6 +135,9 @@ def _deposit(fields: dict) -> str:
     if not path or not client:
         raise DepositFailed("broker_env_missing")
     body = {"client": client, **fields}
+    tool_use_id = call_id()
+    if tool_use_id is not None:
+        body["tool_use_id"] = tool_use_id
     conn = _UnixHTTP(path)
     try:
         conn.request("POST", DEPOSIT_ROUTE,

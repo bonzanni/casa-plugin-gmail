@@ -14,6 +14,11 @@ import tempfile
 import threading
 import unittest
 
+import anyio
+from mcp import types
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
+
 import casa_broker
 
 URL = "https://accounts.google.com/o/oauth2/v2/auth?state=" + "c" * 64
@@ -70,6 +75,31 @@ class FakeBroker:
 
 def _json(obj):
     return json.dumps(obj).encode("utf-8")
+
+
+def _call_through_server(tool, meta=None):
+    """Serve `tool` from a scratch FastMCP server in process and call it the
+    way Claude Code does, with `meta` as the request's `_meta`; return the
+    text the tool returned. `ClientSession.call_tool` cannot send `_meta`, so
+    the request is built by hand."""
+    server = FastMCP("scratch")
+    server.tool()(tool)
+    params = {"name": tool.__name__, "arguments": {}}
+    if meta is not None:
+        params["_meta"] = meta
+    request = types.ClientRequest(types.CallToolRequest(
+        method="tools/call", params=types.CallToolRequestParams(**params)))
+
+    async def call():
+        async with create_connected_server_and_client_session(
+                server._mcp_server) as session:
+            return await session.send_request(request, types.CallToolResult)
+
+    result = anyio.run(call)
+    if result.isError:
+        raise AssertionError(result.content)
+    [content] = result.content
+    return content.text
 
 
 class DepositTests(unittest.TestCase):
@@ -227,3 +257,64 @@ class FileDepositTests(unittest.TestCase):
             casa_broker.deposit_file("file", "/o/x.zip", kind="zip", caption="",
                                      filename="x.zip")
         self.assertEqual(caught.exception.code, "bad_filename")
+
+
+def _report_call_id():
+    return json.dumps(casa_broker.call_id())
+
+
+class CallIdTests(unittest.TestCase):
+    """The id of the tool call being served, read from the request Claude
+    Code sends (`params._meta["claudecode/toolUseId"]`)."""
+
+    def test_the_helper_sees_the_calls_id_through_the_real_server(self):
+        text = _call_through_server(
+            _report_call_id, meta={"claudecode/toolUseId": "toolu_test"})
+        self.assertEqual(json.loads(text), "toolu_test")
+
+    def test_without_meta_there_is_no_id(self):
+        self.assertIsNone(json.loads(_call_through_server(_report_call_id)))
+        self.assertIsNone(json.loads(_call_through_server(
+            _report_call_id, meta={"progressToken": 1})))
+        self.assertIsNone(casa_broker.call_id())       # outside any request
+
+    def test_an_id_that_is_not_a_short_string_is_not_an_id(self):
+        for value in (7, ["toolu_test"], {"id": "toolu_test"}, None, "",
+                      "t" * 129):
+            with self.subTest(value=repr(value)[:20]):
+                self.assertIsNone(json.loads(_call_through_server(
+                    _report_call_id, meta={"claudecode/toolUseId": value})))
+        self.assertEqual(json.loads(_call_through_server(
+            _report_call_id, meta={"claudecode/toolUseId": "t" * 128})),
+            "t" * 128)
+
+
+def _deposit_a_link():
+    return casa_broker.deposit_link(
+        "auth_url", URL, label="Sign in with Google",
+        caption="Open in a real browser")
+
+
+class DepositCallIdTests(unittest.TestCase):
+    """A deposit made while a tool call is served names that call."""
+    setUp = DepositTests.setUp
+    serve = DepositTests.serve
+
+    def test_a_deposit_carries_the_id_when_there_is_one(self):
+        broker = self.serve(lambda body: _json({"reference": REFERENCE}))
+        text = _call_through_server(
+            _deposit_a_link, meta={"claudecode/toolUseId": "toolu_test"})
+        self.assertEqual(text, REFERENCE)
+        [(_, _, body)] = broker.requests
+        self.assertEqual(sorted(body), ["caption", "client", "label", "slot",
+                                        "tool_use_id", "value"])
+        self.assertEqual(body["tool_use_id"], "toolu_test")
+
+    def test_a_deposit_without_an_id_is_todays_request(self):
+        broker = self.serve(lambda body: _json({"reference": REFERENCE}))
+        self.assertEqual(_call_through_server(_deposit_a_link), REFERENCE)
+        [(_, _, body)] = broker.requests
+        self.assertEqual(body, {
+            "client": CLIENT, "slot": "auth_url", "value": URL,
+            "label": "Sign in with Google",
+            "caption": "Open in a real browser"})
