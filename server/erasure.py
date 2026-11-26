@@ -17,8 +17,11 @@ Two kinds, one walk over the data directory:
   error, a write cut short) is kept the same way and never offered to Google:
   a fragment's ``invalid_token`` would prove nothing about the real grant.
 * ``erase_data`` (``casa.eraseDataOnlyTool``) deletes everything EXCEPT the
-  sign-in files (the token store and the collect lock), so a reinstall carries
-  on without authorizing again.
+  sign-in files (the token store), so a reinstall carries on without
+  authorizing again.
+
+Both kinds leave the two lock files (the collect lock and the sent log's):
+they are empty, and other server processes may be holding or waiting on them.
 
 Deletion is by an allowlist of what to keep, never a list of what to delete: a
 file a future version adds is erased by default.
@@ -33,6 +36,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import sent_log
 from auth_flow import LOCK_NAME, collect_lock
 from token_store import ACTIVE_NAME, NOTICE_NAME, STAGED_NAME
 
@@ -42,6 +46,13 @@ PERMISSIONS_PAGE = "https://myaccount.google.com/permissions"
 # What a data-only erase keeps: exactly what a reinstall needs to carry on
 # signed in, plus the notices that report a sign-in's outcome.
 SIGN_IN_FILES = frozenset({ACTIVE_NAME, STAGED_NAME, NOTICE_NAME})
+
+# What no erase deletes: the collect lock and the sent log's lock.
+LOCK_FILES = frozenset({LOCK_NAME, sent_log.LOCK_NAME})
+
+# The sent log, as the server names it. Its lock is found from its place in
+# the data directory, so the erase needs the path and no log object.
+_SENT_LOG_NAME = "sent_log.json"
 
 _HANDOFF_NOTE = (
     "Attachments already handed to Casa's handoff folder are Casa's and expire "
@@ -96,9 +107,16 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
 
     Holds the collect lock throughout, so no collect pass or startup recovery
     can stage or promote a credential between the revocation and the delete.
-    A held lock is an incomplete erasure, never a wait. `before_delete` runs
-    under the lock just before the walk, for in-memory state that would
-    otherwise write deleted files back.
+    A held lock is an incomplete erasure, never a wait.
+
+    Once Google has answered, it also holds the sent log's lock, from
+    `before_delete` to the final look at what is left: no other server
+    process, and no cleanup in this one, is then part-way through rewriting
+    the log while the walk deletes. That lock is taken by the log's place in
+    the directory, so an eraser that never built a log takes it all the same,
+    and it is waited for, since its holders only ever do a file operation.
+    `before_delete` runs under both locks just before the walk, for in-memory
+    state that would otherwise write deleted files back.
     """
     data_dir = store.dir
     if not data_dir.exists():
@@ -130,23 +148,24 @@ def erase(store, *, keep_sign_in: bool, revoke=revoke_token,
                     failed.append(detail)
             if tokens and not failed:
                 lines.append("Revoked Gmail's access at Google.")
-        if before_delete is not None:
-            before_delete()
-        removed = []
-        errors = []
-        for entry in sorted(data_dir.iterdir()):
-            if entry.name == LOCK_NAME or entry.name in keep:
-                continue
-            try:
-                _remove(entry)
-                removed.append(entry.name)
-            except OSError as exc:
-                errors.append(f"{entry.name} ({exc.strerror or exc})")
-        # The lock file itself stays: it is empty, and unlinking it while held
-        # would let another process lock a fresh inode while this one still
-        # believes it holds the lock.
-        left = sorted(e.name for e in data_dir.iterdir()
-                      if e.name != LOCK_NAME and e.name not in keep)
+        with sent_log.log_lock(str(data_dir / _SENT_LOG_NAME)):
+            if before_delete is not None:
+                before_delete()
+            removed = []
+            errors = []
+            for entry in sorted(data_dir.iterdir()):
+                if entry.name in LOCK_FILES or entry.name in keep:
+                    continue
+                try:
+                    _remove(entry)
+                    removed.append(entry.name)
+                except OSError as exc:
+                    errors.append(f"{entry.name} ({exc.strerror or exc})")
+            # The lock files themselves stay: they are empty, and unlinking
+            # one while held would let another process lock a fresh inode
+            # while this one still believes it holds the lock.
+            left = sorted(e.name for e in data_dir.iterdir()
+                          if e.name not in LOCK_FILES and e.name not in keep)
     if removed:
         lines.append("Deleted " + ", ".join(removed) + ".")
     else:
