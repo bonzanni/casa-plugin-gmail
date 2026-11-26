@@ -108,6 +108,8 @@ If `setup_gmail` returns a `redirect_uri` that doesn't match what's registered o
 
 ### Updating an already-connected install
 
+0.16.0 lets several sessions use the plugin at once: two of them sending at the same moment both keep their entry in the sent log. Each link or file it hands to Casa also names the tool call it belongs to; Casa versions that do not read that ignore it. No new sign-in is needed.
+
 0.14.0 adds optional `cc` and `bcc` to `send_email` and `reply_to_thread`; sending already needed `gmail.send`, so no new sign-in is needed. 0.15.0 adds `send_attachment_to_chat`, which reads with the access already granted and needs Casa 0.344.0.
 
 0.13.0 adds the label, bulk and filter tools. Their Gmail permissions were already part of the sign-in (`gmail.modify` and `gmail.settings.basic`), so no new sign-in is needed.

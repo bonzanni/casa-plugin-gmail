@@ -6,12 +6,15 @@ left on disk and what Google was asked, not only the verdict.
 import inspect
 import io
 import json
+import threading
 import urllib.error
 
 import pytest
 
 import erasure
+import sent_log
 from auth_flow import LOCK_NAME, collect_lock
+from test_sent_log import _SPAWN, _WAIT, _end, _record_until_stopped, _wait_for
 from token_store import Credential, TokenStore
 
 
@@ -52,7 +55,7 @@ def test_everything_revokes_every_grant_then_leaves_nothing(tmp_path):
     result = erasure.erase(store, keep_sign_in=False, revoke=google)
     assert result["erasure"] == "complete"
     assert sorted(google.asked) == ["rt-active", "rt-staged"]
-    assert _names(tmp_path) == [LOCK_NAME]
+    assert _names(tmp_path) == [LOCK_NAME, sent_log.LOCK_NAME]
     assert "Revoked" in result["report"]
 
 
@@ -61,7 +64,7 @@ def test_a_token_google_already_invalidated_counts_as_revoked(tmp_path):
     result = erasure.erase(store, keep_sign_in=False,
                            revoke=_Google(("already_invalid", "")))
     assert result["erasure"] == "complete"
-    assert _names(tmp_path) == [LOCK_NAME]
+    assert _names(tmp_path) == [LOCK_NAME, sent_log.LOCK_NAME]
 
 
 def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
@@ -72,13 +75,13 @@ def test_an_unconfirmed_revocation_keeps_that_token_and_is_incomplete(tmp_path):
     assert result["erasure"] == "incomplete"
     # The unrevoked grant's file stays so a second run can still revoke it;
     # the confirmed one and all the data are gone.
-    assert _names(tmp_path) == [LOCK_NAME, "oauth_token.json"]
+    assert _names(tmp_path) == [LOCK_NAME, "oauth_token.json", sent_log.LOCK_NAME]
     assert "could not reach Google (boom)" in result["report"]
     assert erasure.PERMISSIONS_PAGE in result["report"]
     # A second run with Google reachable finishes the job.
     again = erasure.erase(store, keep_sign_in=False, revoke=_Google())
     assert again["erasure"] == "complete"
-    assert _names(tmp_path) == [LOCK_NAME]
+    assert _names(tmp_path) == [LOCK_NAME, sent_log.LOCK_NAME]
 
 
 @pytest.mark.parametrize("slot", ["oauth_token.json", "oauth_token.staged.json"])
@@ -104,10 +107,10 @@ def test_a_token_left_by_an_interrupted_write_is_revoked_first(tmp_path, monkeyp
     result = erasure.erase(store, keep_sign_in=False, revoke=google)
     assert google.asked == ["rt-tmp"]
     assert result["erasure"] == "incomplete"
-    assert _names(tmp_path) == sorted([LOCK_NAME, f".{slot}.tmp"])
+    assert _names(tmp_path) == sorted([LOCK_NAME, sent_log.LOCK_NAME, f".{slot}.tmp"])
     result = erasure.erase(store, keep_sign_in=False, revoke=_Google())
     assert result["erasure"] == "complete"
-    assert _names(tmp_path) == [LOCK_NAME]
+    assert _names(tmp_path) == [LOCK_NAME, sent_log.LOCK_NAME]
 
 
 CREDENTIAL_FILES = ["oauth_token.json", "oauth_token.staged.json",
@@ -156,7 +159,7 @@ def test_a_credential_file_that_cannot_be_read_is_kept_and_incomplete(tmp_path, 
     monkeypatch.undo()
     assert result["erasure"] == "incomplete"
     assert google.asked == []
-    assert _names(tmp_path) == [LOCK_NAME, "oauth_token.json"]
+    assert _names(tmp_path) == [LOCK_NAME, "oauth_token.json", sent_log.LOCK_NAME]
 
 
 def test_a_short_os_write_still_writes_the_whole_credential(tmp_path, monkeypatch):
@@ -184,7 +187,8 @@ def test_data_only_keeps_exactly_the_sign_in_and_asks_google_nothing(tmp_path):
     result = erasure.erase(store, keep_sign_in=True, revoke=google)
     assert result["erasure"] == "complete"
     assert google.asked == []
-    assert _names(tmp_path) == sorted([LOCK_NAME, "oauth_token.json",
+    assert _names(tmp_path) == sorted([LOCK_NAME, sent_log.LOCK_NAME,
+                                       "oauth_token.json",
                                        "oauth_token.staged.json",
                                        "pending_notices.json"])
     assert store.load_active().refresh_token == "rt-active"
@@ -238,6 +242,147 @@ def test_a_deletion_that_fails_is_incomplete_and_named(tmp_path, monkeypatch):
     result = erasure.erase(store, keep_sign_in=True, revoke=_Google())
     assert result["erasure"] == "incomplete"
     assert "saved (Permission denied)" in result["report"]
+
+
+# ── the sent log's own lock: other server processes, and the cleanup timer ──
+
+def _timerless_log(path):
+    log = sent_log.SentLog.__new__(sent_log.SentLog)   # no cleanup timer thread
+    log._path, log._data = str(path), {}
+    return log
+
+
+@pytest.mark.parametrize("keep_sign_in", [True, False])
+def test_erase_spares_the_sent_log_lock_and_still_reports_complete(tmp_path, keep_sign_in):
+    store = _populated(tmp_path)
+    log = _timerless_log(tmp_path / "sent_log.json")
+    log.record("r1", "m1", "a@example.com", "hello")
+    result = erasure.erase(store, keep_sign_in=keep_sign_in, revoke=_Google(),
+                           before_delete=log.forget)
+    assert (tmp_path / sent_log.LOCK_NAME).exists()
+    assert not (tmp_path / "sent_log.json").exists()
+    assert result["erasure"] == "complete"
+    assert "Could not delete" not in result["report"]
+    assert sent_log.LOCK_NAME not in result["report"]
+
+
+def test_a_send_recorded_while_an_erase_runs_is_not_torn(tmp_path):
+    """Another server process keeps recording sends while this one erases,
+    again and again. Each erase must leave nothing behind, and the writer must
+    never find its own half-written file gone."""
+    store = _populated(tmp_path)
+    recorded, stop = _SPAWN.Event(), _SPAWN.Event()
+    result, sender = _SPAWN.Pipe(duplex=False)
+    writer = _SPAWN.Process(target=_record_until_stopped,
+                            args=(str(tmp_path / "sent_log.json"), recorded, stop, sender))
+    try:
+        writer.start()
+        for _ in range(25):
+            # Every erase meets a writer that has recorded since the last one.
+            recorded.clear()
+            _wait_for(recorded, writer)
+            (tmp_path / "saved").mkdir(exist_ok=True)
+            (tmp_path / "saved" / "invoice.pdf").write_bytes(b"%PDF")
+            erased = erasure.erase(store, keep_sign_in=True, revoke=_Google())
+            assert erased["erasure"] == "complete", erased["report"]
+        stop.set()
+        assert result.poll(_WAIT)
+        result.recv()
+        writer.join(_WAIT)
+        assert writer.exitcode == 0
+    finally:
+        stop.set()
+        _end(writer)
+    assert [n for n in _names(tmp_path) if ".corrupt." in n] == []
+    log_file = tmp_path / "sent_log.json"
+    if log_file.exists():
+        assert isinstance(json.loads(log_file.read_text()), dict)
+
+
+def test_the_cleanup_timer_waits_for_an_erase_in_its_own_process(tmp_path, monkeypatch):
+    """The daily cleanup runs on a second thread of the erasing process, on the
+    very log object the erase forgets. Whichever starts first, the other waits
+    for it and both finish."""
+    real_remove = erasure._remove
+    # How long each side is given to barge in on the other before the test
+    # concludes that it is waiting, as it must.
+    barge = 0.3
+
+    # The erase first: the cleanup starts while the walk is under way.
+    data = tmp_path / "erase-first"
+    data.mkdir()
+    store = _populated(data)
+    log = _timerless_log(data / "sent_log.json")
+    log.record("r1", "m1", "a@example.com", "hello")
+    cleanup_started, cleanup_read = threading.Event(), threading.Event()
+    real_load = log._load
+
+    def load():
+        cleanup_read.set()
+        return real_load()
+
+    def cleanup():
+        cleanup_started.set()
+        log.cleanup()
+
+    monkeypatch.setattr(log, "_load", load)
+    timer = threading.Thread(target=cleanup, daemon=True)
+    seen = {}
+
+    def walk_held_open(path):
+        if not seen:
+            timer.start()
+            seen["cleanup started"] = cleanup_started.wait(_WAIT)
+            seen["cleanup read the log during the walk"] = cleanup_read.wait(barge)
+        real_remove(path)
+
+    monkeypatch.setattr(erasure, "_remove", walk_held_open)
+    result = erasure.erase(store, keep_sign_in=True, revoke=_Google(),
+                           before_delete=log.forget)
+    timer.join(_WAIT)
+    assert seen == {"cleanup started": True,
+                    "cleanup read the log during the walk": False}
+    assert not timer.is_alive() and cleanup_read.is_set()
+    assert result["erasure"] == "complete"
+
+    # The cleanup first: the erase arrives while the cleanup holds the log.
+    data = tmp_path / "cleanup-first"
+    data.mkdir()
+    store = _populated(data)
+    log = _timerless_log(data / "sent_log.json")
+    log.record("r1", "m1", "a@example.com", "hello")
+    cleanup_reading, erase_on_its_way, walking = (
+        threading.Event(), threading.Event(), threading.Event())
+    real_load = log._load
+    seen = {}
+
+    def load_held_open():
+        cleanup_reading.set()
+        seen["erase arrived"] = erase_on_its_way.wait(_WAIT)
+        seen["erase walked during the cleanup"] = walking.wait(barge)
+        return real_load()
+
+    def revoke(token):
+        # The last thing an erase does before it takes the log's lock.
+        erase_on_its_way.set()
+        return "revoked", ""
+
+    def walk(path):
+        walking.set()
+        real_remove(path)
+
+    monkeypatch.setattr(log, "_load", load_held_open)
+    monkeypatch.setattr(erasure, "_remove", walk)
+    timer = threading.Thread(target=log.cleanup, daemon=True)
+    timer.start()
+    assert cleanup_reading.wait(_WAIT)
+    result = erasure.erase(store, keep_sign_in=False, revoke=revoke,
+                           before_delete=log.forget)
+    timer.join(_WAIT)
+    assert seen == {"erase arrived": True,
+                    "erase walked during the cleanup": False}
+    assert not timer.is_alive() and walking.is_set()
+    assert result["erasure"] == "complete"
 
 
 def test_a_missing_data_directory_is_nothing_to_erase(tmp_path):
@@ -329,8 +474,7 @@ def _server_on(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_client", object())
     monkeypatch.setattr(server, "_authenticated", True)
     log = SentLog.__new__(SentLog)          # no cleanup timer thread
-    import threading
-    log._path, log._lock, log._data = str(tmp_path / "sent_log.json"), threading.Lock(), {}
+    log._path, log._data = str(tmp_path / "sent_log.json"), {}
     log.record("r1", "m1", "a@example.com", "hello")
     monkeypatch.setattr(server, "_log", log)
     return server, auth, log
@@ -368,12 +512,11 @@ def test_a_second_server_process_cannot_write_erased_history_back(tmp_path):
     its whole stale in-memory log after the erase. The file is now the record:
     that process adds its own entry and nothing it remembered."""
     from sent_log import SentLog
-    import threading
     path = str(tmp_path / "sent_log.json")
 
     def process():
         log = SentLog.__new__(SentLog)          # no cleanup timer thread
-        log._path, log._lock = path, threading.Lock()
+        log._path = path
         log._data = log._load()
         return log
 
