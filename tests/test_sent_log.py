@@ -141,6 +141,13 @@ def _hold_the_lock(path, held, release):
         release.wait(2 * _WAIT)
 
 
+def _take_the_lock(path, about_to, taken):
+    from sent_log import log_lock
+    about_to.set()
+    with log_lock(path):
+        taken.set()
+
+
 def _wait_for(event, child):
     """Wait until the child sets `event`; fail at once if it died instead."""
     deadline = time.monotonic() + _WAIT
@@ -245,6 +252,40 @@ def test_a_lock_held_by_a_dead_process_is_free(tmp_path):
     assert log.check("req-1", "a@b.com", "Hello") == "msg-abc"
 
 
+def test_a_write_that_raises_leaves_the_lock_free(tmp_path, monkeypatch):
+    """A write that fails must not leave this process, which lives on, holding
+    the lock: every other server process would wait on it for good."""
+    import sent_log
+    log = make_log(tmp_path)
+    path = str(tmp_path / "sent_log.json")
+
+    def disk_full(*_):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(sent_log, "_durable_write", disk_full)
+    with pytest.raises(OSError, match="the disk is full"):
+        log.record("req-1", "msg-abc", "a@b.com", "Hello")
+
+    # Another process takes the lock as soon as it asks for it.
+    about_to, taken = _SPAWN.Event(), _SPAWN.Event()
+    other = _SPAWN.Process(target=_take_the_lock, args=(path, about_to, taken))
+    try:
+        other.start()
+        _wait_for(about_to, other)
+        assert taken.wait(5.0)
+        other.join(_WAIT)
+        assert other.exitcode == 0
+    finally:
+        _end(other)
+
+    # And so does another thread of this one.
+    def take():
+        with sent_log.log_lock(path):
+            pass
+
+    assert _finishes_within(1.0, take)
+
+
 def test_a_write_replaces_the_file_and_never_rewrites_it_in_place(tmp_path):
     log = make_log(tmp_path)
     log.record("req-1", "msg-1", "a@b.com", "Hello")
@@ -257,14 +298,19 @@ def test_a_write_replaces_the_file_and_never_rewrites_it_in_place(tmp_path):
 
 
 def test_one_folder_spelled_two_ways_is_one_lock(tmp_path):
-    """The lock is the folder's, however the path to it is written: a thread
-    that holds it under one spelling takes it again under another."""
+    """The lock is the folder's, however the path to it is written, a link to
+    the folder included: a thread that holds it under one spelling takes it
+    again under another."""
     from sent_log import log_lock
-    (tmp_path / "saved").mkdir()
+    data = tmp_path / "data"
+    (data / "saved").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(data, target_is_directory=True)
 
     def nested():
-        with log_lock(str(tmp_path / "sent_log.json")):
-            with log_lock(f"{tmp_path}//saved/../sent_log.json"):
-                pass
+        with log_lock(str(data / "sent_log.json")):
+            with log_lock(f"{data}//saved/../sent_log.json"):
+                with log_lock(str(link / "sent_log.json")):
+                    pass
 
     assert _finishes_within(1.0, nested)
